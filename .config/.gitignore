@@ -1,0 +1,29 @@
+# Git Ignore for AirGradient GO Firmware (ESP32-C5)
+
+## ESP-IDF Build Artifacts
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+managed_components/
+
+## IDE & Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+## Python Cache
+__pycache__/
+*.py[cod]
+
+## Temporary Files
+*.tmp
+*.log
+*.bak
+
+## Documentation (exclude from repo)
+.docs/
+BUILD.md

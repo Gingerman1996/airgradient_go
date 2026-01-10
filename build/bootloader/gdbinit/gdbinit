@@ -1,0 +1,2 @@
+source /Users/formylife/Documents/airgradient_code/airgradient-go/build/bootloader/gdbinit/symbols
+source /Users/formylife/Documents/airgradient_code/airgradient-go/build/bootloader/gdbinit/connect
