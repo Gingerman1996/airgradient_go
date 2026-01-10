@@ -2,7 +2,7 @@
 
 ## ESP-IDF Build Artifacts
 build/
-sdkconfig
+sdkconfig.defaults
 sdkconfig.old
 dependencies.lock
 managed_components/
