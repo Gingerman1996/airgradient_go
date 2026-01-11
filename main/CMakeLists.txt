@@ -1,8 +1,8 @@
 idf_component_register(
     SRCS
-        "airgradient-g.cpp"
-        "sensor.cpp"
-        "ui_display.cpp"
+        airgradient-go.cpp
+        sensor.cpp
+        ui_display.cpp
     INCLUDE_DIRS
         "."
     REQUIRES

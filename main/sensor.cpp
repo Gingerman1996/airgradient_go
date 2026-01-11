@@ -11,6 +11,7 @@
 #include "sgp4x.h"
 #include "sps30.h"
 #include "sensirion_gas_index_algorithm.h"
+#include "driver/gpio.h"
 
 static const char *TAG_SENS = "sensors";
 
@@ -19,6 +20,9 @@ static const char *TAG_SENS = "sensors";
 #define I2C_MASTER_SDA_IO    7      // GPIO 7 for SDA
 #define I2C_MASTER_NUM       I2C_NUM_0
 #define I2C_MASTER_FREQ_HZ   100000 // 100 kHz
+
+// PM Sensor Power Control
+#define EN_PM1_GPIO          26     // GPIO 26 - PM sensor load switch + I2C isolator enable
 
 // CO2 ring buffer capacity
 #define CO2_RING_CAP 12
@@ -226,6 +230,22 @@ static esp_err_t init_sgp4x_sensor(Sensors::SensorsState *state) {
 // Performs initialization test: start measurement, wait 3s, check status, then sleep.
 // Returns ESP_OK on success, error code from driver on failure.
 static esp_err_t init_sps30_sensor(Sensors::SensorsState *state) {
+    // Configure EN_PM1 GPIO (IO26) for PM sensor power control
+    gpio_config_t io_conf = {};
+    io_conf.intr_type = GPIO_INTR_DISABLE;
+    io_conf.mode = GPIO_MODE_OUTPUT;
+    io_conf.pin_bit_mask = (1ULL << EN_PM1_GPIO);
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+    gpio_config(&io_conf);
+    
+    // Enable PM sensor power (TPS27081A load switch + TMUX121 I2C isolator)
+    gpio_set_level((gpio_num_t)EN_PM1_GPIO, 1);
+    ESP_LOGI(TAG_SENS, "EN_PM1 enabled (IO26=HIGH) - PM sensor powered");
+    
+    // Wait for power stabilization
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
     sps30_config_t cfg = {.i2c_address = 0x69, .i2c_clock_speed = I2C_MASTER_FREQ_HZ};
     esp_err_t ret = sps30_init(state->i2c_bus_handle, &cfg, &state->sps30_handle);
     if (ret != ESP_OK) return ret;

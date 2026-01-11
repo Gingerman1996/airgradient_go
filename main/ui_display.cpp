@@ -239,19 +239,19 @@ bool Display::init(uint16_t w, uint16_t h)
     lv_label_set_text(state->rh_label, "RH:--%");
     lv_obj_set_style_text_font(state->rh_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(state->rh_label, lv_color_black(), 0);
-    lv_obj_align_to(state->rh_label, state->temp_label, LV_ALIGN_OUT_RIGHT_MID, 10, 0);
+    lv_obj_align_to(state->rh_label, state->temp_label, LV_ALIGN_OUT_RIGHT_MID, 25, 0);
 
     state->voc_label = lv_label_create(state->root);
     lv_label_set_text(state->voc_label, "VOC:-");
     lv_obj_set_style_text_font(state->voc_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(state->voc_label, lv_color_black(), 0);
-    lv_obj_align_to(state->voc_label, state->temp_label, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 0);
+    lv_obj_align_to(state->voc_label, state->temp_label, LV_ALIGN_OUT_BOTTOM_RIGHT, -5, 0);
 
     state->nox_label = lv_label_create(state->root);
     lv_label_set_text(state->nox_label, "NOx:-");
     lv_obj_set_style_text_font(state->nox_label, &lv_font_montserrat_14, 0);
     lv_obj_set_style_text_color(state->nox_label, lv_color_black(), 0);
-    lv_obj_align_to(state->nox_label, state->rh_label, LV_ALIGN_OUT_BOTTOM_RIGHT, 0, 0);
+    lv_obj_align_to(state->nox_label, state->rh_label, LV_ALIGN_OUT_BOTTOM_RIGHT, -8, 0);
 
     state->pressure_label = lv_label_create(state->root);
     lv_label_set_text(state->pressure_label, "----hPa");

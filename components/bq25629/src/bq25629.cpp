@@ -1,0 +1,438 @@
+/**
+ * @file bq25629.cpp
+ * @brief BQ25629 Battery Charger Driver Implementation
+ */
+
+#include "bq25629.h"
+#include "esp_log.h"
+#include <cstring>
+
+static const char *TAG = "BQ25629";
+
+namespace drivers {
+
+// I2C timeout
+constexpr int I2C_TIMEOUT_MS = 1000;
+
+// Register bit masks
+namespace BIT_MASK {
+  // CHARGER_CONTROL_0 (0x16)
+  constexpr uint8_t EN_CHG = (1 << 5);
+  constexpr uint8_t EN_HIZ = (1 << 4);
+  constexpr uint8_t WD_RST = (1 << 2);
+
+  // CHARGER_CONTROL_2 (0x18)
+  constexpr uint8_t EN_OTG = (1 << 6);
+
+  // ADC_CONTROL (0x26)
+  constexpr uint8_t ADC_EN = (1 << 7);
+  constexpr uint8_t ADC_RATE = (1 << 6);
+
+  // CHARGER_STATUS_1 (0x1E)
+  constexpr uint8_t CHG_STAT_MASK = 0x18;
+  constexpr uint8_t CHG_STAT_SHIFT = 3;
+  constexpr uint8_t VBUS_STAT_MASK = 0x07;
+} // namespace BIT_MASK
+
+BQ25629::BQ25629(i2c_master_bus_handle_t i2c_bus, uint8_t device_address)
+    : i2c_bus_(i2c_bus), dev_handle_(nullptr), device_address_(device_address),
+      initialized_(false) {}
+
+BQ25629::~BQ25629() { deinit(); }
+
+esp_err_t BQ25629::init(const BQ25629_Config &config) {
+  esp_err_t ret;
+
+  // Create I2C device
+  i2c_device_config_t dev_cfg = {
+      .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+      .device_address = device_address_,
+      .scl_speed_hz = 400000, // 400kHz I2C
+  };
+
+  ret = i2c_master_bus_add_device(i2c_bus_, &dev_cfg, &dev_handle_);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to add I2C device: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  // Verify device by reading part information
+  uint8_t part_info = 0;
+  ret = read_register(BQ25629_REG::PART_INFORMATION, part_info);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to read part information: %s", esp_err_to_name(ret));
+    i2c_master_bus_rm_device(dev_handle_);
+    dev_handle_ = nullptr;
+    return ret;
+  }
+
+  uint8_t part_number = (part_info >> 3) & 0x07;
+  if (part_number != 0x06) { // BQ25629 part number = 0x06
+    ESP_LOGW(TAG, "Unexpected part number: 0x%02X (expected 0x06)", part_number);
+  }
+
+  ESP_LOGI(TAG, "BQ25629 found, Part Info: 0x%02X", part_info);
+
+  // Configure charge voltage
+  ret = set_charge_voltage(config.charge_voltage_mv);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set charge voltage");
+    return ret;
+  }
+
+  // Configure charge current
+  ret = set_charge_current(config.charge_current_ma);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set charge current");
+    return ret;
+  }
+
+  // Configure input current limit
+  ret = set_input_current_limit(config.input_current_limit_ma);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set input current limit");
+    return ret;
+  }
+
+  // Configure input voltage limit
+  uint16_t vindpm_value = (config.input_voltage_limit_mv - 3800) / 40;
+  vindpm_value = vindpm_value > 0x1A4 ? 0x1A4 : vindpm_value;
+  vindpm_value = vindpm_value < 0x5F ? 0x5F : vindpm_value;
+  ret = write_register_16(BQ25629_REG::INPUT_VOLTAGE_LIMIT, vindpm_value << 5);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set input voltage limit");
+    return ret;
+  }
+
+  // Configure minimum system voltage
+  uint16_t vsysmin_value = (config.min_system_voltage_mv - 2560) / 80;
+  vsysmin_value = vsysmin_value > 0x10 ? 0x10 : vsysmin_value;
+  vsysmin_value = vsysmin_value < 0x00 ? 0x00 : vsysmin_value;
+  ret = write_register_16(BQ25629_REG::MIN_SYSTEM_VOLTAGE, vsysmin_value << 6);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set minimum system voltage");
+    return ret;
+  }
+
+  // Configure pre-charge current
+  uint16_t iprechg_value = (config.precharge_current_ma - 10) / 10;
+  iprechg_value = iprechg_value > 0x1F ? 0x1F : iprechg_value;
+  if (iprechg_value < 1)
+    iprechg_value = 1;
+  ret = write_register_16(BQ25629_REG::PRECHARGE_CONTROL, iprechg_value << 3);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set pre-charge current");
+    return ret;
+  }
+
+  // Configure termination current
+  uint16_t iterm_value = (config.term_current_ma - 5) / 5;
+  iterm_value = iterm_value > 0x3E ? 0x3E : iterm_value;
+  if (iterm_value < 1)
+    iterm_value = 1;
+  ret = write_register_16(BQ25629_REG::TERMINATION_CONTROL, iterm_value << 2);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to set termination current");
+    return ret;
+  }
+
+  // Enable/disable charging
+  ret = enable_charging(config.enable_charging);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to configure charging enable");
+    return ret;
+  }
+
+  // Enable/disable OTG
+  ret = enable_otg(config.enable_otg);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to configure OTG");
+    return ret;
+  }
+
+  // Enable/disable ADC
+  if (config.enable_adc) {
+    ret = enable_adc(true, true);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to enable ADC");
+      return ret;
+    }
+  }
+
+  initialized_ = true;
+  ESP_LOGI(TAG, "BQ25629 initialized successfully");
+  return ESP_OK;
+}
+
+esp_err_t BQ25629::deinit() {
+  if (dev_handle_ != nullptr) {
+    esp_err_t ret = i2c_master_bus_rm_device(dev_handle_);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "Failed to remove I2C device: %s", esp_err_to_name(ret));
+      return ret;
+    }
+    dev_handle_ = nullptr;
+  }
+  initialized_ = false;
+  ESP_LOGI(TAG, "BQ25629 deinitialized");
+  return ESP_OK;
+}
+
+esp_err_t BQ25629::enable_charging(bool enable) {
+  return modify_register(BQ25629_REG::CHARGER_CONTROL_0, BIT_MASK::EN_CHG,
+                         enable ? BIT_MASK::EN_CHG : 0);
+}
+
+esp_err_t BQ25629::enable_otg(bool enable) {
+  return modify_register(BQ25629_REG::CHARGER_CONTROL_2, BIT_MASK::EN_OTG,
+                         enable ? BIT_MASK::EN_OTG : 0);
+}
+
+esp_err_t BQ25629::set_charge_current(uint16_t current_ma) {
+  // Clamp to valid range: 40-2000mA
+  if (current_ma < 40)
+    current_ma = 40;
+  if (current_ma > 2000)
+    current_ma = 2000;
+
+  // Calculate register value: 40mA steps
+  uint16_t reg_value = (current_ma - 40) / 40 + 1;
+  reg_value = reg_value << 5; // Shift to bits [10:5]
+
+  return write_register_16(BQ25629_REG::CHARGE_CURRENT_LIMIT, reg_value);
+}
+
+esp_err_t BQ25629::set_charge_voltage(uint16_t voltage_mv) {
+  // Clamp to valid range: 3500-4800mV
+  if (voltage_mv < 3500)
+    voltage_mv = 3500;
+  if (voltage_mv > 4800)
+    voltage_mv = 4800;
+
+  // Calculate register value: 10mV steps
+  uint16_t reg_value = (voltage_mv - 3500) / 10;
+  reg_value = reg_value << 3; // Shift to bits [11:3]
+
+  return write_register_16(BQ25629_REG::CHARGE_VOLTAGE_LIMIT, reg_value);
+}
+
+esp_err_t BQ25629::set_input_current_limit(uint16_t current_ma) {
+  // Clamp to valid range: 100-3200mA
+  if (current_ma < 100)
+    current_ma = 100;
+  if (current_ma > 3200)
+    current_ma = 3200;
+
+  // Calculate register value: 20mA steps
+  uint16_t reg_value = (current_ma - 100) / 20 + 5;
+  reg_value = reg_value << 4; // Shift to bits [11:4]
+
+  return write_register_16(BQ25629_REG::INPUT_CURRENT_LIMIT, reg_value);
+}
+
+esp_err_t BQ25629::get_charge_status(ChargeStatus &status) {
+  uint8_t reg_value;
+  esp_err_t ret = read_register(BQ25629_REG::CHARGER_STATUS_1, reg_value);
+  if (ret != ESP_OK) {
+    return ret;
+  }
+
+  uint8_t chg_stat = (reg_value & BIT_MASK::CHG_STAT_MASK) >> BIT_MASK::CHG_STAT_SHIFT;
+  status = static_cast<ChargeStatus>(chg_stat);
+  return ESP_OK;
+}
+
+esp_err_t BQ25629::get_vbus_status(VBusStatus &status) {
+  uint8_t reg_value;
+  esp_err_t ret = read_register(BQ25629_REG::CHARGER_STATUS_1, reg_value);
+  if (ret != ESP_OK) {
+    return ret;
+  }
+
+  uint8_t vbus_stat = reg_value & BIT_MASK::VBUS_STAT_MASK;
+  status = static_cast<VBusStatus>(vbus_stat);
+  return ESP_OK;
+}
+
+esp_err_t BQ25629::read_adc(BQ25629_ADC_Data &data) {
+  esp_err_t ret;
+  uint16_t raw_value;
+
+  // Read IBUS (2mA per LSB, 2's complement)
+  ret = read_register_16(BQ25629_REG::IBUS_ADC, raw_value);
+  if (ret == ESP_OK) {
+    data.ibus_ma = static_cast<int16_t>(raw_value >> 1) * 2;
+  }
+
+  // Read IBAT (4mA per LSB, 2's complement)
+  ret = read_register_16(BQ25629_REG::IBAT_ADC, raw_value);
+  if (ret == ESP_OK) {
+    if (raw_value == 0x8000) {
+      data.ibat_ma = 0; // Polarity changed during measurement
+    } else {
+      data.ibat_ma = static_cast<int16_t>(raw_value >> 2) * 4;
+    }
+  }
+
+  // Read VBUS (3.97mV per LSB)
+  ret = read_register_16(BQ25629_REG::VBUS_ADC, raw_value);
+  if (ret == ESP_OK) {
+    data.vbus_mv = ((raw_value >> 2) * 397) / 100;
+  }
+
+  // Read VPMID (3.97mV per LSB)
+  ret = read_register_16(BQ25629_REG::VPMID_ADC, raw_value);
+  if (ret == ESP_OK) {
+    data.vpmid_mv = ((raw_value >> 2) * 397) / 100;
+  }
+
+  // Read VBAT (1.99mV per LSB)
+  ret = read_register_16(BQ25629_REG::VBAT_ADC, raw_value);
+  if (ret == ESP_OK) {
+    data.vbat_mv = ((raw_value >> 1) * 199) / 100;
+  }
+
+  // Read VSYS (1.99mV per LSB)
+  ret = read_register_16(BQ25629_REG::VSYS_ADC, raw_value);
+  if (ret == ESP_OK) {
+    data.vsys_mv = ((raw_value >> 1) * 199) / 100;
+  }
+
+  // Read TS (0.0961% per LSB)
+  ret = read_register_16(BQ25629_REG::TS_ADC, raw_value);
+  if (ret == ESP_OK) {
+    data.ts_percent = (raw_value & 0x0FFF) * 0.0961f;
+  }
+
+  // Read TDIE (0.5°C per LSB, 2's complement)
+  ret = read_register_16(BQ25629_REG::TDIE_ADC, raw_value);
+  if (ret == ESP_OK) {
+    data.tdie_c = static_cast<int16_t>(raw_value & 0x0FFF);
+    if (data.tdie_c & 0x0800) { // Sign extend
+      data.tdie_c |= 0xF000;
+    }
+    data.tdie_c = data.tdie_c / 2; // 0.5°C per LSB
+  }
+
+  return ESP_OK;
+}
+
+esp_err_t BQ25629::enable_adc(bool enable, bool continuous) {
+  uint8_t value = 0;
+  if (enable) {
+    value |= BIT_MASK::ADC_EN;
+    if (!continuous) {
+      value |= BIT_MASK::ADC_RATE; // One-shot mode
+    }
+  }
+  return write_register(BQ25629_REG::ADC_CONTROL, value);
+}
+
+esp_err_t BQ25629::reset_watchdog() {
+  return modify_register(BQ25629_REG::CHARGER_CONTROL_0, BIT_MASK::WD_RST,
+                         BIT_MASK::WD_RST);
+}
+
+esp_err_t BQ25629::is_battery_present(bool &present) {
+  uint16_t vbat_mv;
+  esp_err_t ret = read_register_16(BQ25629_REG::VBAT_ADC, vbat_mv);
+  if (ret != ESP_OK) {
+    return ret;
+  }
+
+  // Convert to actual voltage (1.99mV per LSB)
+  vbat_mv = ((vbat_mv >> 1) * 199) / 100;
+
+  // Battery present if voltage > 2V
+  present = (vbat_mv > 2000);
+  return ESP_OK;
+}
+
+esp_err_t BQ25629::is_charging(bool &charging) {
+  ChargeStatus status;
+  esp_err_t ret = get_charge_status(status);
+  if (ret != ESP_OK) {
+    return ret;
+  }
+
+  charging = (status != ChargeStatus::NOT_CHARGING);
+  return ESP_OK;
+}
+
+esp_err_t BQ25629::read_register(uint8_t reg_addr, uint8_t &value) {
+  if (dev_handle_ == nullptr) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  esp_err_t ret =
+      i2c_master_transmit_receive(dev_handle_, &reg_addr, 1, &value, 1, I2C_TIMEOUT_MS);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to read register 0x%02X: %s", reg_addr,
+             esp_err_to_name(ret));
+  }
+  return ret;
+}
+
+esp_err_t BQ25629::write_register(uint8_t reg_addr, uint8_t value) {
+  if (dev_handle_ == nullptr) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  uint8_t write_buf[2] = {reg_addr, value};
+  esp_err_t ret = i2c_master_transmit(dev_handle_, write_buf, 2, I2C_TIMEOUT_MS);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to write register 0x%02X: %s", reg_addr,
+             esp_err_to_name(ret));
+  }
+  return ret;
+}
+
+esp_err_t BQ25629::read_register_16(uint8_t reg_addr, uint16_t &value) {
+  if (dev_handle_ == nullptr) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  // BQ25629 uses little-endian format
+  uint8_t data[2];
+  esp_err_t ret = i2c_master_transmit_receive(dev_handle_, &reg_addr, 1, data, 2, I2C_TIMEOUT_MS);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to read 16-bit register 0x%02X: %s", reg_addr,
+             esp_err_to_name(ret));
+    return ret;
+  }
+
+  value = data[0] | (data[1] << 8); // Little-endian
+  return ESP_OK;
+}
+
+esp_err_t BQ25629::write_register_16(uint8_t reg_addr, uint16_t value) {
+  if (dev_handle_ == nullptr) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  // BQ25629 uses little-endian format
+  uint8_t write_buf[3];
+  write_buf[0] = reg_addr;
+  write_buf[1] = value & 0xFF;        // LSB first
+  write_buf[2] = (value >> 8) & 0xFF; // MSB second
+
+  esp_err_t ret = i2c_master_transmit(dev_handle_, write_buf, 3, I2C_TIMEOUT_MS);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to write 16-bit register 0x%02X: %s", reg_addr,
+             esp_err_to_name(ret));
+  }
+  return ret;
+}
+
+esp_err_t BQ25629::modify_register(uint8_t reg_addr, uint8_t mask, uint8_t value) {
+  uint8_t reg_value;
+  esp_err_t ret = read_register(reg_addr, reg_value);
+  if (ret != ESP_OK) {
+    return ret;
+  }
+
+  reg_value = (reg_value & ~mask) | (value & mask);
+  return write_register(reg_addr, reg_value);
+}
+
+} // namespace drivers
