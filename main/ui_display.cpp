@@ -226,7 +226,7 @@ bool Display::init(uint16_t w, uint16_t h)
     lv_label_set_text(state->interval_label, "10s");
     lv_obj_set_style_text_color(state->interval_label, lv_color_black(), 0);
     lv_obj_set_style_text_font(state->interval_label, &lv_font_montserrat_16, 0);
-    lv_obj_align(state->interval_label, LV_ALIGN_TOP_RIGHT, -15, 40);
+    lv_obj_align(state->interval_label, LV_ALIGN_TOP_RIGHT, -15, 20);
 
     // Main large values (CO2 / PM2.5 tiles)
     const int tile_w = 127;
@@ -302,7 +302,7 @@ bool Display::init(uint16_t w, uint16_t h)
     lv_label_set_text(state->pressure_label, "----hPa");
     lv_obj_set_style_text_font(state->pressure_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(state->pressure_label, lv_color_black(), 0);
-    lv_obj_align(state->pressure_label, LV_ALIGN_TOP_RIGHT, -15, 55);
+    lv_obj_align(state->pressure_label, LV_ALIGN_TOP_RIGHT, -15, 40);
 
     setFocusTile(state->focus_tile);
 
