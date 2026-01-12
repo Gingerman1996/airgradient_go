@@ -100,6 +100,8 @@ idf.py flash monitor
 | **Flash** | 4 MB (W25N512 NAND for storage) |
 | **Display** | SSD1680 e-paper (144×296px) |
 | **Sensors** | SHT4x, SGP41, SPS30, LIS2DH12, DPS368 |
+| **GPS** | TAU1113 (NMEA via UART) |
+| **GPS Parser** | libnmea (ESP-IDF component) |
 | **Power** | Li-ion battery with BQ25628 charger |
 | **Build System** | ESP-IDF v5.5.1 |
 | **Language** | C++ (app), C (drivers) |

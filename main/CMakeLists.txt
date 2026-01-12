@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         airgradient-go.cpp
+        gps.cpp
         sensor.cpp
         ui_display.cpp
     INCLUDE_DIRS
@@ -12,6 +13,7 @@ idf_component_register(
         "sensirion_gas_index_algorithm"
         "cap1203"
         "bq25629"
+        "libnmea"
         "esp_epaper"
         "esp_lcd"
         "lvgl"

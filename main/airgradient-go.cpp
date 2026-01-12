@@ -2,6 +2,7 @@
 #include "ui_display.h"
 #include "cap1203.h"
 #include "bq25629.h"
+#include "gps.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
@@ -28,6 +29,10 @@
 // QON button configuration (GPIO5)
 #define QON_PIN                GPIO_NUM_5
 #define SHUTDOWN_HOLD_MS       5000  // 5 seconds long press to shutdown
+// External hardware watchdog (TPL5010)
+#define HW_WD_RST_PIN          GPIO_NUM_2
+#define HW_WD_PULSE_MS         20
+#define HW_WD_KICK_INTERVAL_MS (4 * 60 * 1000ULL)  // Kick before 5 min timeout
 
 static SemaphoreHandle_t lvgl_mux = NULL;
 static bool shutdown_requested = false;
@@ -364,6 +369,18 @@ extern "C" void app_main(void) {
     };
     ESP_ERROR_CHECK(gpio_config(&qon_cfg));
     ESP_LOGI(TAG, "QON button (GPIO%d) configured", QON_PIN);
+
+    // Configure external watchdog reset (TPL5010 DONE pulse, active low)
+    gpio_config_t wd_cfg = {
+        .pin_bit_mask = (1ULL << HW_WD_RST_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&wd_cfg));
+    gpio_set_level(HW_WD_RST_PIN, 1);
+    ESP_LOGI(TAG, "HW watchdog reset configured on GPIO%d", HW_WD_RST_PIN);
     
     // ==================== DISPLAY INITIALIZATION ====================
     
@@ -486,6 +503,8 @@ extern "C" void app_main(void) {
     // Initialize I2C bus first (needed for BQ25629 and sensors)
     ESP_LOGI(TAG, "Initializing I2C bus...");
     Sensors sensors;
+    GPS gps;
+    bool gps_ready = false;
     i2c_master_bus_handle_t i2c_bus = sensors.getI2CBusHandle();
     if (i2c_bus == NULL) {
         ESP_LOGE(TAG, "Failed to get I2C bus handle");
@@ -639,6 +658,17 @@ extern "C" void app_main(void) {
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "CAP1203 init did not complete: %s", esp_err_to_name(ret));
     }
+
+    // ==================== GPS INITIALIZATION ====================
+
+    ESP_LOGI(TAG, "Initializing GPS UART...");
+    ret = gps.init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "GPS init failed: %s", esp_err_to_name(ret));
+    } else {
+        gps_ready = true;
+        esp_log_level_set("gps", ESP_LOG_DEBUG);
+    }
     
     // ==================== QON BUTTON TASK ====================
     
@@ -662,12 +692,21 @@ extern "C" void app_main(void) {
     const uint64_t DISPLAY_UPDATE_INTERVAL_MS = 1000;    // Update values every 1s
     const uint64_t DISPLAY_REFRESH_INTERVAL_MS = RECORDING_INTERVAL_MS; // Follow recording interval
     const uint64_t UI_BLINK_INTERVAL_MS = 500;           // Blink icons every 500ms
+    const uint64_t GPS_UI_UPDATE_INTERVAL_MS = 1000;
+    const uint64_t GPS_SENTENCE_TIMEOUT_MS = 3000;
+    const uint64_t GPS_FIX_TIMEOUT_MS = 5000;
     bool initial_display_refresh_done = false;
     uint64_t last_charger_log_ms = 0;
     const uint64_t CHARGER_LOG_INTERVAL_MS = 2000;       // Debug log interval
     uint64_t last_wd_kick_ms = 0;
     const uint64_t WD_KICK_INTERVAL_MS = 10000;          // Reset charger watchdog
     uint64_t last_ui_blink_ms = 0;
+    uint64_t last_hw_wd_kick_ms = 0;
+    uint64_t last_gps_ui_ms = 0;
+    Display::GPSStatus last_gps_status = Display::GPSStatus::Off;
+    bool last_gps_time_valid = false;
+    int last_gps_hour = -1;
+    int last_gps_min = -1;
 
     while (true) {
         int64_t now_ms = esp_timer_get_time() / 1000;
@@ -675,6 +714,12 @@ extern "C" void app_main(void) {
 
         // Update sensors
         sensors.update(now_ms);
+
+        // Update GPS parser
+        if (gps_ready) {
+            gps.update(now_ms_u);
+            gps.log_status(now_ms_u, GPS_SENTENCE_TIMEOUT_MS, GPS_FIX_TIMEOUT_MS);
+        }
 
         // Update display with real sensor values every 1 second
         if (now_ms_u - last_display_update_ms >= DISPLAY_UPDATE_INTERVAL_MS) {
@@ -735,6 +780,45 @@ extern "C" void app_main(void) {
             }
         }
 
+        if (gps_ready && (now_ms_u - last_gps_ui_ms >= GPS_UI_UPDATE_INTERVAL_MS)) {
+            last_gps_ui_ms = now_ms_u;
+            Display::GPSStatus gps_status = Display::GPSStatus::Off;
+            bool has_sentence = gps.has_recent_sentence(now_ms_u, GPS_SENTENCE_TIMEOUT_MS);
+            if (has_sentence) {
+                gps_status = gps.has_recent_fix(now_ms_u, GPS_FIX_TIMEOUT_MS)
+                                 ? Display::GPSStatus::Fix
+                                 : Display::GPSStatus::Searching;
+            }
+
+            bool time_valid = has_sentence && gps.has_time();
+            int hour = gps.utc_hour();
+            int min = gps.utc_min();
+
+            bool gps_changed = (gps_status != last_gps_status) ||
+                               (time_valid != last_gps_time_valid) ||
+                               (time_valid && (hour != last_gps_hour || min != last_gps_min));
+            if (gps_changed) {
+                bool updated = false;
+                if (lvgl_lock(100)) {
+                    display.setGPSStatus(gps_status);
+                    if (time_valid) {
+                        display.setTimeHM(hour, min, true);
+                    } else {
+                        display.setTimeHM(0, 0, false);
+                    }
+                    lvgl_unlock();
+                    updated = true;
+                }
+                if (updated) {
+                    request_lvgl_refresh();
+                    last_gps_status = gps_status;
+                    last_gps_time_valid = time_valid;
+                    last_gps_hour = hour;
+                    last_gps_min = min;
+                }
+            }
+        }
+
         if (g_focus_dirty) {
             Display::FocusTile focus_tile = g_focus_tile;
             g_focus_dirty = false;
@@ -765,6 +849,15 @@ extern "C" void app_main(void) {
             if (wd_ret != ESP_OK) {
                 ESP_LOGW(TAG, "BQ25629 watchdog reset failed: %s", esp_err_to_name(wd_ret));
             }
+        }
+
+        // Periodic hardware watchdog kick (TPL5010 DONE pulse)
+        if (now_ms_u - last_hw_wd_kick_ms >= HW_WD_KICK_INTERVAL_MS) {
+            last_hw_wd_kick_ms = now_ms_u;
+            gpio_set_level(HW_WD_RST_PIN, 0);
+            vTaskDelay(pdMS_TO_TICKS(HW_WD_PULSE_MS));
+            gpio_set_level(HW_WD_RST_PIN, 1);
+            ESP_LOGI(TAG, "HW watchdog kicked");
         }
 
         // Periodic charger debug logging (PMID/OTG behavior)

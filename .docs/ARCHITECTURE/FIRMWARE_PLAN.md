@@ -11,7 +11,7 @@
 | Phase 1.3 | 🟡 In Progress | 60% | CAP1203 integrated, focus navigation (T1/T2) done, menu actions pending |
 | Phase 1.4 | 🔴 Not Started | 0% | Quick menu pending |
 | Phase 2 | 🔴 Not Started | 0% | Recording system |
-| Phase 3 | 🔴 Not Started | 0% | GPS & sessions |
+| Phase 3 | 🟡 In Progress | 10% | GPS UART + basic NMEA parsing started |
 | Phase 4 | 🔴 Not Started | 0% | Tagging |
 | Phase 5 | 🔴 Not Started | 0% | LEDs & alerts |
 | Phase 6 | 🔴 Not Started | 0% | Settings menu |
@@ -293,8 +293,10 @@
 **Goal**: Enable autonomous GPS-enabled recording sessions
 
 #### 3.1 GPS Integration
-- [ ] NMEA parser for GPS module
-- [ ] GPS fix detection and accuracy tracking
+- [x] NMEA parser for GPS module (GGA/RMC)
+- [x] GPS fix detection (GGA/RMC status)
+- [x] UTC time from NMEA for UI (HH:MM)
+- [x] libnmea component integrated for NMEA parsing
 - [ ] RTC sync from GPS (when fix available)
 
 #### 3.2 Session Management
@@ -554,7 +556,7 @@ documents/
 | HW-104 | ShioMode entry | Long press 5s | Display clears, charger enters ship mode | [ ] |
 | HW-105 | ShioMode exit | Press QON button | Device boots, display initializes | [ ] |
 | HW-106 | Load switch (IO4) | Toggle load switch | SPS30 and peripherals power on/off | [ ] |
-| HW-107 | Watchdog reset | Allow 5min+ timeout | External watchdog resets device | [ ] |
+| HW-107 | Watchdog reset | Allow 5min+ timeout | External watchdog resets device | [x] |
 | HW-108 | Sleep current | Measure in ShioMode | < 10µA (target) | [ ] |
 | HW-109 | BQ25629 I2C comm | Read charger registers | Device ID and status readable | [ ] |
 | HW-10A | BQ25629 charge termination | Charge to 100% | Charging stops at correct voltage | [ ] |
