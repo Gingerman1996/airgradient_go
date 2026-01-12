@@ -10,6 +10,8 @@ idf_component_register(
         "esp_sgp4x"
         "sps30"
         "sensirion_gas_index_algorithm"
+        "cap1203"
+        "bq25629"
         "esp_epaper"
         "esp_lcd"
         "lvgl"

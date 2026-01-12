@@ -184,6 +184,15 @@ static esp_err_t init_i2c_bus(i2c_master_bus_handle_t &i2c_bus_handle) {
     return ESP_OK;
 }
 
+// Public method to initialize I2C bus (can be called before full init())
+esp_err_t Sensors::initI2CBus(void) {
+    if (!state) {
+        ESP_LOGE(TAG_SENS, "Sensors state not initialized");
+        return ESP_ERR_INVALID_STATE;
+    }
+    return init_i2c_bus(state->i2c_bus_handle);
+}
+
 // Initialize STCC4 CO2 sensor (SCD4x variant) on I2C bus.
 // Reads product ID with 3 retries, then puts sensor to sleep mode.
 // Sensor will wake up on first measurement cycle.
@@ -488,7 +497,7 @@ static void update_sps30(Sensors::SensorsState *st, int64_t now_ms) {
 }
 
 esp_err_t Sensors::init(void) {
-    esp_log_level_set("STCC4", ESP_LOG_DEBUG);
+    esp_log_level_set(TAG_SENS, ESP_LOG_DEBUG);
     ESP_ERROR_CHECK_WITHOUT_ABORT(init_i2c_bus(state->i2c_bus_handle));
     esp_err_t ok1 = init_stcc4_sensor(state);
     esp_err_t ok2 = init_sgp4x_sensor(state);
@@ -522,4 +531,19 @@ void Sensors::getValues(int64_t now_ms, sensor_values_t *out) {
     out->nox_ticks = (int)state->sgp_nox_ticks;
     out->voc_index = (int)state->voc_index;
     out->nox_index = (int)state->nox_index;
+}
+
+i2c_master_bus_handle_t Sensors::getI2CBusHandle(void) {
+    if (!state) return NULL;
+    
+    // Auto-initialize I2C bus if not already done
+    if (state->i2c_bus_handle == NULL) {
+        esp_err_t ret = initI2CBus();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG_SENS, "Failed to auto-initialize I2C bus: %s", esp_err_to_name(ret));
+            return NULL;
+        }
+    }
+    
+    return state->i2c_bus_handle;
 }

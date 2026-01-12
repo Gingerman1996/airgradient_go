@@ -158,25 +158,25 @@ bool Display::init(uint16_t w, uint16_t h)
     lv_label_set_text(state->bt_logo, LV_SYMBOL_BLUETOOTH);
     lv_obj_set_style_text_color(state->bt_logo, lv_color_black(), 0);
     lv_obj_set_style_text_font(state->bt_logo, &lv_font_montserrat_16, 0);
-    lv_obj_align(state->bt_logo, LV_ALIGN_TOP_MID, -35, 2);
+    lv_obj_align(state->bt_logo, LV_ALIGN_TOP_MID, -50, 2);
 
     state->wifi_logo = lv_label_create(state->root);
     lv_label_set_text(state->wifi_logo, LV_SYMBOL_WIFI);
     lv_obj_set_style_text_color(state->wifi_logo, lv_color_black(), 0);
     lv_obj_set_style_text_font(state->wifi_logo, &lv_font_montserrat_16, 0);
-    lv_obj_align(state->wifi_logo, LV_ALIGN_TOP_MID, -10, 2);
+    lv_obj_align(state->wifi_logo, LV_ALIGN_TOP_MID, -25, 2);
 
     state->gps_logo = lv_label_create(state->root);
     lv_label_set_text(state->gps_logo, LV_SYMBOL_GPS);
     lv_obj_set_style_text_color(state->gps_logo, lv_color_black(), 0);
     lv_obj_set_style_text_font(state->gps_logo, &lv_font_montserrat_16, 0);
-    lv_obj_align(state->gps_logo, LV_ALIGN_TOP_MID, 15, 2);
+    lv_obj_align(state->gps_logo, LV_ALIGN_TOP_MID, 0, 2);
 
     state->battery_logo = lv_label_create(state->root);
     lv_label_set_text(state->battery_logo, LV_SYMBOL_BATTERY_EMPTY);
     lv_obj_set_style_text_color(state->battery_logo, lv_color_black(), 0);
     lv_obj_set_style_text_font(state->battery_logo, &lv_font_montserrat_16, 0);
-    lv_obj_align(state->battery_logo, LV_ALIGN_TOP_MID, 40, 2);
+    lv_obj_align(state->battery_logo, LV_ALIGN_TOP_MID, 25, 2);
 
     // Second row: Alert, REC, Time, Interval
     state->alert_label = lv_label_create(state->root);
@@ -214,7 +214,7 @@ bool Display::init(uint16_t w, uint16_t h)
     lv_label_set_text(state->co2_unit_label, "CO2 (ppm)");
     lv_obj_set_style_text_font(state->co2_unit_label, &lv_font_montserrat_16, 0);
     lv_obj_set_style_text_color(state->co2_unit_label, lv_color_black(), 0);
-    lv_obj_align_to(state->co2_unit_label, state->co2_label, LV_ALIGN_TOP_RIGHT, 0, -10);
+    lv_obj_align_to(state->co2_unit_label, state->co2_label, LV_ALIGN_TOP_RIGHT, 0, -15);
 
     state->pm25_label = lv_label_create(state->root);
     lv_label_set_text(state->pm25_label, "-");
@@ -226,7 +226,7 @@ bool Display::init(uint16_t w, uint16_t h)
     lv_label_set_text(state->pm25_unit_label, "PM2.5 (ug/m3)");
     lv_obj_set_style_text_font(state->pm25_unit_label, &lv_font_montserrat_12, 0);
     lv_obj_set_style_text_color(state->pm25_unit_label, lv_color_black(), 0);
-    lv_obj_align_to(state->pm25_unit_label, state->pm25_label, LV_ALIGN_TOP_RIGHT, 0, -10);
+    lv_obj_align_to(state->pm25_unit_label, state->pm25_label, LV_ALIGN_TOP_RIGHT, 0, -15);
 
     // Bottom: Temp/RH on same line; VOC/NOx on right; pressure under interval
     state->temp_label = lv_label_create(state->root);

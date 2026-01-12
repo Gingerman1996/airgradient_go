@@ -103,6 +103,33 @@ enum class VBusStatus : uint8_t {
 };
 
 /**
+ * @brief BQ25629 Status Structure
+ */
+struct BQ25629_Status {
+  ChargeStatus charge_status;      // Charging status
+  VBusStatus vbus_status;          // VBUS/adapter status
+  bool adc_done_stat;              // ADC done (one-shot mode only)
+  bool treg_stat;                  // Thermal regulation active
+  bool vsys_stat;                  // VSYS in VSYSMIN regulation
+  bool iindpm_stat;                // IINDPM/ILIM (forward) or IOTG (OTG) regulation
+  bool vindpm_stat;                // VINDPM (forward) or VOTG (OTG) regulation
+  bool safety_tmr_stat;            // Safety timer expired
+  bool wd_stat;                    // Watchdog timer expired
+};
+
+/**
+ * @brief BQ25629 Fault Structure
+ */
+struct BQ25629_Fault {
+  bool vbus_fault;                 // VBUS fault (OVP or sleep comparator)
+  bool bat_fault;                  // Battery fault (IBAT OCP or VBAT OVP)
+  bool sys_fault;                  // VSYS fault (short or OVP)
+  bool otg_fault;                  // OTG fault (reverse current, UV, or OV)
+  bool tshut_fault;                // Thermal shutdown
+  uint8_t ts_stat;                 // TS temperature zone (TS_STAT[2:0])
+};
+
+/**
  * @brief BQ25629 Configuration Structure
  */
 struct BQ25629_Config {
@@ -231,6 +258,88 @@ public:
    * @return ESP_OK on success
    */
   esp_err_t reset_watchdog();
+
+  /**
+   * @brief Enable PMID discharge (force ~30mA discharge current)
+   * @param enable True to enable PMID discharge, false to disable
+   * @return ESP_OK on success
+   */
+  esp_err_t enable_pmid_discharge(bool enable);
+
+  /**
+   * @brief Set OTG boost voltage at PMID output
+   * @param voltage_mv Output voltage in mV (3840-5200mV, step 80mV)
+   * @return ESP_OK on success
+   */
+  esp_err_t set_votg_voltage(uint16_t voltage_mv);
+
+  /**
+   * @brief Disable HIZ mode (required for OTG boost operation)
+   * @return ESP_OK on success
+   */
+  esp_err_t disable_hiz_mode();
+
+  /**
+   * @brief Set TS_IGNORE to ignore thermistor check
+   * @param ignore True to ignore TS, false to enable TS check
+   * @return ESP_OK on success
+   */
+  esp_err_t set_ts_ignore(bool ignore);
+
+  /**
+   * @brief Enable PMID 5V boost output (complete setup sequence)
+   * 
+   * This function performs all steps needed to enable PMID 5V boost:
+   * 1. Disable HIZ mode
+   * 2. Set TS_IGNORE (if no thermistor)
+   * 3. Disable charging
+   * 4. Set VOTG to 5V
+   * 5. Disable bypass OTG
+   * 6. Enable OTG boost mode
+   * 7. Wait for stabilization
+   * 
+   * @return ESP_OK on success
+   */
+  esp_err_t enable_pmid_5v_boost();
+
+  /**
+   * @brief Enable bypass OTG mode (direct battery to PMID)
+   * @param enable True to enable bypass OTG, false to disable
+   * @return ESP_OK on success
+   */
+  esp_err_t enable_bypass_otg(bool enable);
+
+  /**
+   * @brief Enter ship mode (ultra-low power, 0.15 μA)
+   * @return ESP_OK on success
+   */
+  esp_err_t enter_ship_mode();
+
+  /**
+   * @brief Enter shutdown mode (ultra-low power, 0.1 μA)
+   * @return ESP_OK on success
+   */
+  esp_err_t enter_shutdown_mode();
+
+  /**
+   * @brief System power reset (power cycle)
+   * @return ESP_OK on success
+   */
+  esp_err_t system_power_reset();
+
+  /**
+   * @brief Read charger status
+   * @param status Output: charger status structure
+   * @return ESP_OK on success
+   */
+  esp_err_t read_status(BQ25629_Status &status);
+
+  /**
+   * @brief Read fault status
+   * @param fault Output: fault status structure
+   * @return ESP_OK on success
+   */
+  esp_err_t read_fault(BQ25629_Fault &fault);
 
   /**
    * @brief Check if battery is present

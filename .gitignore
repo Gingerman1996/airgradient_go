@@ -16,6 +16,7 @@ managed_components/
 .DS_Store
 .config
 .docs
+.github/
 
 ## Python Cache
 __pycache__/

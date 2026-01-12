@@ -1,8 +1,11 @@
 #include "sensor.h"
 #include "ui_display.h"
+#include "cap1203.h"
+#include "bq25629.h"
 
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "driver/gpio.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/semphr.h"
@@ -21,7 +24,54 @@
 #define LVGL_TASK_MAX_DELAY_MS  500
 #define LVGL_TASK_MIN_DELAY_MS  10
 
+// QON button configuration (GPIO5)
+#define QON_PIN                GPIO_NUM_5
+#define SHUTDOWN_HOLD_MS       5000  // 5 seconds long press to shutdown
+
 static SemaphoreHandle_t lvgl_mux = NULL;
+static bool shutdown_requested = false;
+static Display* g_display = nullptr;
+static epd_handle_t g_epd = nullptr;
+static lv_display_t* g_disp = nullptr;
+static drivers::BQ25629* g_charger = nullptr;
+
+// Button callback for CAP1203 (called when button events occur)
+static void button_event_callback(ButtonState state, void* user_data) {
+    static const char *TAG_BTN = "CAP1203";
+    
+    const char* button_name = "UNKNOWN";
+    switch (state.id) {
+        case ButtonID::BUTTON_LEFT:
+            button_name = "T1 (Left)";
+            break;
+        case ButtonID::BUTTON_MIDDLE:
+            button_name = "T2 (Middle)";
+            break;
+        case ButtonID::BUTTON_RIGHT:
+            button_name = "T3 (Right)";
+            break;
+        default:
+            button_name = "NONE";
+            break;
+    }
+    
+    switch (state.event) {
+        case ButtonEvent::PRESS:
+            ESP_LOGI(TAG_BTN, "[%s] PRESS", button_name);
+            break;
+        case ButtonEvent::RELEASE:
+            ESP_LOGI(TAG_BTN, "[%s] RELEASE (duration: %lu ms)", button_name, state.press_duration_ms);
+            break;
+        case ButtonEvent::SHORT_PRESS:
+            ESP_LOGI(TAG_BTN, "[%s] SHORT_PRESS", button_name);
+            break;
+        case ButtonEvent::LONG_PRESS:
+            ESP_LOGI(TAG_BTN, "[%s] LONG_PRESS (duration: %lu ms)", button_name, state.press_duration_ms);
+            break;
+        default:
+            break;
+    }
+}
 
 // LVGL tick timer callback (increments LVGL internal tick counter)
 static void lv_tick_timer_cb(void *arg) {
@@ -37,6 +87,134 @@ static bool lvgl_lock(int timeout_ms) {
 // Unlock LVGL mutex
 static void lvgl_unlock(void) {
     xSemaphoreGive(lvgl_mux);
+}
+
+// Shutdown sequence with visual feedback
+static void initiate_shutdown(void) {
+    static const char *TAG = "Shutdown";
+    ESP_LOGI(TAG, "========== SHUTDOWN SEQUENCE STARTED ==========");
+    
+    // Phase 1: Stopping sensors
+    ESP_LOGI(TAG, "Phase 1: Stopping sensors...");
+    if (lvgl_lock(1000) && g_display) {
+        lv_obj_t* label = lv_label_create(lv_screen_active());
+        lv_label_set_text(label, "Shutting down...\n\nStopping sensors...");
+        lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        epd_lvgl_refresh(g_disp);
+        lvgl_unlock();
+    }
+    vTaskDelay(pdMS_TO_TICKS(800));
+    
+    // TODO: Stop sensor tasks when implemented
+    
+    // Phase 2: Stopping recording
+    ESP_LOGI(TAG, "Phase 2: Stopping recording...");
+    if (lvgl_lock(1000) && g_display) {
+        lv_obj_t* label = lv_label_create(lv_screen_active());
+        lv_label_set_text(label, "Shutting down...\n\nStopping recording...");
+        lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        epd_lvgl_refresh(g_disp);
+        lvgl_unlock();
+    }
+    vTaskDelay(pdMS_TO_TICKS(800));
+    
+    // TODO: Stop recording when implemented
+    
+    // Phase 3: Saving data
+    ESP_LOGI(TAG, "Phase 3: Saving data...");
+    if (lvgl_lock(1000) && g_display) {
+        lv_obj_t* label = lv_label_create(lv_screen_active());
+        lv_label_set_text(label, "Shutting down...\n\nSaving data...");
+        lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        epd_lvgl_refresh(g_disp);
+        lvgl_unlock();
+    }
+    vTaskDelay(pdMS_TO_TICKS(800));
+    
+    // TODO: Save pending data to flash when implemented
+    
+    // Phase 4: Powering off
+    ESP_LOGI(TAG, "Phase 4: Powering off...");
+    if (lvgl_lock(1000) && g_display) {
+        lv_obj_t* label = lv_label_create(lv_screen_active());
+        lv_label_set_text(label, "Powering off...\n\nGoodbye!");
+        lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+        lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+        epd_lvgl_refresh(g_disp);
+        lvgl_unlock();
+    }
+    vTaskDelay(pdMS_TO_TICKS(1000));
+    
+    // Phase 5: Clear display (prevent ghosting)
+    ESP_LOGI(TAG, "Phase 5: Clearing display...");
+    if (g_epd) {
+        epd_clear(g_epd);
+        vTaskDelay(pdMS_TO_TICKS(100));  // Wait for clear to complete
+    }
+    
+    // Phase 6: Enter ship mode
+    ESP_LOGI(TAG, "Phase 6: Entering ship mode...");
+    if (g_charger) {
+        g_charger->enter_ship_mode();
+        ESP_LOGI(TAG, "Ship mode command sent. System will power off shortly.");
+    } else {
+        ESP_LOGW(TAG, "Charger not initialized, cannot enter ship mode!");
+    }
+    
+    // Wait for ship mode to take effect (system should power off)
+    // If we reach here, ship mode failed
+    ESP_LOGI(TAG, "Waiting for power off...");
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    
+    ESP_LOGE(TAG, "System did not power off! Ship mode may have failed.");
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
+
+// QON button monitor task
+static void qon_button_task(void *arg) {
+    static const char *TAG = "QON_Button";
+    
+    uint64_t qon_press_start_ms = 0;
+    bool was_pressed = false;
+    
+    ESP_LOGI(TAG, "QON button monitor started on GPIO%d", QON_PIN);
+    ESP_LOGI(TAG, "Hold for %d ms to initiate shutdown", SHUTDOWN_HOLD_MS);
+    
+    while (1) {
+        // Active low (pressed = 0)
+        bool is_pressed = (gpio_get_level(QON_PIN) == 0);
+        uint64_t now_ms = esp_timer_get_time() / 1000;
+        
+        if (is_pressed && !was_pressed) {
+            // Button just pressed
+            qon_press_start_ms = now_ms;
+            ESP_LOGI(TAG, "QON button pressed");
+        }
+        else if (is_pressed && was_pressed && !shutdown_requested) {
+            // Button still held
+            uint64_t hold_duration_ms = now_ms - qon_press_start_ms;
+            
+            if (hold_duration_ms >= SHUTDOWN_HOLD_MS) {
+                ESP_LOGI(TAG, "QON button held for %llu ms - SHUTDOWN!", hold_duration_ms);
+                shutdown_requested = true;
+                initiate_shutdown();
+            }
+        }
+        else if (!is_pressed && was_pressed) {
+            // Button released
+            uint64_t hold_duration_ms = now_ms - qon_press_start_ms;
+            ESP_LOGI(TAG, "QON button released after %llu ms", hold_duration_ms);
+            qon_press_start_ms = 0;
+        }
+        
+        was_pressed = is_pressed;
+        vTaskDelay(pdMS_TO_TICKS(50));  // Poll every 50ms
+    }
 }
 
 // LVGL handler task (processes display updates)
@@ -60,10 +238,25 @@ static void lv_handler_task(void *arg) {
 // Phase 1.1: Dashboard display with real sensor data
 extern "C" void app_main(void) {
     static const char *TAG = "app_main";
+    esp_log_level_set(TAG, ESP_LOG_DEBUG);
+    const uint64_t RECORDING_INTERVAL_MS = 10000;  // 10s default, matches UI interval
 
     ESP_LOGI(TAG, "=== AirGradient GO - Phase 1.1 ===");
     ESP_LOGI(TAG, "Initializing display and sensors...");
 
+    // ==================== GPIO INITIALIZATION ====================
+    
+    // Configure QON button (GPIO5) as input with pull-up
+    gpio_config_t qon_cfg = {
+        .pin_bit_mask = (1ULL << QON_PIN),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_ERROR_CHECK(gpio_config(&qon_cfg));
+    ESP_LOGI(TAG, "QON button (GPIO%d) configured", QON_PIN);
+    
     // ==================== DISPLAY INITIALIZATION ====================
     
     // Initialize LVGL
@@ -86,12 +279,12 @@ extern "C" void app_main(void) {
     epd_cfg.panel.mirror_y = false;
     epd_cfg.panel.rotation = 0;
 
-    epd_handle_t epd = NULL;
-    esp_err_t ret = epd_init(&epd_cfg, &epd);
+    esp_err_t ret = epd_init(&epd_cfg, &g_epd);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to init e-paper: %s", esp_err_to_name(ret));
         return;
     }
+    epd_handle_t epd = g_epd;  // Local alias for compatibility
 
     // Get panel info
     epd_panel_info_t panel_info;
@@ -107,12 +300,13 @@ extern "C" void app_main(void) {
     lvgl_cfg.partial_threshold = 1000;          // Partial refresh threshold
     lvgl_cfg.dither_mode = EPD_DITHER_NONE;     // Disable dithering for crisp B/W text
 
-    lv_display_t *disp = epd_lvgl_init(&lvgl_cfg);
-    if (!disp) {
+    g_disp = epd_lvgl_init(&lvgl_cfg);
+    if (!g_disp) {
         ESP_LOGE(TAG, "Failed to init LVGL display");
         epd_deinit(epd);
         return;
     }
+    lv_display_t *disp = g_disp;  // Local alias for compatibility
 
     // Setup LVGL tick timer
     esp_timer_create_args_t lvgl_tick_timer_args = {
@@ -130,6 +324,8 @@ extern "C" void app_main(void) {
     // ==================== UI CREATION ====================
     
     Display display;
+    g_display = &display;  // Store pointer for shutdown access
+    
     if (lvgl_lock(-1)) {
         bool ui_ok = display.init(DISPLAY_WIDTH, DISPLAY_HEIGHT);
         if (!ui_ok) {
@@ -148,7 +344,7 @@ extern "C" void app_main(void) {
         display.setBLEStatus(Display::BLEStatus::Connected);    // BLE icon visible
         display.setBattery(100, true);                           // Battery 100% + charging
         display.setRecording(true);                              // REC icon visible
-        display.setIntervalSeconds(10);                          // Interval shown
+        display.setIntervalSeconds(RECORDING_INTERVAL_MS / 1000); // Interval shown
         display.setTimeHM(23, 59, true);                        // Time 23:59 (4 digits)
         display.setAlert(true);                                  // Alert icon visible
         
@@ -176,15 +372,204 @@ extern "C" void app_main(void) {
     ESP_LOGI(TAG, "TEST SCREEN visible, waiting 3 seconds...");
     vTaskDelay(pdMS_TO_TICKS(3000));
 
+    // ==================== I2C BUS INITIALIZATION ====================
+    
+    // Initialize I2C bus first (needed for BQ25629 and sensors)
+    ESP_LOGI(TAG, "Initializing I2C bus...");
+    Sensors sensors;
+    i2c_master_bus_handle_t i2c_bus = sensors.getI2CBusHandle();
+    if (i2c_bus == NULL) {
+        ESP_LOGE(TAG, "Failed to get I2C bus handle");
+        return;
+    }
+    
+    // ==================== CHARGER INITIALIZATION (BEFORE SENSORS!) ====================
+    
+    // CRITICAL: Initialize BQ25629 BEFORE sensors to ensure PMID power path is ready
+    // PMID provides power to VSYS which powers all sensors including SPS30
+    ESP_LOGI(TAG, "Initializing BQ25629 battery charger (PMID power path)...");
+    g_charger = new drivers::BQ25629(i2c_bus);
+    
+    drivers::BQ25629_Config charger_cfg = {
+        .charge_voltage_mv = 4200,       // 4.2V (full charge for Li-ion)
+        .charge_current_ma = 1000,       // 1A charging
+        .input_current_limit_ma = 1500,  // 1.5A input limit
+        .input_voltage_limit_mv = 4600,  // 4.6V VINDPM
+        .min_system_voltage_mv = 3520,   // 3.52V minimum
+        .precharge_current_ma = 30,      // 30mA pre-charge
+        .term_current_ma = 20,           // 20mA termination
+        .enable_charging = true,         // Enable charging
+        .enable_otg = false,             // Disable OTG mode
+        .enable_adc = true,              // Enable ADC for monitoring
+    };
+    
+    ret = g_charger->init(charger_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "BQ25629 init failed: %s", esp_err_to_name(ret));
+        delete g_charger;
+        g_charger = nullptr;
+    } else {
+        ESP_LOGI(TAG, "BQ25629 initialized successfully");
+        
+        // Verify PMID is working by reading ADC
+        drivers::BQ25629_ADC_Data adc_data;
+        ret = g_charger->read_adc(adc_data);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "PMID voltage: %u mV, VSYS: %u mV, VBAT: %u mV", 
+                     adc_data.vpmid_mv, adc_data.vsys_mv, adc_data.vbat_mv);
+            
+            if (adc_data.vpmid_mv < 3000) {
+                ESP_LOGW(TAG, "PMID voltage too low! Power path may not be working correctly");
+            }
+        } else {
+            ESP_LOGW(TAG, "Failed to read BQ25629 ADC: %s", esp_err_to_name(ret));
+        }
+        
+        // Ensure PMID discharge is disabled (not forcing discharge)
+        g_charger->enable_pmid_discharge(false);
+        
+        // Configure PMID for 5V OTG boost output
+        ESP_LOGI(TAG, "Configuring PMID for 5V boost output...");
+        
+        // Read initial status and faults
+        drivers::BQ25629_Status charger_status;
+        drivers::BQ25629_Fault charger_fault;
+        
+        ret = g_charger->read_status(charger_status);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG,
+                     "Initial status - VBUS: %d, CHG: %d, VSYS_REG: %d, IINDPM: %d, VINDPM: %d",
+                     (int)charger_status.vbus_status,
+                     (int)charger_status.charge_status,
+                     charger_status.vsys_stat,
+                     charger_status.iindpm_stat,
+                     charger_status.vindpm_stat);
+        }
+        
+        ret = g_charger->read_fault(charger_fault);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG,
+                     "Fault status - VBUS_FAULT: %d, BAT_FAULT: %d, SYS_FAULT: %d, "
+                     "OTG_FAULT: %d, TSHUT: %d, TS_STAT: %u",
+                     charger_fault.vbus_fault,
+                     charger_fault.bat_fault,
+                     charger_fault.sys_fault,
+                     charger_fault.otg_fault,
+                     charger_fault.tshut_fault,
+                     charger_fault.ts_stat);
+        }
+        
+        // Enable PMID 5V boost using complete setup sequence
+        ESP_LOGI(TAG, "Enabling PMID 5V boost output...");
+        ret = g_charger->enable_pmid_5v_boost();
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to enable PMID 5V boost: %s", esp_err_to_name(ret));
+        }
+        
+        // Wait for boost to stabilize
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        // Read status and faults after boost enable
+        ret = g_charger->read_status(charger_status);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "After boost - VBUS: %d, CHG: %d, IOTG_REG: %d, VOTG_REG: %d",
+                     (int)charger_status.vbus_status,
+                     (int)charger_status.charge_status,
+                     charger_status.iindpm_stat,
+                     charger_status.vindpm_stat);
+        }
+        
+        ret = g_charger->read_fault(charger_fault);
+        if (ret == ESP_OK) {
+            if (charger_fault.otg_fault || charger_fault.tshut_fault ||
+                charger_fault.ts_stat != 0) {
+                ESP_LOGW(TAG, "OTG fault/TS condition - OTG: %d, TSHUT: %d, TS_STAT: %u",
+                         charger_fault.otg_fault,
+                         charger_fault.tshut_fault,
+                         charger_fault.ts_stat);
+                ESP_LOGW(TAG, "PMID_GD may be LOW due to fault/TS condition");
+            } else {
+                ESP_LOGI(TAG, "No OTG faults detected");
+            }
+        }
+        
+        // Re-read ADC to verify boost voltage
+        ret = g_charger->read_adc(adc_data);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Final PMID: %u mV, VSYS: %u mV, VBUS: %u mV, VBAT: %u mV", 
+                     adc_data.vpmid_mv, adc_data.vsys_mv, adc_data.vbus_mv, adc_data.vbat_mv);
+            
+            if (adc_data.vpmid_mv >= 4500) {
+                ESP_LOGI(TAG, "PMID boost successful! PMID_GD should be HIGH");
+            } else {
+                ESP_LOGW(TAG, "PMID voltage lower than expected (%umV vs 5000mV target)", 
+                         adc_data.vpmid_mv);
+            }
+        }
+        
+        ESP_LOGI(TAG, "PMID power path ready for sensors");
+    }
+    
+    // Wait a bit for PMID to stabilize
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
     // ==================== SENSOR INITIALIZATION ====================
     
-    Sensors sensors;
+    ESP_LOGI(TAG, "Initializing sensors (now that PMID power is ready)...");
     ret = sensors.init();
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Sensors init failed: %s", esp_err_to_name(ret));
     } else {
-        ESP_LOGI(TAG, "Sensors initialized");
+        ESP_LOGI(TAG, "Sensors initialized successfully");
     }
+
+    // ==================== BUTTON INITIALIZATION ====================
+    
+    ESP_LOGI(TAG, "Initializing CAP1203 capacitive buttons...");
+    
+    if (i2c_bus != NULL) {
+        CAP1203* touchButtons = new CAP1203(i2c_bus);
+        ret = touchButtons->init();
+        if (ret != ESP_OK) {
+            ESP_LOGE(TAG, "CAP1203 init failed: %s", esp_err_to_name(ret));
+            delete touchButtons;
+            touchButtons = NULL;
+        } else {
+            ESP_LOGI(TAG, "CAP1203 initialized successfully");
+            touchButtons->setButtonCallback(button_event_callback, NULL);
+            ESP_LOGI(TAG, "Button callback registered. Touch T1/T2/T3 to test!");
+            
+            // Create button processing task
+            xTaskCreatePinnedToCore(
+                [](void* param) {
+                    CAP1203* buttons = (CAP1203*)param;
+                    while (true) {
+                        buttons->processButtons();
+                        vTaskDelay(pdMS_TO_TICKS(10));  // Poll every 10ms
+                    }
+                },
+                "ButtonTask",
+                4096,
+                touchButtons,
+                5,  // Priority
+                NULL,
+                tskNO_AFFINITY
+            );
+        }
+    }
+    
+    // ==================== QON BUTTON TASK ====================
+    
+    ESP_LOGI(TAG, "Starting QON button monitor task...");
+    xTaskCreatePinnedToCore(
+        qon_button_task,
+        "QON_Task",
+        4096,
+        NULL,
+        6,  // High priority for shutdown detection
+        NULL,
+        tskNO_AFFINITY
+    );
 
     // ==================== MAIN LOOP ====================
     
@@ -193,7 +578,12 @@ extern "C" void app_main(void) {
     uint64_t last_display_update_ms = 0;
     uint64_t last_display_refresh_ms = 0;
     const uint64_t DISPLAY_UPDATE_INTERVAL_MS = 1000;    // Update values every 1s
-    const uint64_t DISPLAY_REFRESH_INTERVAL_MS = 30000;  // Partial refresh every 30s
+    const uint64_t DISPLAY_REFRESH_INTERVAL_MS = RECORDING_INTERVAL_MS; // Follow recording interval
+    bool initial_display_refresh_done = false;
+    uint64_t last_charger_log_ms = 0;
+    const uint64_t CHARGER_LOG_INTERVAL_MS = 2000;       // Debug log interval
+    uint64_t last_wd_kick_ms = 0;
+    const uint64_t WD_KICK_INTERVAL_MS = 10000;          // Reset charger watchdog
 
     while (true) {
         int64_t now_ms = esp_timer_get_time() / 1000;
@@ -212,9 +602,11 @@ extern "C" void app_main(void) {
                 sensor_values_t vals;
                 sensors.getValues(now_ms, &vals);
                 
-                display.setCO2(vals.co2_ppm_avg);
-                display.setTempCf(vals.temp_c_avg);
-                display.setRHf(vals.rh_avg);
+                if (vals.have_co2_avg) {
+                    display.setCO2(vals.co2_ppm_avg);
+                    display.setTempCf(vals.temp_c_avg);
+                    display.setRHf(vals.rh_avg);
+                }
                 display.setPM25f(vals.pm25_mass);
                 display.setVOC(vals.voc_index);
                 display.setNOx(vals.nox_index);
@@ -223,11 +615,29 @@ extern "C" void app_main(void) {
                 // Update blink animations (REC, charging)
                 display.update(now_ms_u);
                 
+                ESP_LOGD(TAG,
+                         "Display updated - CO2: %d ppm (avg_ready=%d), T: %.1fC, RH: %.1f%%, "
+                         "PM2.5: %.1f, VOC idx: %d, NOx idx: %d",
+                         vals.co2_ppm_avg,
+                         vals.have_co2_avg,
+                         vals.temp_c_avg,
+                         vals.rh_avg,
+                         vals.pm25_mass,
+                         vals.voc_index,
+                         vals.nox_index);
+
+                if (!initial_display_refresh_done) {
+                    ESP_LOGI(TAG, "Initial display refresh after first data update");
+                    epd_lvgl_refresh(disp);
+                    initial_display_refresh_done = true;
+                    last_display_refresh_ms = now_ms_u;
+                }
+
                 lvgl_unlock();
             }
         }
 
-        // Periodic display refresh (partial) every 30 seconds
+        // Periodic display refresh (partial) per recording interval
         if (now_ms_u - last_display_refresh_ms >= DISPLAY_REFRESH_INTERVAL_MS) {
             last_display_refresh_ms = now_ms_u;
             
@@ -235,6 +645,70 @@ extern "C" void app_main(void) {
             if (lvgl_lock(100)) {
                 epd_lvgl_refresh(disp);
                 lvgl_unlock();
+            }
+        }
+
+        // Periodic charger watchdog reset to avoid OTG drop
+        if (g_charger && (now_ms_u - last_wd_kick_ms >= WD_KICK_INTERVAL_MS)) {
+            last_wd_kick_ms = now_ms_u;
+            esp_err_t wd_ret = g_charger->reset_watchdog();
+            if (wd_ret != ESP_OK) {
+                ESP_LOGW(TAG, "BQ25629 watchdog reset failed: %s", esp_err_to_name(wd_ret));
+            }
+        }
+
+        // Periodic charger debug logging (PMID/OTG behavior)
+        if (g_charger && (now_ms_u - last_charger_log_ms >= CHARGER_LOG_INTERVAL_MS)) {
+            last_charger_log_ms = now_ms_u;
+
+            drivers::BQ25629_Status charger_status = {};
+            drivers::BQ25629_Fault charger_fault = {};
+            drivers::BQ25629_ADC_Data adc_data = {};
+
+            esp_err_t status_ret = g_charger->read_status(charger_status);
+            esp_err_t fault_ret = g_charger->read_fault(charger_fault);
+            esp_err_t adc_ret = g_charger->read_adc(adc_data);
+
+            if (status_ret == ESP_OK) {
+                ESP_LOGI(TAG, "BQ25629 dbg - VBUS: %d, CHG: %d, IOTG_REG: %d, VOTG_REG: %d, WD: %d",
+                         (int)charger_status.vbus_status,
+                         (int)charger_status.charge_status,
+                         charger_status.iindpm_stat,
+                         charger_status.vindpm_stat,
+                         charger_status.wd_stat);
+            } else {
+                ESP_LOGW(TAG, "BQ25629 status read failed: %s", esp_err_to_name(status_ret));
+            }
+
+            if (fault_ret == ESP_OK) {
+                ESP_LOGI(TAG, "BQ25629 fault - OTG: %d, TSHUT: %d, TS_STAT: %u, VBUS: %d, BAT: %d, SYS: %d",
+                         charger_fault.otg_fault,
+                         charger_fault.tshut_fault,
+                         charger_fault.ts_stat,
+                         charger_fault.vbus_fault,
+                         charger_fault.bat_fault,
+                         charger_fault.sys_fault);
+                if (charger_fault.otg_fault || charger_fault.tshut_fault || charger_fault.ts_stat != 0) {
+                    ESP_LOGW(TAG, "BQ25629 fault/TS active - OTG: %d, TSHUT: %d, TS_STAT: %u",
+                             charger_fault.otg_fault,
+                             charger_fault.tshut_fault,
+                             charger_fault.ts_stat);
+                }
+            } else {
+                ESP_LOGW(TAG, "BQ25629 fault read failed: %s", esp_err_to_name(fault_ret));
+            }
+
+            if (adc_ret == ESP_OK) {
+                ESP_LOGI(TAG, "BQ25629 adc - VPMID: %u mV, VBAT: %u mV, VSYS: %u mV, VBUS: %u mV",
+                         adc_data.vpmid_mv,
+                         adc_data.vbat_mv,
+                         adc_data.vsys_mv,
+                         adc_data.vbus_mv);
+                if (adc_data.vpmid_mv < 4000) {
+                    ESP_LOGW(TAG, "PMID low: %u mV (VBAT: %u mV)", adc_data.vpmid_mv, adc_data.vbat_mv);
+                }
+            } else {
+                ESP_LOGW(TAG, "BQ25629 adc read failed: %s", esp_err_to_name(adc_ret));
             }
         }
 

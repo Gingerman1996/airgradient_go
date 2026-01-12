@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include "esp_err.h"
+#include "driver/i2c_master.h"  // For i2c_master_bus_handle_t
 
 // Aggregated sensor values for display
 typedef struct {
@@ -26,6 +27,9 @@ public:
     Sensors();
     ~Sensors();
 
+    // Initialize I2C bus only (can be called before init). Returns ESP_OK on success.
+    esp_err_t initI2CBus(void);
+
     // Initialize I2C and all sensors. Returns ESP_OK on success.
     esp_err_t init(void);
 
@@ -34,6 +38,9 @@ public:
 
     // Retrieve current display-ready values. Uses 5s average for CO2/Temp/RH.
     void getValues(int64_t now_ms, sensor_values_t *out);
+
+    // Get I2C bus handle (for sharing with other components like CAP1203)
+    i2c_master_bus_handle_t getI2CBusHandle(void);
 
 private:
     SensorsState *state;
