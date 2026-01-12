@@ -156,7 +156,7 @@ void GPS::update(uint64_t now_ms) {
                             line_buf_[log_len - 1] == '\n') {
                             log_len -= 2;
                         }
-                        ESP_LOGD(TAG, "NMEA RX: %.*s", (int)log_len, line_buf_);
+                        ESP_LOGV(TAG, "NMEA RX: %.*s", (int)log_len, line_buf_);
                     }
                     handle_sentence(line_buf_, line_len_, now_ms);
                 }
@@ -369,10 +369,30 @@ void GPS::log_status(uint64_t now_ms, uint64_t sentence_timeout_ms, uint64_t fix
     else if (ant == AntennaStatus::Short) ant_str = "SHORT";
 
     if (time_valid) {
-        ESP_LOGI(TAG, "GPS status=%s fix_q=%d sats=%d time=%02d:%02d ant=%s",
-                 status_str, fix_quality_, satellites_, hour, min, ant_str);
+        if (has_fix) {
+            ESP_LOGI(TAG,
+                     "GPS status=%s fix_q=%d sats=%d time=%02d:%02d ant=%s "
+                     "lat=%.5f lon=%.5f",
+                     status_str, fix_quality_, satellites_, hour, min, ant_str,
+                     lat_deg_, lon_deg_);
+        } else {
+            ESP_LOGI(TAG,
+                     "GPS status=%s fix_q=%d sats=%d time=%02d:%02d ant=%s "
+                     "lat=-- lon=--",
+                     status_str, fix_quality_, satellites_, hour, min, ant_str);
+        }
     } else {
-        ESP_LOGI(TAG, "GPS status=%s fix_q=%d sats=%d time=--:-- ant=%s",
-                 status_str, fix_quality_, satellites_, ant_str);
+        if (has_fix) {
+            ESP_LOGI(TAG,
+                     "GPS status=%s fix_q=%d sats=%d time=--:-- ant=%s "
+                     "lat=%.5f lon=%.5f",
+                     status_str, fix_quality_, satellites_, ant_str, lat_deg_,
+                     lon_deg_);
+        } else {
+            ESP_LOGI(TAG,
+                     "GPS status=%s fix_q=%d sats=%d time=--:-- ant=%s "
+                     "lat=-- lon=--",
+                     status_str, fix_quality_, satellites_, ant_str);
+        }
     }
 }

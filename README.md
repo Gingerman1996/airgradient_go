@@ -98,6 +98,7 @@ idf.py flash monitor
 |------|---------|
 | **MCU** | ESP32-C5-MINI-1 (WiFi + BLE) |
 | **Flash** | 4 MB (W25N512 NAND for storage) |
+| **Log Storage** | SPIFFS on W25N512 (log.txt) |
 | **Display** | SSD1680 e-paper (144×296px) |
 | **Sensors** | SHT4x, SGP41, SPS30, LIS2DH12, DPS368 |
 | **GPS** | TAU1113 (NMEA via UART) |

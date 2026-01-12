@@ -2,6 +2,7 @@ idf_component_register(
     SRCS
         airgradient-go.cpp
         gps.cpp
+        log_storage.cpp
         sensor.cpp
         ui_display.cpp
     INCLUDE_DIRS
@@ -17,6 +18,7 @@ idf_component_register(
         "esp_epaper"
         "esp_lcd"
         "lvgl"
+        "spiffs_nand"
 )
 
 # Optimize for size (OTA partition is 1 MB)
