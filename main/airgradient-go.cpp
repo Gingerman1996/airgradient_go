@@ -40,6 +40,7 @@ static Display::FocusTile g_focus_tile = Display::FocusTile::CO2;
 static bool g_focus_dirty = true;
 static volatile bool g_lvgl_refresh_requested = false;
 static volatile bool g_lvgl_refresh_urgent = false;
+static TaskHandle_t g_lvgl_task_handle = nullptr;
 
 // Button callback for CAP1203 (called when button events occur)
 static void button_event_callback(ButtonState state, void* user_data) {
@@ -78,15 +79,28 @@ static void button_event_callback(ButtonState state, void* user_data) {
             break;
     }
 
-    if (state.event == ButtonEvent::SHORT_PRESS) {
+    bool focus_event = (state.event == ButtonEvent::PRESS ||
+                        state.event == ButtonEvent::SHORT_PRESS ||
+                        state.event == ButtonEvent::LONG_PRESS);
+    if (focus_event) {
+        bool focus_changed = false;
+        const char* focus_label = nullptr;
         if (state.id == ButtonID::BUTTON_LEFT) {
-            g_focus_tile = Display::FocusTile::CO2;
-            g_focus_dirty = true;
-            ESP_LOGI(TAG_BTN, "Focus set to CO2 tile");
+            if (g_focus_tile != Display::FocusTile::CO2) {
+                g_focus_tile = Display::FocusTile::CO2;
+                focus_changed = true;
+                focus_label = "CO2";
+            }
         } else if (state.id == ButtonID::BUTTON_MIDDLE) {
-            g_focus_tile = Display::FocusTile::PM25;
+            if (g_focus_tile != Display::FocusTile::PM25) {
+                g_focus_tile = Display::FocusTile::PM25;
+                focus_changed = true;
+                focus_label = "PM2.5";
+            }
+        }
+        if (focus_changed) {
             g_focus_dirty = true;
-            ESP_LOGI(TAG_BTN, "Focus set to PM2.5 tile");
+            ESP_LOGI(TAG_BTN, "Focus set to %s tile", focus_label);
         }
     }
 }
@@ -153,10 +167,16 @@ static void lvgl_unlock(void) {
 
 static void request_lvgl_refresh(void) {
     g_lvgl_refresh_requested = true;
+    if (g_lvgl_task_handle) {
+        xTaskNotifyGive(g_lvgl_task_handle);
+    }
 }
 
 static void request_lvgl_refresh_urgent(void) {
     g_lvgl_refresh_urgent = true;
+    if (g_lvgl_task_handle) {
+        xTaskNotifyGive(g_lvgl_task_handle);
+    }
 }
 
 // Shutdown sequence with visual feedback
@@ -318,7 +338,7 @@ static void lv_handler_task(void *arg) {
         } else if (task_delay_ms < LVGL_TASK_MIN_DELAY_MS) {
             task_delay_ms = LVGL_TASK_MIN_DELAY_MS;
         }
-        vTaskDelay(pdMS_TO_TICKS(task_delay_ms));
+        ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(task_delay_ms));
     }
 }
 
@@ -407,7 +427,13 @@ extern "C" void app_main(void) {
 
     // Create LVGL task (ESP32-C5 is unicore, use tskNO_AFFINITY)
     lvgl_mux = xSemaphoreCreateMutex();
-    xTaskCreatePinnedToCore(lv_handler_task, "LVGL", 8 * 1024, NULL, 4, NULL, tskNO_AFFINITY);
+    xTaskCreatePinnedToCore(lv_handler_task,
+                            "LVGL",
+                            8 * 1024,
+                            NULL,
+                            4,
+                            &g_lvgl_task_handle,
+                            tskNO_AFFINITY);
 
     // ==================== UI CREATION ====================
     

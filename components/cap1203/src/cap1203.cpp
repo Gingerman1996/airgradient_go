@@ -124,10 +124,11 @@ esp_err_t CAP1203::init() {
         return ret;
     }
 
-    // Enable interrupts for all sensor inputs
+    // Enable interrupts so the INT bit latches touches and status clears on release.
+    // We still poll for status; the ALERT# pin does not need to be wired.
     ret = setInterruptEnable(true);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failed to enable interrupts");
+        ESP_LOGE(TAG, "Failed to configure interrupts");
         return ret;
     }
 
@@ -257,6 +258,12 @@ void CAP1203::setButtonCallback(button_callback_t callback, void* user_data) {
 void CAP1203::processButtons() {
     uint8_t current_status;
     if (getButtonStatus(&current_status) != ESP_OK) {
+        static uint32_t last_err_log_ms = 0;
+        uint32_t now_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        if (now_ms - last_err_log_ms >= 1000) {
+            ESP_LOGW(TAG, "CAP1203 read status failed");
+            last_err_log_ms = now_ms;
+        }
         return;
     }
 

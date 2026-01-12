@@ -249,7 +249,8 @@
 - [x] CAP1203 init + polling task + button callback integrated in main ✅
 - [x] T1 (Up): Move focus up between tiles (CO2/PM2.5) ✅
 - [x] T2 (Down): Move focus down between tiles (CO2/PM2.5) ✅
-- [x] Clear CAP1203 interrupt latch for repeated presses ✅
+- [x] Immediate focus update on press (PRESS/SHORT/LONG) + urgent refresh ✅
+- [x] Enable CAP1203 interrupts so latch clears for repeated presses ✅
 - [ ] T3 (Middle) short press: Quick Menu
 - [ ] T3 (Middle) long press: Start/Stop Session (with confirmation)
 - [ ] T2 (Down) long press: Touch lock/unlock
