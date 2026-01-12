@@ -2,7 +2,7 @@
  * @file bq25629.h
  * @brief BQ25629 Battery Charger Driver
  *
- * Driver for TI BQ25629 battery charge management IC
+ * Driver for TI BQ25628/BQ25629 battery charge management IC
  * Features:
  * - I2C-controlled 1-cell 2A battery charger
  * - NVDC power path management
@@ -17,8 +17,8 @@
 
 #pragma once
 
-#include "esp_err.h"
 #include "driver/i2c_master.h"
+#include "esp_err.h"
 #include <cstdint>
 
 namespace drivers {
@@ -27,56 +27,56 @@ namespace drivers {
  * @brief BQ25629 Register Addresses
  */
 namespace BQ25629_REG {
-  // Charging configuration registers
-  constexpr uint8_t CHARGE_CURRENT_LIMIT = 0x02;  // 16-bit
-  constexpr uint8_t CHARGE_VOLTAGE_LIMIT = 0x04;  // 16-bit
-  constexpr uint8_t INPUT_CURRENT_LIMIT = 0x06;   // 16-bit
-  constexpr uint8_t INPUT_VOLTAGE_LIMIT = 0x08;   // 16-bit
-  constexpr uint8_t VOTG_REGULATION = 0x0C;       // 16-bit
-  constexpr uint8_t MIN_SYSTEM_VOLTAGE = 0x0E;    // 16-bit
-  constexpr uint8_t PRECHARGE_CONTROL = 0x10;     // 16-bit
-  constexpr uint8_t TERMINATION_CONTROL = 0x12;   // 16-bit
+// Charging configuration registers
+constexpr uint8_t CHARGE_CURRENT_LIMIT = 0x02; // 16-bit
+constexpr uint8_t CHARGE_VOLTAGE_LIMIT = 0x04; // 16-bit
+constexpr uint8_t INPUT_CURRENT_LIMIT = 0x06;  // 16-bit
+constexpr uint8_t INPUT_VOLTAGE_LIMIT = 0x08;  // 16-bit
+constexpr uint8_t VOTG_REGULATION = 0x0C;      // 16-bit
+constexpr uint8_t MIN_SYSTEM_VOLTAGE = 0x0E;   // 16-bit
+constexpr uint8_t PRECHARGE_CONTROL = 0x10;    // 16-bit
+constexpr uint8_t TERMINATION_CONTROL = 0x12;  // 16-bit
 
-  // Control registers
-  constexpr uint8_t CHARGE_CONTROL = 0x14;
-  constexpr uint8_t CHARGE_TIMER_CONTROL = 0x15;
-  constexpr uint8_t CHARGER_CONTROL_0 = 0x16;
-  constexpr uint8_t CHARGER_CONTROL_1 = 0x17;
-  constexpr uint8_t CHARGER_CONTROL_2 = 0x18;
-  constexpr uint8_t CHARGER_CONTROL_3 = 0x19;
+// Control registers
+constexpr uint8_t CHARGE_CONTROL = 0x14;
+constexpr uint8_t CHARGE_TIMER_CONTROL = 0x15;
+constexpr uint8_t CHARGER_CONTROL_0 = 0x16;
+constexpr uint8_t CHARGER_CONTROL_1 = 0x17;
+constexpr uint8_t CHARGER_CONTROL_2 = 0x18;
+constexpr uint8_t CHARGER_CONTROL_3 = 0x19;
 
-  // NTC control registers
-  constexpr uint8_t NTC_CONTROL_0 = 0x1A;
-  constexpr uint8_t NTC_CONTROL_1 = 0x1B;
-  constexpr uint8_t NTC_CONTROL_2 = 0x1C;
+// NTC control registers
+constexpr uint8_t NTC_CONTROL_0 = 0x1A;
+constexpr uint8_t NTC_CONTROL_1 = 0x1B;
+constexpr uint8_t NTC_CONTROL_2 = 0x1C;
 
-  // Status and fault registers
-  constexpr uint8_t CHARGER_STATUS_0 = 0x1D;
-  constexpr uint8_t CHARGER_STATUS_1 = 0x1E;
-  constexpr uint8_t FAULT_STATUS_0 = 0x1F;
-  constexpr uint8_t CHARGER_FLAG_0 = 0x20;
-  constexpr uint8_t CHARGER_FLAG_1 = 0x21;
-  constexpr uint8_t FAULT_FLAG_0 = 0x22;
+// Status and fault registers
+constexpr uint8_t CHARGER_STATUS_0 = 0x1D;
+constexpr uint8_t CHARGER_STATUS_1 = 0x1E;
+constexpr uint8_t FAULT_STATUS_0 = 0x1F;
+constexpr uint8_t CHARGER_FLAG_0 = 0x20;
+constexpr uint8_t CHARGER_FLAG_1 = 0x21;
+constexpr uint8_t FAULT_FLAG_0 = 0x22;
 
-  // Mask registers
-  constexpr uint8_t CHARGER_MASK_0 = 0x23;
-  constexpr uint8_t CHARGER_MASK_1 = 0x24;
-  constexpr uint8_t FAULT_MASK_0 = 0x25;
+// Mask registers
+constexpr uint8_t CHARGER_MASK_0 = 0x23;
+constexpr uint8_t CHARGER_MASK_1 = 0x24;
+constexpr uint8_t FAULT_MASK_0 = 0x25;
 
-  // ADC registers
-  constexpr uint8_t ADC_CONTROL = 0x26;
-  constexpr uint8_t ADC_FUNCTION_DISABLE = 0x27;
-  constexpr uint8_t IBUS_ADC = 0x28;  // 16-bit
-  constexpr uint8_t IBAT_ADC = 0x2A;  // 16-bit
-  constexpr uint8_t VBUS_ADC = 0x2C;  // 16-bit
-  constexpr uint8_t VPMID_ADC = 0x2E; // 16-bit
-  constexpr uint8_t VBAT_ADC = 0x30;  // 16-bit
-  constexpr uint8_t VSYS_ADC = 0x32;  // 16-bit
-  constexpr uint8_t TS_ADC = 0x34;    // 16-bit
-  constexpr uint8_t TDIE_ADC = 0x36;  // 16-bit
+// ADC registers
+constexpr uint8_t ADC_CONTROL = 0x26;
+constexpr uint8_t ADC_FUNCTION_DISABLE = 0x27;
+constexpr uint8_t IBUS_ADC = 0x28;  // 16-bit
+constexpr uint8_t IBAT_ADC = 0x2A;  // 16-bit
+constexpr uint8_t VBUS_ADC = 0x2C;  // 16-bit
+constexpr uint8_t VPMID_ADC = 0x2E; // 16-bit
+constexpr uint8_t VBAT_ADC = 0x30;  // 16-bit
+constexpr uint8_t VSYS_ADC = 0x32;  // 16-bit
+constexpr uint8_t TS_ADC = 0x34;    // 16-bit
+constexpr uint8_t TDIE_ADC = 0x36;  // 16-bit
 
-  // Part information
-  constexpr uint8_t PART_INFORMATION = 0x38;
+// Part information
+constexpr uint8_t PART_INFORMATION = 0x38;
 } // namespace BQ25629_REG
 
 /**
@@ -94,11 +94,11 @@ enum class ChargeStatus : uint8_t {
  */
 enum class VBusStatus : uint8_t {
   NO_ADAPTER = 0x00,
-  USB_SDP = 0x01,      // 500mA
-  USB_CDP = 0x02,      // 1.5A
-  USB_DCP = 0x03,      // 1.5A
+  USB_SDP = 0x01, // 500mA
+  USB_CDP = 0x02, // 1.5A
+  USB_DCP = 0x03, // 1.5A
   UNKNOWN_ADAPTER = 0x04,
-  NON_STANDARD = 0x05,  // 1A/2.1A/2.4A
+  NON_STANDARD = 0x05, // 1A/2.1A/2.4A
   OTG_MODE = 0x07
 };
 
@@ -106,27 +106,27 @@ enum class VBusStatus : uint8_t {
  * @brief BQ25629 Status Structure
  */
 struct BQ25629_Status {
-  ChargeStatus charge_status;      // Charging status
-  VBusStatus vbus_status;          // VBUS/adapter status
-  bool adc_done_stat;              // ADC done (one-shot mode only)
-  bool treg_stat;                  // Thermal regulation active
-  bool vsys_stat;                  // VSYS in VSYSMIN regulation
-  bool iindpm_stat;                // IINDPM/ILIM (forward) or IOTG (OTG) regulation
-  bool vindpm_stat;                // VINDPM (forward) or VOTG (OTG) regulation
-  bool safety_tmr_stat;            // Safety timer expired
-  bool wd_stat;                    // Watchdog timer expired
+  ChargeStatus charge_status; // Charging status
+  VBusStatus vbus_status;     // VBUS/adapter status
+  bool adc_done_stat;         // ADC done (one-shot mode only)
+  bool treg_stat;             // Thermal regulation active
+  bool vsys_stat;             // VSYS in VSYSMIN regulation
+  bool iindpm_stat;           // IINDPM/ILIM (forward) or IOTG (OTG) regulation
+  bool vindpm_stat;           // VINDPM (forward) or VOTG (OTG) regulation
+  bool safety_tmr_stat;       // Safety timer expired
+  bool wd_stat;               // Watchdog timer expired
 };
 
 /**
  * @brief BQ25629 Fault Structure
  */
 struct BQ25629_Fault {
-  bool vbus_fault;                 // VBUS fault (OVP or sleep comparator)
-  bool bat_fault;                  // Battery fault (IBAT OCP or VBAT OVP)
-  bool sys_fault;                  // VSYS fault (short or OVP)
-  bool otg_fault;                  // OTG fault (reverse current, UV, or OV)
-  bool tshut_fault;                // Thermal shutdown
-  uint8_t ts_stat;                 // TS temperature zone (TS_STAT[2:0])
+  bool vbus_fault;  // VBUS fault (OVP or sleep comparator)
+  bool bat_fault;   // Battery fault (IBAT OCP or VBAT OVP)
+  bool sys_fault;   // VSYS fault (short or OVP)
+  bool otg_fault;   // OTG fault (reverse current, UV, or OV)
+  bool tshut_fault; // Thermal shutdown
+  uint8_t ts_stat;  // TS temperature zone (TS_STAT[2:0])
 };
 
 /**
@@ -149,8 +149,9 @@ struct BQ25629_Config {
  * @brief BQ25629 ADC Measurements
  */
 struct BQ25629_ADC_Data {
-  int16_t ibus_ma;   // Input current (negative = discharging)
-  int16_t ibat_ma;   // Battery current (positive = charging, negative = discharging)
+  int16_t ibus_ma; // Input current (negative = discharging)
+  int16_t
+      ibat_ma; // Battery current (positive = charging, negative = discharging)
   uint16_t vbus_mv;  // Input voltage
   uint16_t vpmid_mv; // PMID voltage
   uint16_t vbat_mv;  // Battery voltage
@@ -288,7 +289,7 @@ public:
 
   /**
    * @brief Enable PMID 5V boost output (complete setup sequence)
-   * 
+   *
    * This function performs all steps needed to enable PMID 5V boost:
    * 1. Disable HIZ mode
    * 2. Set TS_IGNORE (if no thermistor)
@@ -297,7 +298,7 @@ public:
    * 5. Disable bypass OTG
    * 6. Enable OTG boost mode
    * 7. Wait for stabilization
-   * 
+   *
    * @return ESP_OK on success
    */
   esp_err_t enable_pmid_5v_boost();
