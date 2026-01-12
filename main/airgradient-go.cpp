@@ -34,6 +34,7 @@ static Display* g_display = nullptr;
 static epd_handle_t g_epd = nullptr;
 static lv_display_t* g_disp = nullptr;
 static drivers::BQ25629* g_charger = nullptr;
+static CAP1203* g_buttons = nullptr;
 
 // Button callback for CAP1203 (called when button events occur)
 static void button_event_callback(ButtonState state, void* user_data) {
@@ -42,13 +43,13 @@ static void button_event_callback(ButtonState state, void* user_data) {
     const char* button_name = "UNKNOWN";
     switch (state.id) {
         case ButtonID::BUTTON_LEFT:
-            button_name = "T1 (Left)";
+            button_name = "T1 (Up)";
             break;
         case ButtonID::BUTTON_MIDDLE:
-            button_name = "T2 (Middle)";
+            button_name = "T2 (Down)";
             break;
         case ButtonID::BUTTON_RIGHT:
-            button_name = "T3 (Right)";
+            button_name = "T3 (Middle)";
             break;
         default:
             button_name = "NONE";
@@ -71,6 +72,50 @@ static void button_event_callback(ButtonState state, void* user_data) {
         default:
             break;
     }
+}
+
+static esp_err_t init_cap1203(i2c_master_bus_handle_t i2c_bus) {
+    static const char *TAG_BTN = "CAP1203";
+    if (i2c_bus == NULL) {
+        ESP_LOGE(TAG_BTN, "I2C bus handle is NULL");
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    if (g_buttons) {
+        ESP_LOGW(TAG_BTN, "CAP1203 already initialized");
+        return ESP_OK;
+    }
+
+    g_buttons = new CAP1203(i2c_bus);
+    esp_err_t ret = g_buttons->init();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG_BTN, "CAP1203 init failed: %s", esp_err_to_name(ret));
+        delete g_buttons;
+        g_buttons = nullptr;
+        return ret;
+    }
+
+    g_buttons->setButtonCallback(button_event_callback, NULL);
+    ESP_LOGI(TAG_BTN, "Button callback registered. Touch T1/T2/T3 to test!");
+
+    xTaskCreatePinnedToCore(
+        [](void* param) {
+            CAP1203* buttons = (CAP1203*)param;
+            while (true) {
+                buttons->processButtons();
+                vTaskDelay(pdMS_TO_TICKS(10));  // Poll every 10ms
+            }
+        },
+        "ButtonTask",
+        4096,
+        g_buttons,
+        5,  // Priority
+        NULL,
+        tskNO_AFFINITY
+    );
+
+    ESP_LOGI(TAG_BTN, "CAP1203 initialized successfully");
+    return ESP_OK;
 }
 
 // LVGL tick timer callback (increments LVGL internal tick counter)
@@ -526,36 +571,9 @@ extern "C" void app_main(void) {
     // ==================== BUTTON INITIALIZATION ====================
     
     ESP_LOGI(TAG, "Initializing CAP1203 capacitive buttons...");
-    
-    if (i2c_bus != NULL) {
-        CAP1203* touchButtons = new CAP1203(i2c_bus);
-        ret = touchButtons->init();
-        if (ret != ESP_OK) {
-            ESP_LOGE(TAG, "CAP1203 init failed: %s", esp_err_to_name(ret));
-            delete touchButtons;
-            touchButtons = NULL;
-        } else {
-            ESP_LOGI(TAG, "CAP1203 initialized successfully");
-            touchButtons->setButtonCallback(button_event_callback, NULL);
-            ESP_LOGI(TAG, "Button callback registered. Touch T1/T2/T3 to test!");
-            
-            // Create button processing task
-            xTaskCreatePinnedToCore(
-                [](void* param) {
-                    CAP1203* buttons = (CAP1203*)param;
-                    while (true) {
-                        buttons->processButtons();
-                        vTaskDelay(pdMS_TO_TICKS(10));  // Poll every 10ms
-                    }
-                },
-                "ButtonTask",
-                4096,
-                touchButtons,
-                5,  // Priority
-                NULL,
-                tskNO_AFFINITY
-            );
-        }
+    ret = init_cap1203(i2c_bus);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "CAP1203 init did not complete: %s", esp_err_to_name(ret));
     }
     
     // ==================== QON BUTTON TASK ====================
