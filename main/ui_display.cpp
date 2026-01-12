@@ -46,6 +46,24 @@ static void format_1dp(char* out, size_t out_sz, float v, const char* suffix)
     }
 }
 
+static void apply_tile_focus(lv_obj_t* tile,
+                             lv_obj_t* value_label,
+                             lv_obj_t* unit_label,
+                             bool focused)
+{
+    if (!tile || !value_label || !unit_label) {
+        return;
+    }
+
+    lv_obj_set_style_bg_color(tile, lv_color_black(), 0);
+    lv_obj_set_style_bg_opa(tile, focused ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(tile, 1, 0);
+    lv_obj_set_style_border_color(tile, lv_color_black(), 0);
+    lv_obj_set_style_border_opa(tile, focused ? LV_OPA_COVER : LV_OPA_TRANSP, 0);
+    lv_obj_set_style_text_color(value_label, focused ? lv_color_white() : lv_color_black(), 0);
+    lv_obj_set_style_text_color(unit_label, focused ? lv_color_white() : lv_color_black(), 0);
+}
+
 // Display class instance private members
 struct Display::DisplayState {
     lv_obj_t *root = nullptr;
@@ -54,6 +72,8 @@ struct Display::DisplayState {
     lv_obj_t *interval_label = nullptr;
     lv_obj_t *time_label = nullptr;
     lv_obj_t *alert_label = nullptr;
+    lv_obj_t *co2_tile = nullptr;
+    lv_obj_t *pm25_tile = nullptr;
     lv_obj_t *pm25_label = nullptr;
     lv_obj_t *pm25_unit_label = nullptr;
     lv_obj_t *co2_label = nullptr;
@@ -75,6 +95,11 @@ struct Display::DisplayState {
     bool batt_charging = false;
     bool batt_blink_state = true;
     uint64_t last_batt_blink_ms = 0;
+    bool bt_blink_state = true;
+    uint64_t last_bt_blink_ms = 0;
+    Display::BLEStatus ble_status = Display::BLEStatus::Disconnected;
+
+    Display::FocusTile focus_tile = Display::FocusTile::CO2;
 };
 
 // Display constructor and destructor
@@ -203,30 +228,50 @@ bool Display::init(uint16_t w, uint16_t h)
     lv_obj_set_style_text_font(state->interval_label, &lv_font_montserrat_16, 0);
     lv_obj_align(state->interval_label, LV_ALIGN_TOP_RIGHT, -15, 40);
 
-    // Main large values
-    state->co2_label = lv_label_create(state->root);
+    // Main large values (CO2 / PM2.5 tiles)
+    const int tile_w = 127;
+    const int tile_h = 60;
+    const int tile_x = -8;
+    const int co2_tile_y = -60;
+    const int pm_tile_y = 10;
+    const int tile_pad_x = 6;
+    const int tile_pad_y = 4;
+
+    state->co2_tile = lv_obj_create(state->root);
+    lv_obj_remove_style_all(state->co2_tile);
+    lv_obj_set_size(state->co2_tile, tile_w, tile_h);
+    lv_obj_align(state->co2_tile, LV_ALIGN_RIGHT_MID, tile_x, co2_tile_y);
+    lv_obj_set_style_radius(state->co2_tile, 6, 0);
+    lv_obj_set_style_pad_all(state->co2_tile, 0, 0);
+    lv_obj_clear_flag(state->co2_tile, LV_OBJ_FLAG_SCROLLABLE);
+
+    state->co2_label = lv_label_create(state->co2_tile);
     lv_label_set_text(state->co2_label, "-");
     lv_obj_set_style_text_font(state->co2_label, get_large_font(), 0);
-    lv_obj_set_style_text_color(state->co2_label, lv_color_black(), 0);
-    lv_obj_align(state->co2_label, LV_ALIGN_RIGHT_MID, -15, -40);
+    lv_obj_align(state->co2_label, LV_ALIGN_BOTTOM_RIGHT, -tile_pad_x, -tile_pad_y);
 
-    state->co2_unit_label = lv_label_create(state->root);
+    state->co2_unit_label = lv_label_create(state->co2_tile);
     lv_label_set_text(state->co2_unit_label, "CO2 (ppm)");
     lv_obj_set_style_text_font(state->co2_unit_label, &lv_font_montserrat_16, 0);
-    lv_obj_set_style_text_color(state->co2_unit_label, lv_color_black(), 0);
-    lv_obj_align_to(state->co2_unit_label, state->co2_label, LV_ALIGN_TOP_RIGHT, 0, -15);
+    lv_obj_align_to(state->co2_unit_label, state->co2_label, LV_ALIGN_OUT_TOP_RIGHT, 0, -4);
 
-    state->pm25_label = lv_label_create(state->root);
+    state->pm25_tile = lv_obj_create(state->root);
+    lv_obj_remove_style_all(state->pm25_tile);
+    lv_obj_set_size(state->pm25_tile, tile_w, tile_h);
+    lv_obj_align(state->pm25_tile, LV_ALIGN_RIGHT_MID, tile_x, pm_tile_y);
+    lv_obj_set_style_radius(state->pm25_tile, 6, 0);
+    lv_obj_set_style_pad_all(state->pm25_tile, 0, 0);
+    lv_obj_clear_flag(state->pm25_tile, LV_OBJ_FLAG_SCROLLABLE);
+
+    state->pm25_label = lv_label_create(state->pm25_tile);
     lv_label_set_text(state->pm25_label, "-");
     lv_obj_set_style_text_font(state->pm25_label, get_large_font(), 0);
-    lv_obj_set_style_text_color(state->pm25_label, lv_color_black(), 0);
-    lv_obj_align(state->pm25_label, LV_ALIGN_RIGHT_MID, -15, 20);
+    lv_obj_align(state->pm25_label, LV_ALIGN_BOTTOM_RIGHT, -tile_pad_x, -tile_pad_y);
 
-    state->pm25_unit_label = lv_label_create(state->root);
+    state->pm25_unit_label = lv_label_create(state->pm25_tile);
     lv_label_set_text(state->pm25_unit_label, "PM2.5 (ug/m3)");
     lv_obj_set_style_text_font(state->pm25_unit_label, &lv_font_montserrat_12, 0);
-    lv_obj_set_style_text_color(state->pm25_unit_label, lv_color_black(), 0);
-    lv_obj_align_to(state->pm25_unit_label, state->pm25_label, LV_ALIGN_TOP_RIGHT, 0, -15);
+    lv_obj_align_to(state->pm25_unit_label, state->pm25_label, LV_ALIGN_OUT_TOP_RIGHT, 0, -4);
 
     // Bottom: Temp/RH on same line; VOC/NOx on right; pressure under interval
     state->temp_label = lv_label_create(state->root);
@@ -259,11 +304,21 @@ bool Display::init(uint16_t w, uint16_t h)
     lv_obj_set_style_text_color(state->pressure_label, lv_color_black(), 0);
     lv_obj_align(state->pressure_label, LV_ALIGN_TOP_RIGHT, -15, 55);
 
+    setFocusTile(state->focus_tile);
+
     return true;
 }
 
 void Display::update(uint64_t millis_now)
 {
+    // BLE blink every 500ms
+    if (millis_now - state->last_bt_blink_ms >= 500) {
+        state->bt_blink_state = !state->bt_blink_state;
+        state->last_bt_blink_ms = millis_now;
+    }
+    lv_opa_t ble_base_opa = (state->ble_status == BLEStatus::Connected) ? LV_OPA_COVER : LV_OPA_30;
+    lv_obj_set_style_opa(state->bt_logo, state->bt_blink_state ? ble_base_opa : LV_OPA_TRANSP, 0);
+
     // REC blink at 500ms when recording
     if (state->recording) {
         if (millis_now - state->last_rec_blink_ms >= 500) {
@@ -287,8 +342,7 @@ void Display::update(uint64_t millis_now)
 
 void Display::setBLEStatus(BLEStatus s)
 {
-    // Use bold icon when connected; faded when disconnected
-    lv_obj_set_style_opa(state->bt_logo, s == BLEStatus::Connected ? LV_OPA_COVER : LV_OPA_30, 0);
+    state->ble_status = s;
 }
 
 void Display::setWiFiStatus(WiFiStatus s)
@@ -351,6 +405,17 @@ void Display::setTimeHM(int hours, int minutes, bool valid)
     if (valid) lv_snprintf(time_buf, sizeof(time_buf), "%02d:%02d", hours, minutes);
     else lv_snprintf(time_buf, sizeof(time_buf), "--:--");
     lv_label_set_text(state->time_label, time_buf);
+}
+
+void Display::setFocusTile(FocusTile tile)
+{
+    state->focus_tile = tile;
+
+    const bool co2_focused = (tile == FocusTile::CO2);
+    const bool pm_focused = (tile == FocusTile::PM25);
+
+    apply_tile_focus(state->co2_tile, state->co2_label, state->co2_unit_label, co2_focused);
+    apply_tile_focus(state->pm25_tile, state->pm25_label, state->pm25_unit_label, pm_focused);
 }
 
 void Display::setPM25(int v)

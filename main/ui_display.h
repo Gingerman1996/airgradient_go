@@ -7,6 +7,7 @@ public:
     enum class BLEStatus { Disconnected, Connected };
     enum class WiFiStatus { Off, Connecting, Connected };
     enum class GPSStatus { Off, Searching, Fix };
+    enum class FocusTile { CO2, PM25 };
 
     // Constructor and destructor
     Display();
@@ -33,6 +34,9 @@ public:
     // Time and interval controls
     void setIntervalSeconds(int seconds);
     void setTimeHM(int hours, int minutes, bool valid);
+
+    // Tile focus
+    void setFocusTile(FocusTile tile);
 
     // Sensor values
     void setPM25(int v);

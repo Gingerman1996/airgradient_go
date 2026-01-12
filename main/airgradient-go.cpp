@@ -23,6 +23,7 @@
 #define LVGL_TICK_PERIOD_MS     5
 #define LVGL_TASK_MAX_DELAY_MS  500
 #define LVGL_TASK_MIN_DELAY_MS  10
+#define LVGL_REFRESH_MIN_INTERVAL_MS 2000
 
 // QON button configuration (GPIO5)
 #define QON_PIN                GPIO_NUM_5
@@ -35,6 +36,10 @@ static epd_handle_t g_epd = nullptr;
 static lv_display_t* g_disp = nullptr;
 static drivers::BQ25629* g_charger = nullptr;
 static CAP1203* g_buttons = nullptr;
+static Display::FocusTile g_focus_tile = Display::FocusTile::CO2;
+static bool g_focus_dirty = true;
+static volatile bool g_lvgl_refresh_requested = false;
+static volatile bool g_lvgl_refresh_urgent = false;
 
 // Button callback for CAP1203 (called when button events occur)
 static void button_event_callback(ButtonState state, void* user_data) {
@@ -71,6 +76,18 @@ static void button_event_callback(ButtonState state, void* user_data) {
             break;
         default:
             break;
+    }
+
+    if (state.event == ButtonEvent::SHORT_PRESS) {
+        if (state.id == ButtonID::BUTTON_LEFT) {
+            g_focus_tile = Display::FocusTile::CO2;
+            g_focus_dirty = true;
+            ESP_LOGI(TAG_BTN, "Focus set to CO2 tile");
+        } else if (state.id == ButtonID::BUTTON_MIDDLE) {
+            g_focus_tile = Display::FocusTile::PM25;
+            g_focus_dirty = true;
+            ESP_LOGI(TAG_BTN, "Focus set to PM2.5 tile");
+        }
     }
 }
 
@@ -134,6 +151,14 @@ static void lvgl_unlock(void) {
     xSemaphoreGive(lvgl_mux);
 }
 
+static void request_lvgl_refresh(void) {
+    g_lvgl_refresh_requested = true;
+}
+
+static void request_lvgl_refresh_urgent(void) {
+    g_lvgl_refresh_urgent = true;
+}
+
 // Shutdown sequence with visual feedback
 static void initiate_shutdown(void) {
     static const char *TAG = "Shutdown";
@@ -146,9 +171,9 @@ static void initiate_shutdown(void) {
         lv_label_set_text(label, "Shutting down...\n\nStopping sensors...");
         lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
         lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-        epd_lvgl_refresh(g_disp);
         lvgl_unlock();
     }
+    request_lvgl_refresh();
     vTaskDelay(pdMS_TO_TICKS(800));
     
     // TODO: Stop sensor tasks when implemented
@@ -160,9 +185,9 @@ static void initiate_shutdown(void) {
         lv_label_set_text(label, "Shutting down...\n\nStopping recording...");
         lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
         lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-        epd_lvgl_refresh(g_disp);
         lvgl_unlock();
     }
+    request_lvgl_refresh();
     vTaskDelay(pdMS_TO_TICKS(800));
     
     // TODO: Stop recording when implemented
@@ -174,9 +199,9 @@ static void initiate_shutdown(void) {
         lv_label_set_text(label, "Shutting down...\n\nSaving data...");
         lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
         lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-        epd_lvgl_refresh(g_disp);
         lvgl_unlock();
     }
+    request_lvgl_refresh();
     vTaskDelay(pdMS_TO_TICKS(800));
     
     // TODO: Save pending data to flash when implemented
@@ -188,9 +213,9 @@ static void initiate_shutdown(void) {
         lv_label_set_text(label, "Powering off...\n\nGoodbye!");
         lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
         lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-        epd_lvgl_refresh(g_disp);
         lvgl_unlock();
     }
+    request_lvgl_refresh();
     vTaskDelay(pdMS_TO_TICKS(1000));
     
     // Phase 5: Clear display (prevent ghosting)
@@ -265,9 +290,27 @@ static void qon_button_task(void *arg) {
 // LVGL handler task (processes display updates)
 static void lv_handler_task(void *arg) {
     uint32_t task_delay_ms = LVGL_TASK_MAX_DELAY_MS;
+    uint64_t last_refresh_ms = 0;
     while (1) {
+        bool do_refresh = false;
+        uint64_t now_ms = esp_timer_get_time() / 1000;
+        if (g_lvgl_refresh_urgent) {
+            g_lvgl_refresh_urgent = false;
+            g_lvgl_refresh_requested = false;
+            do_refresh = true;
+            last_refresh_ms = now_ms;
+        } else if (g_lvgl_refresh_requested) {
+            if (now_ms - last_refresh_ms >= LVGL_REFRESH_MIN_INTERVAL_MS) {
+                g_lvgl_refresh_requested = false;
+                do_refresh = true;
+                last_refresh_ms = now_ms;
+            }
+        }
         if (lvgl_lock(-1)) {
             task_delay_ms = lv_timer_handler();
+            if (do_refresh && g_disp) {
+                epd_lvgl_refresh(g_disp);
+            }
             lvgl_unlock();
         }
         if (task_delay_ms > LVGL_TASK_MAX_DELAY_MS) {
@@ -406,12 +449,7 @@ extern "C" void app_main(void) {
     }
 
     ESP_LOGI(TAG, "TEST SCREEN displayed, performing initial full refresh...");
-    
-    // Initial full refresh to show test screen
-    if (lvgl_lock(-1)) {
-        epd_lvgl_refresh(disp);
-        lvgl_unlock();
-    }
+    request_lvgl_refresh();
     
     // Wait 3 seconds to let user see test screen
     ESP_LOGI(TAG, "TEST SCREEN visible, waiting 3 seconds...");
@@ -597,11 +635,13 @@ extern "C" void app_main(void) {
     uint64_t last_display_refresh_ms = 0;
     const uint64_t DISPLAY_UPDATE_INTERVAL_MS = 1000;    // Update values every 1s
     const uint64_t DISPLAY_REFRESH_INTERVAL_MS = RECORDING_INTERVAL_MS; // Follow recording interval
+    const uint64_t UI_BLINK_INTERVAL_MS = 500;           // Blink icons every 500ms
     bool initial_display_refresh_done = false;
     uint64_t last_charger_log_ms = 0;
     const uint64_t CHARGER_LOG_INTERVAL_MS = 2000;       // Debug log interval
     uint64_t last_wd_kick_ms = 0;
     const uint64_t WD_KICK_INTERVAL_MS = 10000;          // Reset charger watchdog
+    uint64_t last_ui_blink_ms = 0;
 
     while (true) {
         int64_t now_ms = esp_timer_get_time() / 1000;
@@ -613,6 +653,7 @@ extern "C" void app_main(void) {
         // Update display with real sensor values every 1 second
         if (now_ms_u - last_display_update_ms >= DISPLAY_UPDATE_INTERVAL_MS) {
             last_display_update_ms = now_ms_u;
+            bool request_initial_refresh = false;
 
             // Update display (thread-safe with LVGL mutex)
             if (lvgl_lock(100)) {
@@ -629,10 +670,7 @@ extern "C" void app_main(void) {
                 display.setVOC(vals.voc_index);
                 display.setNOx(vals.nox_index);
                 display.setPressure(1013);  // TODO: Add pressure sensor when DPS368 is implemented
-                
-                // Update blink animations (REC, charging)
-                display.update(now_ms_u);
-                
+
                 ESP_LOGD(TAG,
                          "Display updated - CO2: %d ppm (avg_ready=%d), T: %.1fC, RH: %.1f%%, "
                          "PM2.5: %.1f, VOC idx: %d, NOx idx: %d",
@@ -646,12 +684,43 @@ extern "C" void app_main(void) {
 
                 if (!initial_display_refresh_done) {
                     ESP_LOGI(TAG, "Initial display refresh after first data update");
-                    epd_lvgl_refresh(disp);
                     initial_display_refresh_done = true;
                     last_display_refresh_ms = now_ms_u;
+                    request_initial_refresh = true;
                 }
 
                 lvgl_unlock();
+            }
+            if (request_initial_refresh) {
+                request_lvgl_refresh();
+            }
+        }
+
+        if (now_ms_u - last_ui_blink_ms >= UI_BLINK_INTERVAL_MS) {
+            last_ui_blink_ms = now_ms_u;
+            bool updated = false;
+            if (lvgl_lock(100)) {
+                display.update(now_ms_u);
+                updated = true;
+                lvgl_unlock();
+            }
+            if (updated) {
+                request_lvgl_refresh();
+            }
+        }
+
+        if (g_focus_dirty) {
+            Display::FocusTile focus_tile = g_focus_tile;
+            g_focus_dirty = false;
+            bool request_focus_refresh = false;
+            if (lvgl_lock(100)) {
+                display.setFocusTile(focus_tile);
+                request_focus_refresh = true;
+                lvgl_unlock();
+            }
+            if (request_focus_refresh) {
+                request_lvgl_refresh_urgent();
+                last_display_refresh_ms = now_ms_u;
             }
         }
 
@@ -660,10 +729,7 @@ extern "C" void app_main(void) {
             last_display_refresh_ms = now_ms_u;
             
             ESP_LOGI(TAG, "Display refresh at %llu ms", now_ms_u);
-            if (lvgl_lock(100)) {
-                epd_lvgl_refresh(disp);
-                lvgl_unlock();
-            }
+            request_lvgl_refresh();
         }
 
         // Periodic charger watchdog reset to avoid OTG drop

@@ -198,8 +198,23 @@ bool CAP1203::isButtonPressed(ButtonID button_id) {
 }
 
 esp_err_t CAP1203::clearInterrupt() {
-    uint8_t status;
-    // Reading the general status register clears the interrupt
+    uint8_t main_ctrl = 0;
+    esp_err_t ret = readRegister(CAP1203_REG_MAIN_CONTROL, &main_ctrl);
+    if (ret != ESP_OK) {
+        return ret;
+    }
+
+    // Clear INT bit (bit 0) to release latched touch status.
+    if (main_ctrl & 0x01) {
+        main_ctrl &= (uint8_t)~0x01;
+        ret = writeRegister(CAP1203_REG_MAIN_CONTROL, main_ctrl);
+        if (ret != ESP_OK) {
+            return ret;
+        }
+    }
+
+    // Read general status to complete interrupt clear sequence.
+    uint8_t status = 0;
     return readRegister(CAP1203_REG_GENERAL_STATUS, &status);
 }
 
