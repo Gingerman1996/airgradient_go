@@ -1,8 +1,8 @@
 # AirGradient GO - Firmware Planning & Implementation Checklist
 
-## 📊 Current Progress (Updated: Jan 12, 2026)
+## 📊 Current Progress (Updated: Jan 13, 2026)
 
-### Overall Status: ~35% MVP Complete
+### Overall Status: ~40% MVP Complete
 
 | Phase | Status | Progress | Notes |
 |-------|--------|----------|-------|
@@ -26,6 +26,10 @@
   - STCC4 (CO2/Temp/RH @ 0x62) with state machine and 5s averaging
   - SGP41 (VOC/NOx @ 0x59) with Gas Index Algorithm
   - SPS30 (PM sensor @ 0x69) with EN_PM1 load switch control
+  - **DPS368 (Pressure/Temp @ 0x77) - INTEGRATED ✅** (Jan 13, 2026)
+    - Full calibration coefficient reading (c0-c30)
+    - 16x oversampling with P_SHIFT/T_SHIFT enabled
+    - Compensated pressure (Pa) and temperature (°C) calculation
 - Display API (`Display` class) - fully implemented with all status bar elements
 - Sensor API (`Sensors` class) - working with ring buffer averaging
 - I2C bus initialization (GPIO 6=SCL, GPIO 7=SDA @ 100kHz)
@@ -35,6 +39,12 @@
   - Shutdown mode support (0.1 μA battery leakage)
   - System power reset capability
   - ADC for battery/charging monitoring
+  - **Register limit logging (Jan 13, 2026)** - `log_charger_limits()` function
+    - REG0x02 (ICHG): Charge current setting
+    - REG0x04 (VREG): Battery regulation voltage
+    - REG0x06 (IINDPM): Input current limit
+    - REG0x08 (VINDPM): Input voltage limit
+  - **Formula corrections per datasheet** - all register calculations verified
 - **QON Button Power Management - IMPLEMENTED ✅**
   - GPIO5 QON button monitoring task
   - 5-second long press shutdown detection
@@ -100,7 +110,7 @@
 > - ✅ **STCC4**: State machine with 10s measurement cycle, 5s moving average for CO2/Temp/RH
 > - ✅ **SGP41**: VOC/NOx raw ticks with Gas Index Algorithm (1-500 scale), 1s sampling
 > - ✅ **SPS30**: PM2.5 mass concentration (µg/m³)
-> - ⏳ **DPS368**: I2C address 0x76, driver pending
+> - ✅ **DPS368**: I2C address 0x77, pressure (Pa) + temperature (°C) with full compensation
 > - ⏳ **LIS2DH12**: I2C address 0x18, driver pending
 
 ### 📍 GPS
@@ -127,7 +137,7 @@
 | SCD41 | 0x62 | Main | Alternative |
 | SHT40 | 0x44 | Main | Optional |
 | SGP41 | 0x59 | Main | ✅ Active |
-| DPS368 | 0x76 | Main | Hardware ready |
+| DPS368 | 0x77 | Main | ✅ Active |
 | LIS2DH12 | 0x18 | Main | Hardware ready |
 | CAP1203 | 0x28 | Main | ✅ Component ready (CS1/CS2/CS3 mapped; UI: T1=Up, T2=Down, T3=Middle) |
 | LP5030/36 | 0x30 | Main | Pending Phase 5 |
@@ -188,8 +198,9 @@
 >   ├── stcc4/                   ✅ STCC4/SCD4x CO2 sensor driver
 >   ├── esp_sgp4x/               ✅ SGP41 VOC/NOx sensor driver
 >   ├── sps30/                   ✅ SPS30 PM sensor driver
+>   ├── dps368/                  ✅ DPS368 pressure/temp sensor (Jan 13)
 >   ├── sensirion_gas_index_algorithm/  ✅ Gas index calculation
->   ├── bq25629/                 ✅ BQ25629 charger driver (integrated)
+>   ├── bq25629/                 ✅ BQ25629 charger driver + log_charger_limits()
 >   └── cap1203/                 ✅ CAP1203 capacitive touch buttons (T1/T2/T3)
 > ```
 >

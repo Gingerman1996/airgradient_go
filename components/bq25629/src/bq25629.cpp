@@ -113,8 +113,9 @@ esp_err_t BQ25629::init(const BQ25629_Config &config) {
     return ret;
   }
 
-  // Configure input voltage limit
-  uint16_t vindpm_value = (config.input_voltage_limit_mv - 3800) / 40;
+  // Configure input voltage limit per datasheet: VINDPM_mV = code * 40
+  // code = VINDPM_mV / 40
+  uint16_t vindpm_value = config.input_voltage_limit_mv / 40;
   vindpm_value = vindpm_value > 0x1A4 ? 0x1A4 : vindpm_value;
   vindpm_value = vindpm_value < 0x5F ? 0x5F : vindpm_value;
   ret = write_register_16(BQ25629_REG::INPUT_VOLTAGE_LIMIT, vindpm_value << 5);
@@ -214,9 +215,9 @@ esp_err_t BQ25629::set_charge_current(uint16_t current_ma) {
   if (current_ma > 2000)
     current_ma = 2000;
 
-  // Calculate register value: 40mA steps starting at 40mA
-  // ICHG[5:0] = (ICHG_mA - 40) / 40
-  uint16_t reg_value = (current_ma - 40) / 40;
+  // Calculate register value per datasheet: ICHG_mA = code * 40
+  // code = ICHG_mA / 40
+  uint16_t reg_value = current_ma / 40;
   reg_value = reg_value << 5; // Shift to bits [10:5]
 
   return write_register_16(BQ25629_REG::CHARGE_CURRENT_LIMIT, reg_value);
@@ -229,8 +230,9 @@ esp_err_t BQ25629::set_charge_voltage(uint16_t voltage_mv) {
   if (voltage_mv > 4800)
     voltage_mv = 4800;
 
-  // Calculate register value: 10mV steps
-  uint16_t reg_value = (voltage_mv - 3500) / 10;
+  // Calculate register value per datasheet: VREG_mV = code * 10
+  // code = VREG_mV / 10
+  uint16_t reg_value = voltage_mv / 10;
   reg_value = reg_value << 3; // Shift to bits [11:3]
 
   return write_register_16(BQ25629_REG::CHARGE_VOLTAGE_LIMIT, reg_value);
@@ -243,9 +245,9 @@ esp_err_t BQ25629::set_input_current_limit(uint16_t current_ma) {
   if (current_ma > 3200)
     current_ma = 3200;
 
-  // Calculate register value: 20mA steps starting at 100mA
-  // IINDPM[7:0] = (IINDPM_mA - 100) / 20
-  uint16_t reg_value = (current_ma - 100) / 20;
+  // Calculate register value per datasheet: IINDPM_mA = code * 20
+  // code = IINDPM_mA / 20
+  uint16_t reg_value = current_ma / 20;
   reg_value = reg_value << 4; // Shift to bits [11:4]
 
   return write_register_16(BQ25629_REG::INPUT_CURRENT_LIMIT, reg_value);
@@ -436,11 +438,12 @@ esp_err_t BQ25629::log_charger_limits() {
   ESP_LOGI(TAG, "=== BQ25629 Charger Limit Registers ===");
 
   // REG0x02: Charge Current Limit (ICHG)
-  // Bits [10:5], Range: 40-2000mA, Step: 40mA
+  // Bits [10:5], POR: 320mA (8h), Range: 40-2000mA, Step: 40mA
+  // Formula per datasheet: ICHG_mA = code * 40
   ret = read_register_16(BQ25629_REG::CHARGE_CURRENT_LIMIT, reg_value);
   if (ret == ESP_OK) {
     uint16_t ichg_code = (reg_value >> 5) & 0x3F; // Extract bits [10:5]
-    uint16_t ichg_ma = 40 + ichg_code * 40;
+    uint16_t ichg_ma = ichg_code * 40;
     ESP_LOGI(TAG, "REG0x02 (Charge Current Limit): 0x%04X → %u mA", reg_value,
              ichg_ma);
   } else {
@@ -448,7 +451,8 @@ esp_err_t BQ25629::log_charger_limits() {
   }
 
   // REG0x04: Charge Voltage Limit (VBATREG)
-  // Bits [11:3], Range: 3500-4800mV, Step: 10mV
+  // Bits [11:3], POR: 4200mV (1A4h), Range: 3500-4800mV, Step: 10mV
+  // Formula per datasheet: VREG_mV = code * 10
   ret = read_register_16(BQ25629_REG::CHARGE_VOLTAGE_LIMIT, reg_value);
   if (ret == ESP_OK) {
     uint16_t vbatreg_code = (reg_value >> 3) & 0x1FF; // Extract bits [11:3]
@@ -460,11 +464,12 @@ esp_err_t BQ25629::log_charger_limits() {
   }
 
   // REG0x06: Input Current Limit (IINDPM)
-  // Bits [11:4], Range: 100-3200mA, Step: 20mA
+  // Bits [11:4], POR: 3200mA (A0h), Range: 100-3200mA, Step: 20mA
+  // Formula per datasheet: IINDPM_mA = code * 20
   ret = read_register_16(BQ25629_REG::INPUT_CURRENT_LIMIT, reg_value);
   if (ret == ESP_OK) {
     uint16_t iindpm_code = (reg_value >> 4) & 0xFF; // Extract bits [11:4]
-    uint16_t iindpm_ma = 100 + iindpm_code * 20;
+    uint16_t iindpm_ma = iindpm_code * 20;
     ESP_LOGI(TAG, "REG0x06 (Input Current Limit): 0x%04X → %u mA", reg_value,
              iindpm_ma);
   } else {
@@ -472,11 +477,12 @@ esp_err_t BQ25629::log_charger_limits() {
   }
 
   // REG0x08: Input Voltage Limit (VINDPM)
-  // Bits [13:5], Range: 3800-21000mV, Step: 40mV
+  // Bits [13:5], POR: 4600mV (73h), Range: 3800-16800mV, Step: 40mV
+  // Formula per datasheet: VINDPM_mV = code * 40
   ret = read_register_16(BQ25629_REG::INPUT_VOLTAGE_LIMIT, reg_value);
   if (ret == ESP_OK) {
     uint16_t vindpm_code = (reg_value >> 5) & 0x1FF; // Extract bits [13:5]
-    uint16_t vindpm_mv = 3800 + vindpm_code * 40;
+    uint16_t vindpm_mv = vindpm_code * 40;
     ESP_LOGI(TAG, "REG0x08 (Input Voltage Limit): 0x%04X → %u mV", reg_value,
              vindpm_mv);
   } else {
