@@ -522,6 +522,13 @@ extern "C" void app_main(void) {
           ESP_LOGW(TAG, "Log storage init failed: %s",
                    esp_err_to_name(log_ret));
         }
+
+        // Wait for SPIFFS mount and e-paper initialization to complete
+        // E-paper takes time to init, and they share SPI2_HOST bus
+        ESP_LOGI(TAG, "Waiting for SPIFFS mount before sensor record test...");
+        vTaskDelay(pdMS_TO_TICKS(15000));  // Wait 15s for everything to settle
+        sensor_record_test();
+
         vTaskDelete(NULL);
       },
       "LogInit", 8192, nullptr, 2, nullptr, tskNO_AFFINITY);
@@ -704,7 +711,7 @@ extern "C" void app_main(void) {
       .charge_voltage_mv = 4200,      // 4.2V (full charge for Li-ion)
       .charge_current_ma = 1000,      // 1A charging
       .input_current_limit_ma = 1500, // 1.5A input limit
-      .input_voltage_limit_mv = 4600, // 4.6V VINDPM
+      .input_voltage_limit_mv = 5500, // 5.5V VINDPM (higher threshold for USB-C)
       .min_system_voltage_mv = 3520,  // 3.52V minimum
       .precharge_current_ma = 30,     // 30mA pre-charge
       .term_current_ma = 20,          // 20mA termination
@@ -908,6 +915,8 @@ extern "C" void app_main(void) {
   const uint64_t WD_KICK_INTERVAL_MS = 10000; // Reset charger watchdog
   uint64_t last_hw_wd_kick_ms = 0;
   uint64_t last_gps_ui_ms = 0;
+  uint64_t last_sensor_summary_ms = 0;
+  const uint64_t SENSOR_SUMMARY_INTERVAL_MS = 5000; // Sensor summary every 5s
   bool boost_requested = pmid_boost_requested;
 
   while (true) {
@@ -937,13 +946,22 @@ extern "C" void app_main(void) {
         g_display_snapshot.sensor_update_ms = now_ms_u;
         xSemaphoreGive(g_display_data_mux);
       }
+    }
 
-      ESP_LOGD(TAG,
-               "Display data updated - CO2: %d ppm (avg_ready=%d), T: %.1fC, "
-               "RH: %.1f%%, "
-               "PM2.5: %.1f, VOC idx: %d, NOx idx: %d",
-               vals.co2_ppm_avg, vals.have_co2_avg, vals.temp_c_avg,
-               vals.rh_avg, vals.pm25_mass, vals.voc_index, vals.nox_index);
+    // Consolidated sensor summary log every 5 seconds
+    if (now_ms_u - last_sensor_summary_ms >= SENSOR_SUMMARY_INTERVAL_MS) {
+      last_sensor_summary_ms = now_ms_u;
+      sensor_values_t vals;
+      sensors.getValues(now_ms, &vals);
+      
+      ESP_LOGI(TAG, "━━━━━━━━━━━━━ SENSOR SUMMARY ━━━━━━━━━━━━━");
+      ESP_LOGI(TAG, "  CO2: %d ppm | T: %.1f°C | RH: %.1f%%",
+               vals.co2_ppm_avg, vals.temp_c_avg, vals.rh_avg);
+      ESP_LOGI(TAG, "  PM2.5: %.1f µg/m³ | VOC: %d | NOx: %d",
+               vals.pm25_mass, vals.voc_index, vals.nox_index);
+      ESP_LOGI(TAG, "  Pressure: %.1f hPa",
+               vals.pressure_pa / 100.0f);
+      ESP_LOGI(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     }
 
     if (gps_ready && (now_ms_u - last_gps_ui_ms >= GPS_UI_UPDATE_INTERVAL_MS)) {

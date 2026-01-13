@@ -28,23 +28,22 @@ static const char *TAG_SENS = "sensors";
 // CO2 ring buffer capacity
 #define CO2_RING_CAP 12
 
-// STCC4 state machine enum - follows recommended operation sequence
-// STCC4 measurement cycle interval (milliseconds). Follows Sensirion spec: 5-600 seconds.
-// Currently set to 10 seconds as optimal balance between power and responsiveness.
-#define STCC4_MEASUREMENT_CYCLE_MS 10000
+// STCC4 continuous measurement mode - reads every 1 second
+// Sensor provides new data every 1 second in continuous mode
+#define STCC4_READ_INTERVAL_MS 1000
 
 // STCC4 automatic conditioning interval (milliseconds). Cleans sensor every 3 hours.
 // Required for long-term accuracy in high CO2 environments.
 #define STCC4_CONDITIONING_INTERVAL_MS (3 * 60 * 60 * 1000)
 
+// DPS368 pressure sensor read interval (milliseconds)
+#define DPS368_READ_INTERVAL_MS 5000
+
 enum class STCC4State {
-    SLEEPING,           // Sensor in sleep mode, waiting for next measurement cycle
-    WAKING_UP,          // Exiting sleep mode to idle
-    IDLE,               // Sensor awake and ready
-    TRIGGER_SINGLE,     // Sending measure_single_shot command
-    WAIT_MEASUREMENT,   // Waiting for measurement execution time
-    READ_RESULT,        // Reading measurement data
-    ENTERING_SLEEP      // Putting sensor back to sleep
+    INIT,               // Need to start continuous measurement
+    STARTING,           // Starting continuous measurement mode
+    MEASURING,          // Continuous measurement active, reading every 1s
+    ERROR               // Error state, will retry
 };
 
 // Private implementation struct - defined outside class at file scope
@@ -56,13 +55,11 @@ struct Sensors::SensorsState {
     stcc4_dev_t co2_sensor;
     stcc4_measurement_t co2_measurement;
     
-    // STCC4 state machine
+    // STCC4 state machine (continuous mode)
     STCC4State stcc4_state;
     int64_t stcc4_state_time;
     int64_t stcc4_last_conditioning;
-    int stcc4_wake_retries;
-    int stcc4_read_attempts;
-    int64_t stcc4_next_cycle_time;  // Next measurement cycle (5-600s interval)
+    int64_t stcc4_last_read;         // Last successful read time
 
     // CO2/Temp/RH ring buffer for last samples (5s average)
     int co2_ring_ppm[CO2_RING_CAP];
@@ -99,8 +96,8 @@ Sensors::Sensors() {
     state = new SensorsState();
     memset(state, 0, sizeof(*state));
     state->i2c_bus_handle = NULL;
-    state->stcc4_state = STCC4State::SLEEPING;
-    state->stcc4_next_cycle_time = 0; // Start first cycle immediately
+    state->stcc4_state = STCC4State::INIT;
+    state->stcc4_last_read = 0;
     state->co2_measurement = {
         .co2_ppm = 0,
         .temperature_raw = 0,
@@ -201,8 +198,7 @@ esp_err_t Sensors::initI2CBus(void) {
 }
 
 // Initialize STCC4 CO2 sensor (SCD4x variant) on I2C bus.
-// Reads product ID with 3 retries, then puts sensor to sleep mode.
-// Sensor will wake up on first measurement cycle.
+// Reads product ID with 3 retries, then sets up for continuous measurement.
 // Returns ESP_OK on success, error code from driver on failure.
 static esp_err_t init_stcc4_sensor(Sensors::SensorsState *state) {
     ESP_LOGI(TAG_SENS, "Initializing STCC4...");
@@ -222,10 +218,12 @@ static esp_err_t init_stcc4_sensor(Sensors::SensorsState *state) {
     if (ret != ESP_OK) {
         ESP_LOGW(TAG_SENS, "Product ID read failed, continuing...");
     }
-    stcc4_enter_sleep_mode(&state->co2_sensor);
-    state->stcc4_state = STCC4State::SLEEPING;
+    
+    // Set initial state for continuous measurement mode
+    state->stcc4_state = STCC4State::INIT;
     state->stcc4_state_time = esp_timer_get_time() / 1000;
     state->stcc4_last_conditioning = state->stcc4_state_time;
+    state->stcc4_last_read = 0;
     return ESP_OK;
 }
 
@@ -293,152 +291,84 @@ static esp_err_t init_sps30_sensor(Sensors::SensorsState *state) {
     return ESP_OK;
 }
 
-// Update STCC4 CO2 sensor state machine (non-blocking).
-// State flow: SLEEPING → WAKING_UP → IDLE → TRIGGER_SINGLE → WAIT_MEASUREMENT → READ_RESULT → ENTERING_SLEEP → repeat.
-// Measurement cycle: 10 seconds (configurable via STCC4_MEASUREMENT_CYCLE_MS).
+// Update STCC4 CO2 sensor using continuous measurement mode (non-blocking).
+// State flow: INIT → STARTING → MEASURING (continuous 1s reads).
 // Automatic conditioning every 3 hours for long-term accuracy.
 static void update_stcc4(Sensors::SensorsState *st, int64_t now_ms) {
     int64_t elapsed = now_ms - st->stcc4_state_time;
     esp_err_t ret;
     
     switch (st->stcc4_state) {
-        case STCC4State::SLEEPING:
-            // Wait for next measurement cycle (recommended: 5-600s)
-            if (now_ms >= st->stcc4_next_cycle_time) {
-                ESP_LOGI(TAG_SENS, "STCC4: Starting measurement cycle");
-                st->stcc4_wake_retries = 0;
-                st->stcc4_state = STCC4State::WAKING_UP;
-                st->stcc4_state_time = now_ms;
+        case STCC4State::INIT:
+            // Initial state - start continuous measurement
+            ESP_LOGI(TAG_SENS, "STCC4: Starting continuous measurement mode");
+            st->stcc4_state = STCC4State::STARTING;
+            st->stcc4_state_time = now_ms;
+            break;
+            
+        case STCC4State::STARTING:
+            // Start continuous measurement mode (1s sampling)
+            if (elapsed >= 100) {
+                ret = stcc4_start_continuous_measurement(&st->co2_sensor);
+                if (ret == ESP_OK) {
+                    ESP_LOGI(TAG_SENS, "STCC4: Continuous measurement started");
+                    st->stcc4_state = STCC4State::MEASURING;
+                    st->stcc4_state_time = now_ms;
+                    st->stcc4_last_read = now_ms;
+                } else {
+                    ESP_LOGW(TAG_SENS, "STCC4: Failed to start continuous mode: %s", esp_err_to_name(ret));
+                    st->stcc4_state = STCC4State::ERROR;
+                    st->stcc4_state_time = now_ms;
+                }
             }
             break;
             
-        case STCC4State::WAKING_UP:
-            // Wait a bit before sending exit_sleep_mode
-            if (elapsed >= 100) {
-                ret = stcc4_exit_sleep_mode(&st->co2_sensor);
+        case STCC4State::MEASURING:
+            // Read measurement every 1 second in continuous mode
+            if (now_ms - st->stcc4_last_read >= STCC4_READ_INTERVAL_MS) {
+                ret = stcc4_read_measurement(&st->co2_sensor, &st->co2_measurement);
                 if (ret == ESP_OK) {
-                    ESP_LOGI(TAG_SENS, "STCC4: Woke up from sleep");
+                    st->stcc4_last_read = now_ms;
+                    
+                    // Push to ring buffer
+                    co2_ring_push(st, (int)st->co2_measurement.co2_ppm,
+                                  st->co2_measurement.temperature_c,
+                                  st->co2_measurement.humidity_rh,
+                                  now_ms);
                     
                     // Perform conditioning if needed (every 3 hours)
-                    if (now_ms - st->stcc4_last_conditioning >= (int64_t)3 * 60 * 60 * 1000) {
+                    if (now_ms - st->stcc4_last_conditioning >= (int64_t)STCC4_CONDITIONING_INTERVAL_MS) {
                         ESP_LOGI(TAG_SENS, "STCC4: Performing conditioning");
-                        (void)stcc4_perform_conditioning(&st->co2_sensor);
+                        stcc4_stop_continuous_measurement(&st->co2_sensor);
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                        stcc4_perform_conditioning(&st->co2_sensor);
                         st->stcc4_last_conditioning = now_ms;
-                    }
-                    
-                    st->stcc4_state = STCC4State::IDLE;
-                    st->stcc4_state_time = now_ms;
-                } else {
-                    ESP_LOGW(TAG_SENS, "STCC4: Failed to wake up (retry %d)", st->stcc4_wake_retries);
-                    if (st->stcc4_wake_retries < 3) {
-                        st->stcc4_wake_retries++;
-                        st->stcc4_state_time = now_ms;
-                    } else {
-                        // Give up, schedule next cycle
-                        ESP_LOGE(TAG_SENS, "STCC4: Wake up failed after retries");
-                        st->stcc4_state = STCC4State::SLEEPING;
-                        st->stcc4_next_cycle_time = now_ms + 10000; // Retry in 10s
+                        vTaskDelay(pdMS_TO_TICKS(100));
+                        stcc4_start_continuous_measurement(&st->co2_sensor);
                     }
                 }
+                // Note: ESP_ERR_INVALID_RESPONSE means no data ready yet, which is normal
             }
             break;
             
-        case STCC4State::IDLE:
-            // Sensor is awake and ready, proceed to trigger measurement
-            st->stcc4_state = STCC4State::TRIGGER_SINGLE;
-            st->stcc4_state_time = now_ms;
-            break;
-            
-        case STCC4State::TRIGGER_SINGLE:
-            ret = stcc4_measure_single_shot(&st->co2_sensor);
-            if (ret == ESP_OK) {
-                ESP_LOGI(TAG_SENS, "STCC4: Triggered single shot measurement");
-                st->stcc4_state = STCC4State::WAIT_MEASUREMENT;
-                st->stcc4_state_time = now_ms;
-                st->stcc4_read_attempts = 0;
-            } else {
-                ESP_LOGW(TAG_SENS, "STCC4: Failed to trigger measurement");
-                // Skip to sleep
-                st->stcc4_state = STCC4State::ENTERING_SLEEP;
+        case STCC4State::ERROR:
+            // Retry after 5 seconds
+            if (elapsed >= 5000) {
+                ESP_LOGI(TAG_SENS, "STCC4: Retrying continuous measurement...");
+                st->stcc4_state = STCC4State::INIT;
                 st->stcc4_state_time = now_ms;
             }
-            break;
-            
-        case STCC4State::WAIT_MEASUREMENT:
-            // Wait for measurement execution time (typically 500ms)
-            if (elapsed >= 500) {
-                st->stcc4_state = STCC4State::READ_RESULT;
-                st->stcc4_state_time = now_ms;
-            }
-            break;
-            
-        case STCC4State::READ_RESULT:
-            ret = stcc4_read_measurement(&st->co2_sensor, &st->co2_measurement);
-            if (ret == ESP_OK) {
-                ESP_LOGI(TAG_SENS, "STCC4: CO2=%d ppm, T=%.1f°C, RH=%.1f%%",
-                         (int)st->co2_measurement.co2_ppm,
-                         st->co2_measurement.temperature_c,
-                         st->co2_measurement.humidity_rh);
-                
-                // Push to ring buffer
-                co2_ring_push(st, (int)st->co2_measurement.co2_ppm,
-                              st->co2_measurement.temperature_c,
-                              st->co2_measurement.humidity_rh,
-                              now_ms);
-                
-                // Proceed to sleep
-                st->stcc4_state = STCC4State::ENTERING_SLEEP;
-                st->stcc4_state_time = now_ms;
-            } else {
-                ESP_LOGW(TAG_SENS, "STCC4: Failed to read measurement (attempt %d)", st->stcc4_read_attempts);
-                if (st->stcc4_read_attempts < 2) {
-                    // Retry after 100ms
-                    st->stcc4_read_attempts++;
-                    vTaskDelay(pdMS_TO_TICKS(100));
-                } else {
-                    // Give up, go to sleep
-                    ESP_LOGE(TAG_SENS, "STCC4: Read failed after retries");
-                    st->stcc4_state = STCC4State::ENTERING_SLEEP;
-                    st->stcc4_state_time = now_ms;
-                }
-            }
-            break;
-            
-        case STCC4State::ENTERING_SLEEP:
-            ret = stcc4_enter_sleep_mode(&st->co2_sensor);
-            if (ret == ESP_OK) {
-                ESP_LOGI(TAG_SENS, "STCC4: Entered sleep mode");
-            } else {
-                ESP_LOGW(TAG_SENS, "STCC4: Failed to enter sleep mode");
-            }
-            
-            // Schedule next cycle (10 seconds as per main loop interval requirement)
-            st->stcc4_next_cycle_time = now_ms + STCC4_MEASUREMENT_CYCLE_MS;
-            st->stcc4_state = STCC4State::SLEEPING;
-            st->stcc4_state_time = now_ms;
-            ESP_LOGI(TAG_SENS, "STCC4: Cycle complete, next in 10s");
             break;
     }
 }
 
 // Update SGP4x VOC/NOx sensor with 1-second sampling interval.
-// Skips I2C access during STCC4 critical operations to avoid bus contention.
 // Calculates gas index (1-500 scale) from raw ticks using Sensirion algorithm.
 // Automatic retry on first read failure (40ms delay).
 static void update_sgp4x(Sensors::SensorsState *st, int64_t now_ms) {
     if (!st->sgp4x_handle) return;
     
-    // Skip while STCC4 is actively using I2C bus to avoid contention
-    // Only skip during critical I2C operations: WAKING_UP, TRIGGER_SINGLE, WAIT_MEASUREMENT, READ_RESULT
-    if (st->stcc4_state == STCC4State::WAKING_UP ||
-        st->stcc4_state == STCC4State::TRIGGER_SINGLE ||
-        st->stcc4_state == STCC4State::WAIT_MEASUREMENT ||
-        st->stcc4_state == STCC4State::READ_RESULT ||
-        st->stcc4_state == STCC4State::ENTERING_SLEEP) {
-        return;
-    }
-    
-    // Read SGP4x every 1 second when STCC4 is SLEEPING or IDLE
+    // Read SGP4x every 1 second
     if (now_ms - st->last_sgp_read < 1000) return;
     st->last_sgp_read = now_ms;
     
@@ -458,57 +388,89 @@ static void update_sgp4x(Sensors::SensorsState *st, int64_t now_ms) {
         GasIndexAlgorithm_process(&st->nox_algo_params, (int32_t)nox_raw, &nox_idx);
         st->voc_index = voc_idx;
         st->nox_index = nox_idx;
-        
-        ESP_LOGD(TAG_SENS, "SGP4x: VOC=%d (idx=%ld), NOx=%d (idx=%ld)", voc_raw, voc_idx, nox_raw, nox_idx);
     }
 }
 
-// Update SPS30 particulate matter sensor with duty-cycling to save power.
-// Uses static local state machine to track sensor lifecycle: SLEEPING -> WAKING -> MEASURING -> READY -> SLEEPING.
-// Static state persists across function calls and avoids dynamic allocation.
-// Measurement cycle: 10s sleep -> 100ms wake -> 10s measurement -> 1s readout -> repeat.
-// Returns immediately if sensor handle is NULL (sensor not initialized).
+// Update SPS30 particulate matter sensor with continuous 1-second readings.
+// Per datasheet: "New readings are available every second" (Section 4.1).
+// State machine: INIT -> START -> WARMUP -> MEASURING (continuous 1s reads)
+// After initialization, sensor stays in Measurement Mode for continuous readings.
+// Startup time: 8-30 seconds depending on concentration level (Table 1).
 static void update_sps30(Sensors::SensorsState *st, int64_t now_ms) {
     if (!st->sps30_handle) return;
-    static enum { PM_SLEEPING, PM_WAKING, PM_MEASURING, PM_READY } pm_state = PM_SLEEPING;
-    static int64_t pm_state_time = 0;
-    int64_t elapsed = now_ms - pm_state_time;
+    
+    // SPS30 state machine for continuous measurement
+    static enum { 
+        SPS30_INIT,      // Initial state - need to wake up sensor
+        SPS30_START,     // Start measurement mode
+        SPS30_WARMUP,    // Wait for sensor warmup (8-30s per datasheet)
+        SPS30_MEASURING  // Continuous 1-second readings
+    } sps30_state = SPS30_INIT;
+    static int64_t sps30_state_time = 0;
+    static int64_t last_read_time = 0;
+    
+    int64_t elapsed = now_ms - sps30_state_time;
     esp_err_t ret;
-    switch (pm_state) {
-        case PM_SLEEPING:
-            if (elapsed >= 10000) {
-                ret = sps30_wakeup(st->sps30_handle);
-                if (ret == ESP_OK) {
-                    pm_state = PM_WAKING;
-                    pm_state_time = now_ms;
-                }
+    
+    switch (sps30_state) {
+        case SPS30_INIT:
+            // Wake up sensor from sleep mode
+            ret = sps30_wakeup(st->sps30_handle);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG_SENS, "SPS30: Waking up sensor");
+                sps30_state = SPS30_START;
+                sps30_state_time = now_ms;
             }
             break;
-        case PM_WAKING:
+            
+        case SPS30_START:
+            // Wait 100ms after wake-up before starting measurement
             if (elapsed >= 100) {
                 ret = sps30_start_measurement(st->sps30_handle);
                 if (ret == ESP_OK) {
-                    pm_state = PM_MEASURING;
-                    pm_state_time = now_ms;
+                    ESP_LOGI(TAG_SENS, "SPS30: Starting continuous measurement mode");
+                    sps30_state = SPS30_WARMUP;
+                    sps30_state_time = now_ms;
                 } else {
+                    ESP_LOGE(TAG_SENS, "SPS30: Failed to start measurement");
                     sps30_sleep(st->sps30_handle);
-                    pm_state = PM_SLEEPING;
-                    pm_state_time = now_ms;
+                    sps30_state = SPS30_INIT;
+                    sps30_state_time = now_ms + 5000; // Retry in 5s
                 }
             }
             break;
-        case PM_MEASURING:
-            if (elapsed >= 10000) {
-                pm_state = PM_READY;
+            
+        case SPS30_WARMUP:
+            // Wait for sensor warmup (8-30s per datasheet Table 1)
+            // Using 8 seconds minimum for typical concentrations
+            if (elapsed >= 8000) {
+                ESP_LOGI(TAG_SENS, "SPS30: Warmup complete, entering continuous read mode");
+                sps30_state = SPS30_MEASURING;
+                sps30_state_time = now_ms;
+                last_read_time = now_ms;
             }
             break;
-        case PM_READY:
-            ret = sps30_read_measurement(st->sps30_handle, &st->sps30_data);
-            (void)ret;
-            sps30_stop_measurement(st->sps30_handle);
-            sps30_sleep(st->sps30_handle);
-            pm_state = PM_SLEEPING;
-            pm_state_time = now_ms;
+            
+        case SPS30_MEASURING:
+            // Read measurement every 1 second (per datasheet: new data every 1s)
+            if (now_ms - last_read_time >= 1000) {
+                last_read_time = now_ms;
+                
+                // Check if data is ready before reading
+                bool ready = false;
+                ret = sps30_read_data_ready(st->sps30_handle, &ready);
+                
+                if (ret == ESP_OK && ready) {
+                    ret = sps30_read_measurement(st->sps30_handle, &st->sps30_data);
+                    if (ret == ESP_OK) {
+                        ESP_LOGD(TAG_SENS, "SPS30: PM1.0=%.1f, PM2.5=%.1f, PM4.0=%.1f, PM10=%.1f µg/m³",
+                                 st->sps30_data.pm1p0_mass, st->sps30_data.pm2p5_mass,
+                                 st->sps30_data.pm4p0_mass, st->sps30_data.pm10p0_mass);
+                    }
+                } else if (ret != ESP_OK) {
+                    ESP_LOGW(TAG_SENS, "SPS30: Data ready check failed");
+                }
+            }
             break;
     }
 }
@@ -531,8 +493,8 @@ void Sensors::update(int64_t current_millis) {
     update_sgp4x(state, current_millis);
     update_sps30(state, current_millis);
     
-    // Read DPS368 pressure sensor (every second)
-    if (state->dps368_handle && (current_millis - state->last_dps_read >= 1000)) {
+    // Read DPS368 pressure sensor (every 5 seconds)
+    if (state->dps368_handle && (current_millis - state->last_dps_read >= DPS368_READ_INTERVAL_MS)) {
         state->last_dps_read = current_millis;
         esp_err_t ret = dps368_read(state->dps368_handle, &state->dps368_data);
         if (ret == ESP_OK && state->dps368_data.pressure_valid) {

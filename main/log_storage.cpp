@@ -1,731 +1,501 @@
+/**
+ * @file log_storage_new.cpp
+ * @brief NAND Flash storage using espressif/spi_nand_flash component
+ *
+ * Uses the official Espressif SPI NAND Flash driver with Dhara FTL for
+ * automatic bad block management and wear leveling.
+ */
+
 #include "log_storage.h"
 
 #include "driver/spi_master.h"
-#include "esp_heap_caps.h"
-#include "esp_intr_alloc.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_vfs_fat_nand.h"
 #include "freertos/FreeRTOS.h"
-#include "freertos/ringbuf.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
-#include "spiffs.h"
+#include "spi_nand_flash.h"
 
-#include <stdarg.h>
+#include <dirent.h>
+#include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 
 static const char *TAG = "log_store";
 
 // W25N512GV SPI NAND configuration
-// Shares SPI2_HOST bus with e-paper display
-// E-paper must initialize the bus with MISO pin for NAND to work
+// Shares SPI2_HOST bus with e-paper display (already initialized)
 static const spi_host_device_t kNandSpiHost = SPI2_HOST;
-static const int kNandPinMosi = 25;
-static const int kNandPinMiso = 24;
-static const int kNandPinSclk = 23;
 static const int kNandPinCs = 4;
 static const int kNandClockHz = 10 * 1000 * 1000;
-static const uint32_t kNandPageSize = 2048;
-static const uint32_t kNandPagesPerBlock = 64;
-static const uint32_t kNandBlockSize = kNandPageSize * kNandPagesPerBlock;
-static const uint32_t kNandBlockCount = 512;
-static const uint16_t kNandSpareOffset = 2048;
 
-// W25N512GV commands
-static const uint8_t kCmdReset = 0xFF;
-static const uint8_t kCmdReadId = 0x9F;
-static const uint8_t kCmdReadStatus = 0x0F;
-static const uint8_t kCmdWriteEnable = 0x06;
-static const uint8_t kCmdPageRead = 0x13;
-static const uint8_t kCmdReadCache = 0x03;
-static const uint8_t kCmdProgramLoad = 0x02;
-static const uint8_t kCmdProgramExecute = 0x10;
-static const uint8_t kCmdBlockErase = 0xD8;
+// Mount point for FATFS
+static const char *kMountPoint = "/nand";
+static const char *kSensorDataFile = "/nand/sensors.bin";
 
-static const uint8_t kStatusReg3 = 0xC0;
-static const uint8_t kStatusBusyMask = 0x01;
-
-static const size_t kLogRingbufSize = 16 * 1024;
-static const uint32_t kLogFlushBytes = 4096;
-static const uint32_t kLogMaxBytes = 8 * 1024 * 1024;
-
+// State
 static spi_device_handle_t g_nand_spi = nullptr;
-static SemaphoreHandle_t g_nand_lock = nullptr;
-static uint16_t g_good_blocks[kNandBlockCount];
-static uint32_t g_good_block_count = 0;
-
-static spiffs g_fs = {};
-static RingbufHandle_t g_log_ringbuf = nullptr;
-static TaskHandle_t g_log_task = nullptr;
+static spi_nand_flash_device_t *g_nand_device = nullptr;
 static TaskHandle_t g_mount_task = nullptr;
-static spiffs_file g_log_file = -1;
-static bool g_log_ready = false;
-static bool g_spiffs_mounted = false;
+static SemaphoreHandle_t g_storage_lock = nullptr;
+static bool g_storage_ready = false;
 static bool g_mount_started = false;
-static vprintf_like_t g_orig_vprintf = nullptr;
-static uint32_t g_log_max_bytes = kLogMaxBytes;
 
-static uint8_t *g_spiffs_work = nullptr;
-static uint8_t *g_spiffs_fds = nullptr;
-static uint8_t *g_spiffs_cache = nullptr;
+// Sensor record file handle (unused for now, using open/close per operation)
+// static FILE *g_sensor_file = nullptr;
+static int32_t g_record_count = -1;
 
-struct spiffs_nand_ctx_t {
-  SemaphoreHandle_t lock;
-};
+// ============================================================================
+// CRC16 Implementation
+// ============================================================================
 
-static spiffs_nand_ctx_t g_spiffs_ctx = {};
+static uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
+  uint16_t crc = 0xFFFF;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= (uint16_t)data[i] << 8;
+    for (uint8_t j = 0; j < 8; j++) {
+      if (crc & 0x8000) {
+        crc = (crc << 1) ^ 0x1021;
+      } else {
+        crc <<= 1;
+      }
+    }
+  }
+  return crc;
+}
 
-static bool nand_lock(TickType_t timeout_ticks) {
-  if (!g_nand_lock) {
+// ============================================================================
+// Internal Helper Functions
+// ============================================================================
+
+static bool storage_lock(TickType_t timeout_ticks) {
+  if (!g_storage_lock) {
     return false;
   }
-  return xSemaphoreTake(g_nand_lock, timeout_ticks) == pdTRUE;
+  return xSemaphoreTake(g_storage_lock, timeout_ticks) == pdTRUE;
 }
 
-static void nand_unlock(void) {
-  if (g_nand_lock) {
-    xSemaphoreGive(g_nand_lock);
+static void storage_unlock(void) {
+  if (g_storage_lock) {
+    xSemaphoreGive(g_storage_lock);
   }
 }
 
-static esp_err_t nand_transact(uint8_t cmd, uint32_t addr, uint8_t addr_bits,
-                               const uint8_t *tx, size_t tx_len, uint8_t *rx,
-                               size_t rx_len, uint8_t dummy_bits) {
-  if (!g_nand_spi) {
-    return ESP_ERR_INVALID_STATE;
-  }
+// ============================================================================
+// Mount Task - Runs in background to initialize NAND flash
+// ============================================================================
 
-  spi_transaction_ext_t t = {};
-  t.base.flags = SPI_TRANS_VARIABLE_CMD;
-  t.command_bits = 8;
-  t.base.cmd = cmd;
+static void log_storage_mount_task(void *arg) {
+  ESP_LOGI(TAG, "=== NAND Flash Initialization (spi_nand_flash) ===");
 
-  if (addr_bits > 0) {
-    t.base.flags |= SPI_TRANS_VARIABLE_ADDR;
-    t.address_bits = addr_bits;
-    t.base.addr = addr;
-  }
+  esp_err_t ret;
 
-  if (dummy_bits > 0) {
-    t.base.flags |= SPI_TRANS_VARIABLE_DUMMY;
-    t.dummy_bits = dummy_bits;
-  }
-
-  t.base.length = tx_len * 8;
-  t.base.tx_buffer = tx;
-  t.base.rxlength = rx_len * 8;
-  t.base.rx_buffer = rx;
-
-  return spi_device_polling_transmit(g_nand_spi, &t.base);
-}
-
-static esp_err_t nand_write_enable(void) {
-  return nand_transact(kCmdWriteEnable, 0, 0, nullptr, 0, nullptr, 0, 0);
-}
-
-static esp_err_t nand_read_status(uint8_t reg_addr, uint8_t *out_status) {
-  uint8_t rx[1] = {0};
-  esp_err_t ret =
-      nand_transact(kCmdReadStatus, reg_addr, 8, nullptr, 0, rx, sizeof(rx), 0);
-  if (ret == ESP_OK) {
-    *out_status = rx[0];
-  }
-  return ret;
-}
-
-static esp_err_t nand_wait_ready(uint32_t timeout_ms) {
-  int64_t start_ms = esp_timer_get_time() / 1000;
-  while (true) {
-    uint8_t status = 0;
-    esp_err_t ret = nand_read_status(kStatusReg3, &status);
-    if (ret != ESP_OK) {
-      return ret;
+  // Create storage lock mutex
+  if (!g_storage_lock) {
+    g_storage_lock = xSemaphoreCreateMutex();
+    if (!g_storage_lock) {
+      ESP_LOGE(TAG, "Failed to create storage mutex");
+      vTaskDelete(nullptr);
+      return;
     }
-    if ((status & kStatusBusyMask) == 0) {
-      return ESP_OK;
-    }
-    if ((esp_timer_get_time() / 1000 - start_ms) > timeout_ms) {
-      return ESP_ERR_TIMEOUT;
-    }
-    vTaskDelay(pdMS_TO_TICKS(1));
   }
-}
 
-static esp_err_t nand_reset(void) {
-  ESP_LOGI(TAG, "Sending NAND reset command (0xFF)...");
-  esp_err_t ret = nand_transact(kCmdReset, 0, 0, nullptr, 0, nullptr, 0, 0);
+  // SPI bus is already initialized by e-paper driver
+  // Just add our NAND device to the bus
+  ESP_LOGI(TAG, "Adding NAND device to SPI2_HOST bus...");
+
+  // Configure SPI device with half-duplex for NAND
+  spi_device_interface_config_t devcfg = {
+      .command_bits = 0,
+      .address_bits = 0,
+      .dummy_bits = 0,
+      .mode = 0,
+      .clock_source = SPI_CLK_SRC_DEFAULT,
+      .duty_cycle_pos = 128,
+      .cs_ena_pretrans = 0,
+      .cs_ena_posttrans = 0,
+      .clock_speed_hz = kNandClockHz,
+      .input_delay_ns = 0,
+      .spics_io_num = kNandPinCs,
+      .flags = SPI_DEVICE_HALFDUPLEX,
+      .queue_size = 10,
+      .pre_cb = nullptr,
+      .post_cb = nullptr,
+  };
+
+  ret = spi_bus_add_device(kNandSpiHost, &devcfg, &g_nand_spi);
   if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "NAND reset transact failed: %s", esp_err_to_name(ret));
-    return ret;
+    ESP_LOGE(TAG, "Failed to add NAND SPI device: %s", esp_err_to_name(ret));
+    vTaskDelete(nullptr);
+    return;
   }
-  ESP_LOGI(TAG, "NAND reset sent, waiting for ready...");
-  ret = nand_wait_ready(100);  // Increase timeout to 100ms
+  ESP_LOGI(TAG, "NAND SPI device added successfully");
+
+  // Initialize the spi_nand_flash driver
+  spi_nand_flash_config_t nand_config = {
+      .device_handle = g_nand_spi,
+      .gc_factor = 4,  // Default garbage collection factor
+      .io_mode = SPI_NAND_IO_MODE_SIO,
+      .flags = SPI_DEVICE_HALFDUPLEX,
+  };
+
+  ret = spi_nand_flash_init_device(&nand_config, &g_nand_device);
   if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "NAND wait_ready failed: %s", esp_err_to_name(ret));
+    ESP_LOGE(TAG, "Failed to init NAND device: %s", esp_err_to_name(ret));
+    spi_bus_remove_device(g_nand_spi);
+    g_nand_spi = nullptr;
+    vTaskDelete(nullptr);
+    return;
   }
-  return ret;
-}
 
-static esp_err_t nand_read_id(uint8_t *out_mfr, uint8_t *out_dev1,
-                              uint8_t *out_dev2) {
-  uint8_t rx[3] = {0};
-  // W25N512 Read ID: CMD (0x9F) + 8-bit dummy address (0x00) + read 3 bytes
-  esp_err_t ret =
-      nand_transact(kCmdReadId, 0, 8, nullptr, 0, rx, sizeof(rx), 0);
-  if (ret == ESP_OK) {
-    *out_mfr = rx[0];
-    *out_dev1 = rx[1];
-    *out_dev2 = rx[2];
-  }
-  return ret;
-}
+  // Log device info
+  uint32_t num_sectors = 0, sector_size = 0, block_size = 0, num_blocks = 0;
+  spi_nand_flash_get_capacity(g_nand_device, &num_sectors);
+  spi_nand_flash_get_sector_size(g_nand_device, &sector_size);
+  spi_nand_flash_get_block_size(g_nand_device, &block_size);
+  spi_nand_flash_get_block_num(g_nand_device, &num_blocks);
 
-static esp_err_t nand_page_read(uint32_t page) {
-  esp_err_t ret = nand_transact(kCmdPageRead, page, 24, nullptr, 0, nullptr, 0, 0);
+  ESP_LOGI(TAG, "NAND Flash Info:");
+  ESP_LOGI(TAG, "  - Sectors: %lu (sector size: %lu bytes)", num_sectors,
+           sector_size);
+  ESP_LOGI(TAG, "  - Blocks: %lu (block size: %lu bytes)", num_blocks,
+           block_size);
+  ESP_LOGI(TAG, "  - Total capacity: %lu KB",
+           (num_sectors * sector_size) / 1024);
+
+  // Mount FATFS on NAND
+  ESP_LOGI(TAG, "Mounting FATFS on NAND flash...");
+
+  esp_vfs_fat_mount_config_t mount_config = {
+      .format_if_mount_failed = true,
+      .max_files = 4,
+      .allocation_unit_size = 16 * 1024,
+      .disk_status_check_enable = false,
+      .use_one_fat = false,
+  };
+
+  ret = esp_vfs_fat_nand_mount(kMountPoint, g_nand_device, &mount_config);
   if (ret != ESP_OK) {
-    return ret;
-  }
-  return nand_wait_ready(5);
-}
-
-static esp_err_t nand_read_cache(uint16_t column, uint8_t *dst, size_t len) {
-  return nand_transact(kCmdReadCache, column, 16, nullptr, 0, dst, len, 8);
-}
-
-static esp_err_t nand_read_page(uint32_t page, uint8_t *dst) {
-  esp_err_t ret = nand_page_read(page);
-  if (ret != ESP_OK) {
-    return ret;
-  }
-  return nand_read_cache(0, dst, kNandPageSize);
-}
-
-static esp_err_t nand_program_page(uint32_t page, uint16_t column,
-                                   const uint8_t *data, size_t len) {
-  if (len == 0 || len > kNandPageSize) {
-    return ESP_ERR_INVALID_SIZE;
+    ESP_LOGE(TAG, "Failed to mount FATFS: %s", esp_err_to_name(ret));
+    spi_nand_flash_deinit_device(g_nand_device);
+    g_nand_device = nullptr;
+    spi_bus_remove_device(g_nand_spi);
+    g_nand_spi = nullptr;
+    vTaskDelete(nullptr);
+    return;
   }
 
-  esp_err_t ret = nand_write_enable();
-  if (ret != ESP_OK) {
-    return ret;
-  }
+  // Print FATFS size information
+  uint64_t bytes_total = 0, bytes_free = 0;
+  esp_vfs_fat_info(kMountPoint, &bytes_total, &bytes_free);
+  ESP_LOGI(TAG, "FATFS mounted: %llu KB total, %llu KB free",
+           bytes_total / 1024, bytes_free / 1024);
 
-  ret = nand_transact(kCmdProgramLoad, column, 16, data, len, nullptr, 0, 0);
-  if (ret != ESP_OK) {
-    return ret;
-  }
-
-  ret = nand_transact(kCmdProgramExecute, page, 24, nullptr, 0, nullptr, 0, 0);
-  if (ret != ESP_OK) {
-    return ret;
-  }
-  return nand_wait_ready(10);
-}
-
-static esp_err_t nand_erase_block(uint32_t page) {
-  esp_err_t ret = nand_write_enable();
-  if (ret != ESP_OK) {
-    return ret;
-  }
-
-  ret = nand_transact(kCmdBlockErase, page, 24, nullptr, 0, nullptr, 0, 0);
-  if (ret != ESP_OK) {
-    return ret;
-  }
-  return nand_wait_ready(200);
-}
-
-static esp_err_t nand_read_bytes(uint32_t phys_addr, uint8_t *dst, size_t len) {
-  while (len > 0) {
-    uint32_t page = phys_addr / kNandPageSize;
-    uint16_t column = phys_addr % kNandPageSize;
-    size_t chunk = kNandPageSize - column;
-    if (chunk > len) {
-      chunk = len;
-    }
-
-    esp_err_t ret = nand_page_read(page);
-    if (ret != ESP_OK) {
-      return ret;
-    }
-    ret = nand_read_cache(column, dst, chunk);
-    if (ret != ESP_OK) {
-      return ret;
-    }
-
-    phys_addr += chunk;
-    dst += chunk;
-    len -= chunk;
-
-    if ((phys_addr % (kNandPageSize * 8)) == 0) {
-      vTaskDelay(pdMS_TO_TICKS(1));
-    }
-  }
-  return ESP_OK;
-}
-
-static esp_err_t nand_write_bytes(uint32_t phys_addr, const uint8_t *src,
-                                  size_t len) {
-  while (len > 0) {
-    uint32_t page = phys_addr / kNandPageSize;
-    uint16_t column = phys_addr % kNandPageSize;
-    size_t chunk = kNandPageSize - column;
-    if (chunk > len) {
-      chunk = len;
-    }
-
-    esp_err_t ret = ESP_OK;
-    if (column == 0 && chunk == kNandPageSize) {
-      ret = nand_program_page(page, 0, src, kNandPageSize);
-    } else {
-      uint8_t page_buf[kNandPageSize];
-      ret = nand_read_page(page, page_buf);
-      if (ret != ESP_OK) {
-        return ret;
-      }
-      memcpy(page_buf + column, src, chunk);
-      ret = nand_program_page(page, 0, page_buf, kNandPageSize);
-    }
-    if (ret != ESP_OK) {
-      return ret;
-    }
-
-    phys_addr += chunk;
-    src += chunk;
-    len -= chunk;
-
-    if ((phys_addr % (kNandPageSize * 8)) == 0) {
-      vTaskDelay(pdMS_TO_TICKS(1));
-    }
-  }
-  return ESP_OK;
-}
-
-static bool nand_is_block_bad(uint32_t block) {
-  uint8_t marker = 0xFF;
-  uint32_t page0 = block * kNandPagesPerBlock;
-  if (nand_page_read(page0) != ESP_OK) {
-    return true;
-  }
-  if (nand_read_cache(kNandSpareOffset, &marker, 1) != ESP_OK) {
-    return true;
-  }
-  if (marker != 0xFF) {
-    return true;
-  }
-
-  marker = 0xFF;
-  uint32_t page1 = page0 + 1;
-  if (nand_page_read(page1) != ESP_OK) {
-    return true;
-  }
-  if (nand_read_cache(kNandSpareOffset, &marker, 1) != ESP_OK) {
-    return true;
-  }
-  return marker != 0xFF;
-}
-
-static esp_err_t nand_build_block_map(void) {
-  g_good_block_count = 0;
-  for (uint32_t block = 0; block < kNandBlockCount; ++block) {
-    if (!nand_is_block_bad(block)) {
-      g_good_blocks[g_good_block_count++] = block;
-    }
-    if ((block % 16) == 0) {
-      vTaskDelay(pdMS_TO_TICKS(1));
-    }
-  }
-  return g_good_block_count > 0 ? ESP_OK : ESP_FAIL;
-}
-
-static bool nand_map_addr(uint32_t addr, uint32_t *out_phys) {
-  uint32_t block = addr / kNandBlockSize;
-  uint32_t offset = addr % kNandBlockSize;
-  if (block >= g_good_block_count) {
-    return false;
-  }
-  *out_phys = g_good_blocks[block] * kNandBlockSize + offset;
-  return true;
-}
-
-extern "C" void spiffs_api_lock(spiffs *fs) {
-  auto *ctx = static_cast<spiffs_nand_ctx_t *>(fs->user_data);
-  if (ctx && ctx->lock) {
-    xSemaphoreTake(ctx->lock, portMAX_DELAY);
-  }
-}
-
-extern "C" void spiffs_api_unlock(spiffs *fs) {
-  auto *ctx = static_cast<spiffs_nand_ctx_t *>(fs->user_data);
-  if (ctx && ctx->lock) {
-    xSemaphoreGive(ctx->lock);
-  }
-}
-
-static s32_t spiffs_nand_read(spiffs *fs, uint32_t addr, uint32_t size,
-                              uint8_t *dst) {
-  (void)fs;
-  if (!nand_lock(portMAX_DELAY)) {
-    return -1;
-  }
-
-  while (size > 0) {
-    uint32_t phys_addr = 0;
-    if (!nand_map_addr(addr, &phys_addr)) {
-      nand_unlock();
-      return -1;
-    }
-
-    uint32_t chunk = kNandBlockSize - (addr % kNandBlockSize);
-    if (chunk > size) {
-      chunk = size;
-    }
-
-    esp_err_t ret = nand_read_bytes(phys_addr, dst, chunk);
-    if (ret != ESP_OK) {
-      nand_unlock();
-      return -1;
-    }
-
-    addr += chunk;
-    dst += chunk;
-    size -= chunk;
-  }
-
-  nand_unlock();
-  return 0;
-}
-
-static s32_t spiffs_nand_write(spiffs *fs, uint32_t addr, uint32_t size,
-                               uint8_t *src) {
-  (void)fs;
-  if (!nand_lock(portMAX_DELAY)) {
-    return -1;
-  }
-
-  while (size > 0) {
-    uint32_t phys_addr = 0;
-    if (!nand_map_addr(addr, &phys_addr)) {
-      nand_unlock();
-      return -1;
-    }
-
-    uint32_t chunk = kNandBlockSize - (addr % kNandBlockSize);
-    if (chunk > size) {
-      chunk = size;
-    }
-
-    esp_err_t ret = nand_write_bytes(phys_addr, src, chunk);
-    if (ret != ESP_OK) {
-      nand_unlock();
-      return -1;
-    }
-
-    addr += chunk;
-    src += chunk;
-    size -= chunk;
-  }
-
-  nand_unlock();
-  return 0;
-}
-
-static s32_t spiffs_nand_erase(spiffs *fs, uint32_t addr, uint32_t size) {
-  (void)fs;
-  if (!nand_lock(portMAX_DELAY)) {
-    return -1;
-  }
-
-  while (size > 0) {
-    uint32_t block = addr / kNandBlockSize;
-    if (block >= g_good_block_count) {
-      nand_unlock();
-      return -1;
-    }
-
-    uint32_t phys_page = g_good_blocks[block] * kNandPagesPerBlock;
-    esp_err_t ret = nand_erase_block(phys_page);
-    if (ret != ESP_OK) {
-      nand_unlock();
-      return -1;
-    }
-
-    addr += kNandBlockSize;
-    if (size >= kNandBlockSize) {
-      size -= kNandBlockSize;
-    } else {
-      size = 0;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(1));
-  }
-
-  nand_unlock();
-  return 0;
-}
-
-static int log_storage_vprintf(const char *fmt, va_list args) {
-  char line[256];
-  va_list args_copy;
-  va_copy(args_copy, args);
-  int len = vsnprintf(line, sizeof(line), fmt, args_copy);
-  va_end(args_copy);
-
-  if (g_log_ready && g_log_ringbuf && len > 0 &&
-      xTaskGetSchedulerState() == taskSCHEDULER_RUNNING &&
-      !xPortInIsrContext()) {
-    size_t write_len = (len >= (int)sizeof(line)) ? (sizeof(line) - 1) : len;
-    xRingbufferSend(g_log_ringbuf, line, write_len, 0);
-  }
-
-  if (g_orig_vprintf) {
-    va_list args_copy2;
-    va_copy(args_copy2, args);
-    int ret = g_orig_vprintf(fmt, args_copy2);
-    va_end(args_copy2);
-    return ret;
-  }
-
-  return len;
-}
-
-static void log_storage_task(void *param) {
-  (void)param;
-  uint32_t pending_bytes = 0;
-  uint32_t last_flush_ms = 0;
-
-  while (true) {
-    if (!g_spiffs_mounted || g_log_file < 0 || !g_log_ringbuf) {
-      vTaskDelay(pdMS_TO_TICKS(200));
-      continue;
-    }
-
-    size_t item_size = 0;
-    char *item = (char *)xRingbufferReceive(g_log_ringbuf, &item_size,
-                                            pdMS_TO_TICKS(200));
-    if (item) {
-      if (g_log_file >= 0) {
-        SPIFFS_write(&g_fs, g_log_file, item, item_size);
-        pending_bytes += item_size;
-      }
-      vRingbufferReturnItem(g_log_ringbuf, item);
-    }
-
-    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    bool should_flush = pending_bytes >= kLogFlushBytes ||
-                        (pending_bytes > 0 && (now_ms - last_flush_ms) > 2000);
-
-    if (should_flush && g_log_file >= 0) {
-      SPIFFS_fflush(&g_fs, g_log_file);
-      pending_bytes = 0;
-      last_flush_ms = now_ms;
-
-      spiffs_stat stat = {};
-      if (SPIFFS_fstat(&g_fs, g_log_file, &stat) == SPIFFS_OK &&
-          stat.size > g_log_max_bytes) {
-        SPIFFS_close(&g_fs, g_log_file);
-        SPIFFS_remove(&g_fs, "log.txt");
-        g_log_file = SPIFFS_open(&g_fs, "log.txt",
-                                 SPIFFS_CREAT | SPIFFS_APPEND | SPIFFS_RDWR, 0);
+  // List files in mount point
+  DIR *dir = opendir(kMountPoint);
+  if (dir) {
+    ESP_LOGI(TAG, "Files in %s:", kMountPoint);
+    struct dirent *ent;
+    while ((ent = readdir(dir)) != nullptr) {
+      char filepath[280];  // PATH_MAX for d_name is 255 + mount point
+      snprintf(filepath, sizeof(filepath), "%s/%.250s", kMountPoint, ent->d_name);
+      struct stat st;
+      if (stat(filepath, &st) == 0) {
+        ESP_LOGI(TAG, "  - %s (%ld bytes)", ent->d_name, st.st_size);
+      } else {
+        ESP_LOGI(TAG, "  - %s (size unknown)", ent->d_name);
       }
     }
-  }
-}
-
-static esp_err_t log_storage_mount_spiffs(void) {
-  g_spiffs_ctx.lock = xSemaphoreCreateMutex();
-  if (!g_spiffs_ctx.lock) {
-    return ESP_ERR_NO_MEM;
+    closedir(dir);
   }
 
-  spiffs_config cfg = {};
-  cfg.hal_read_f = spiffs_nand_read;
-  cfg.hal_write_f = spiffs_nand_write;
-  cfg.hal_erase_f = spiffs_nand_erase;
-  cfg.phys_size = g_good_block_count * kNandBlockSize;
-  cfg.phys_addr = 0;
-  cfg.phys_erase_block = kNandBlockSize;
-  cfg.log_block_size = kNandBlockSize;
-  cfg.log_page_size = kNandPageSize;
+  g_storage_ready = true;
+  ESP_LOGI(TAG, "=== NAND Flash Ready ===");
 
-  g_fs.cfg = cfg;
-  g_fs.user_data = &g_spiffs_ctx;
+  // Initialize sensor record storage
+  sensor_record_init();
 
-  g_spiffs_work = (uint8_t *)heap_caps_malloc(kNandPageSize * 2, MALLOC_CAP_DEFAULT);
-  g_spiffs_fds = (uint8_t *)heap_caps_malloc(4096, MALLOC_CAP_DEFAULT);
-  g_spiffs_cache = (uint8_t *)heap_caps_malloc(kNandPageSize * 2 + 1024,
-                                               MALLOC_CAP_DEFAULT);
-
-  if (!g_spiffs_work || !g_spiffs_fds || !g_spiffs_cache) {
-    return ESP_ERR_NO_MEM;
-  }
-
-  int res = SPIFFS_mount(&g_fs, &cfg, g_spiffs_work, g_spiffs_fds, 4096,
-                         g_spiffs_cache, kNandPageSize * 2 + 1024, nullptr);
-  if (res != SPIFFS_OK) {
-    SPIFFS_format(&g_fs);
-    res = SPIFFS_mount(&g_fs, &cfg, g_spiffs_work, g_spiffs_fds, 4096,
-                       g_spiffs_cache, kNandPageSize * 2 + 1024, nullptr);
-  }
-
-  return (res == SPIFFS_OK) ? ESP_OK : ESP_FAIL;
-}
-
-static void log_storage_mount_task(void *param) {
-  (void)param;
-  vTaskDelay(pdMS_TO_TICKS(5000));
-
-  ESP_LOGI(TAG, "=== NAND Flash Debug ===");
-  ESP_LOGI(TAG, "SPI Host: SPI2_HOST, CS: GPIO%d, CLK: GPIO%d, MOSI: GPIO%d, MISO: GPIO%d",
-           kNandPinCs, kNandPinSclk, kNandPinMosi, kNandPinMiso);
-  ESP_LOGI(TAG, "SPI handle: %p", (void*)g_nand_spi);
-
-  if (!g_nand_spi) {
-    ESP_LOGE(TAG, "NAND SPI handle is NULL!");
-    vTaskDelete(nullptr);
-    return;
-  }
-
-  if (!nand_lock(pdMS_TO_TICKS(1000))) {
-    ESP_LOGE(TAG, "NAND lock timeout");
-    vTaskDelete(nullptr);
-    return;
-  }
-
-  // Try read ID first (without reset) to see if chip responds at all
-  ESP_LOGI(TAG, "Trying Read ID before reset...");
-  uint8_t mfr = 0, dev1 = 0, dev2 = 0;
-  esp_err_t ret = nand_read_id(&mfr, &dev1, &dev2);
-  ESP_LOGI(TAG, "Pre-reset Read ID result: %s, ID: 0x%02X 0x%02X 0x%02X",
-           esp_err_to_name(ret), mfr, dev1, dev2);
-
-  ret = nand_reset();
-  if (ret != ESP_OK) {
-    nand_unlock();
-    ESP_LOGE(TAG, "NAND reset failed: %s", esp_err_to_name(ret));
-    vTaskDelete(nullptr);
-    return;
-  }
-
-  mfr = 0; dev1 = 0; dev2 = 0;
-  ret = nand_read_id(&mfr, &dev1, &dev2);
-  nand_unlock();
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "NAND read ID failed: %s", esp_err_to_name(ret));
-    vTaskDelete(nullptr);
-    return;
-  }
-
-  ESP_LOGI(TAG, "W25N512 ID: 0x%02X 0x%02X 0x%02X", mfr, dev1, dev2);
-
-  if (!nand_lock(pdMS_TO_TICKS(1000))) {
-    ESP_LOGE(TAG, "NAND lock timeout");
-    vTaskDelete(nullptr);
-    return;
-  }
-  ret = nand_build_block_map();
-  nand_unlock();
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "NAND block scan failed");
-    vTaskDelete(nullptr);
-    return;
-  }
-
-  ESP_LOGI(TAG, "NAND blocks: %u good / %u total", g_good_block_count,
-           kNandBlockCount);
-  uint32_t total_bytes = g_good_block_count * kNandBlockSize;
-  if (total_bytes > kNandBlockSize) {
-    uint32_t max_allowed = total_bytes - kNandBlockSize;
-    if (g_log_max_bytes > max_allowed) {
-      g_log_max_bytes = max_allowed;
-    }
-  }
-
-  ret = log_storage_mount_spiffs();
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "SPIFFS mount failed");
-    vTaskDelete(nullptr);
-    return;
-  }
-
-  g_log_file = SPIFFS_open(&g_fs, "log.txt",
-                           SPIFFS_CREAT | SPIFFS_APPEND | SPIFFS_RDWR, 0);
-  if (g_log_file < 0) {
-    ESP_LOGE(TAG, "SPIFFS open log failed");
-    vTaskDelete(nullptr);
-    return;
-  }
-
-  g_spiffs_mounted = true;
-  ESP_LOGI(TAG, "Log storage ready (SPIFFS on W25N512, %u bytes)",
-           g_good_block_count * kNandBlockSize);
+  // Run test
+  sensor_record_test();
 
   vTaskDelete(nullptr);
 }
 
+// ============================================================================
+// Public API
+// ============================================================================
+
 esp_err_t log_storage_init(void) {
-  if (g_log_ready) {
+  if (g_mount_started) {
+    ESP_LOGW(TAG, "log_storage_init already called");
     return ESP_OK;
   }
+  g_mount_started = true;
 
-  g_nand_lock = xSemaphoreCreateMutex();
-  if (!g_nand_lock) {
+  // Start mount task with sufficient stack
+  BaseType_t ret =
+      xTaskCreate(log_storage_mount_task, "LogMount", 8192, nullptr, 5, &g_mount_task);
+  if (ret != pdPASS) {
+    ESP_LOGE(TAG, "Failed to create mount task");
     return ESP_ERR_NO_MEM;
   }
 
-  spi_bus_config_t buscfg = {};
-  buscfg.mosi_io_num = kNandPinMosi;
-  buscfg.miso_io_num = kNandPinMiso;
-  buscfg.sclk_io_num = kNandPinSclk;
-  buscfg.quadwp_io_num = -1;
-  buscfg.quadhd_io_num = -1;
-  buscfg.data4_io_num = -1;
-  buscfg.data5_io_num = -1;
-  buscfg.data6_io_num = -1;
-  buscfg.data7_io_num = -1;
-  buscfg.data_io_default_level = false;
-  buscfg.max_transfer_sz = 4096;
-  buscfg.flags = 0;
-  buscfg.isr_cpu_id = ESP_INTR_CPU_AFFINITY_AUTO;
-  buscfg.intr_flags = 0;
-
-  esp_err_t ret = spi_bus_initialize(kNandSpiHost, &buscfg, SPI_DMA_CH_AUTO);
-  if (ret != ESP_OK && ret != ESP_ERR_INVALID_STATE) {
-    ESP_LOGE(TAG, "SPI bus init failed: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  spi_device_interface_config_t devcfg = {};
-  devcfg.clock_speed_hz = kNandClockHz;
-  devcfg.mode = 0;
-  devcfg.spics_io_num = kNandPinCs;
-  devcfg.queue_size = 1;
-  devcfg.flags = SPI_DEVICE_HALFDUPLEX;
-
-  ret = spi_bus_add_device(kNandSpiHost, &devcfg, &g_nand_spi);
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG, "SPI NAND add device failed: %s", esp_err_to_name(ret));
-    return ret;
-  }
-
-  g_log_ringbuf = xRingbufferCreate(kLogRingbufSize, RINGBUF_TYPE_BYTEBUF);
-  if (!g_log_ringbuf) {
-    return ESP_ERR_NO_MEM;
-  }
-
-  xTaskCreatePinnedToCore(log_storage_task, "LogTask", 4096, nullptr, 3,
-                          &g_log_task, tskNO_AFFINITY);
-
-  if (!g_orig_vprintf) {
-    g_orig_vprintf = esp_log_set_vprintf(log_storage_vprintf);
-  }
-  g_log_ready = true;
-
-  if (!g_mount_started) {
-    g_mount_started = true;
-    xTaskCreatePinnedToCore(log_storage_mount_task, "LogMount", 8192, nullptr, 1,
-                            &g_mount_task, tskNO_AFFINITY);
-  }
   return ESP_OK;
+}
+
+bool log_storage_is_ready(void) {
+  return g_storage_ready;
+}
+
+// ============================================================================
+// Sensor Record Storage
+// ============================================================================
+
+esp_err_t sensor_record_init(void) {
+  if (!g_storage_ready) {
+    ESP_LOGE(TAG, "Storage not ready");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  // Check if sensor file exists and count records
+  struct stat st;
+  if (stat(kSensorDataFile, &st) == 0) {
+    g_record_count = st.st_size / sizeof(sensor_record_t);
+    ESP_LOGI(TAG, "Sensor data file exists: %ld bytes, %ld records",
+             st.st_size, g_record_count);
+  } else {
+    g_record_count = 0;
+    ESP_LOGI(TAG, "Sensor data file does not exist, will be created");
+  }
+
+  return ESP_OK;
+}
+
+esp_err_t sensor_record_write(const sensor_record_t *record) {
+  if (!g_storage_ready) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (!storage_lock(pdMS_TO_TICKS(1000))) {
+    return ESP_ERR_TIMEOUT;
+  }
+
+  esp_err_t result = ESP_OK;
+
+  // Open file for append in binary mode
+  FILE *f = fopen(kSensorDataFile, "ab");
+  if (!f) {
+    ESP_LOGE(TAG, "Failed to open sensor file for append");
+    storage_unlock();
+    return ESP_FAIL;
+  }
+
+  // Write record
+  size_t written = fwrite(record, sizeof(sensor_record_t), 1, f);
+  if (written != 1) {
+    ESP_LOGE(TAG, "Failed to write sensor record");
+    result = ESP_FAIL;
+  } else {
+    g_record_count++;
+  }
+
+  fclose(f);
+  storage_unlock();
+
+  return result;
+}
+
+int32_t sensor_record_count(void) {
+  if (!g_storage_ready) {
+    return -1;
+  }
+
+  // Refresh count from file
+  struct stat st;
+  if (stat(kSensorDataFile, &st) == 0) {
+    g_record_count = st.st_size / sizeof(sensor_record_t);
+  } else {
+    g_record_count = 0;
+  }
+
+  return g_record_count;
+}
+
+esp_err_t sensor_record_read(uint32_t index, sensor_record_t *record) {
+  if (!g_storage_ready) {
+    return ESP_ERR_INVALID_STATE;
+  }
+  if (!record) {
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (!storage_lock(pdMS_TO_TICKS(1000))) {
+    return ESP_ERR_TIMEOUT;
+  }
+
+  esp_err_t result = ESP_OK;
+
+  FILE *f = fopen(kSensorDataFile, "rb");
+  if (!f) {
+    storage_unlock();
+    return ESP_ERR_NOT_FOUND;
+  }
+
+  // Seek to record position
+  long offset = index * sizeof(sensor_record_t);
+  if (fseek(f, offset, SEEK_SET) != 0) {
+    fclose(f);
+    storage_unlock();
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  // Read record
+  size_t read = fread(record, sizeof(sensor_record_t), 1, f);
+  if (read != 1) {
+    result = ESP_ERR_NOT_FOUND;
+  }
+
+  fclose(f);
+  storage_unlock();
+
+  return result;
+}
+
+int32_t sensor_record_read_recent(uint32_t count, sensor_record_t *records) {
+  if (!g_storage_ready || !records) {
+    return -1;
+  }
+
+  int32_t total = sensor_record_count();
+  if (total <= 0) {
+    return 0;
+  }
+
+  uint32_t start_idx = (total > (int32_t)count) ? (total - count) : 0;
+  uint32_t actual_count = total - start_idx;
+
+  if (!storage_lock(pdMS_TO_TICKS(1000))) {
+    return -1;
+  }
+
+  FILE *f = fopen(kSensorDataFile, "rb");
+  if (!f) {
+    storage_unlock();
+    return -1;
+  }
+
+  long offset = start_idx * sizeof(sensor_record_t);
+  if (fseek(f, offset, SEEK_SET) != 0) {
+    fclose(f);
+    storage_unlock();
+    return -1;
+  }
+
+  size_t read = fread(records, sizeof(sensor_record_t), actual_count, f);
+  fclose(f);
+  storage_unlock();
+
+  return (int32_t)read;
+}
+
+esp_err_t sensor_record_clear(void) {
+  if (!g_storage_ready) {
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (!storage_lock(pdMS_TO_TICKS(1000))) {
+    return ESP_ERR_TIMEOUT;
+  }
+
+  // Remove the file
+  remove(kSensorDataFile);
+  g_record_count = 0;
+
+  storage_unlock();
+  ESP_LOGI(TAG, "Sensor records cleared");
+
+  return ESP_OK;
+}
+
+// ============================================================================
+// Test Function
+// ============================================================================
+
+void sensor_record_test(void) {
+  ESP_LOGI(TAG, "=== Sensor Record Test ===");
+
+  // Create test records
+  sensor_record_t test_records[5];
+
+  for (int i = 0; i < 5; i++) {
+    test_records[i].timestamp_ms = esp_timer_get_time() / 1000 + i * 1000;
+    test_records[i].co2_ppm = 400 + i * 50;
+    test_records[i].temp_c_x100 = 2350 + i * 10;  // 23.5°C + offset
+    test_records[i].rh_x100 = 5500 + i * 100;     // 55% + offset
+    test_records[i].pm25_x10 = 120 + i * 5;       // 12.0 µg/m³ + offset
+    test_records[i].pm10_x10 = 180 + i * 8;
+    test_records[i].pm1_x10 = 80 + i * 3;
+    test_records[i].voc_index = 100 + i;
+    test_records[i].nox_index = 1;
+    test_records[i].pressure_pa = 101325 + i * 100;
+    test_records[i].reserved = 0;
+
+    // Calculate CRC (excluding CRC field itself)
+    test_records[i].crc16 =
+        crc16_ccitt((uint8_t *)&test_records[i],
+                    sizeof(sensor_record_t) - sizeof(uint16_t));
+  }
+
+  // Write test records
+  ESP_LOGI(TAG, "Writing %d test records...", 5);
+  for (int i = 0; i < 5; i++) {
+    esp_err_t ret = sensor_record_write(&test_records[i]);
+    if (ret == ESP_OK) {
+      ESP_LOGI(TAG, "  Record %d written: CO2=%u ppm, T=%d.%02d°C",
+               i, test_records[i].co2_ppm,
+               test_records[i].temp_c_x100 / 100,
+               test_records[i].temp_c_x100 % 100);
+    } else {
+      ESP_LOGE(TAG, "  Failed to write record %d: %s", i, esp_err_to_name(ret));
+    }
+  }
+
+  // Count records
+  int32_t count = sensor_record_count();
+  ESP_LOGI(TAG, "Total records in storage: %ld", count);
+
+  // Read back and verify
+  ESP_LOGI(TAG, "Reading back records...");
+  for (int i = 0; i < 5; i++) {
+    sensor_record_t read_record;
+    uint32_t read_idx = (count > 5) ? (count - 5 + i) : i;
+    esp_err_t ret = sensor_record_read(read_idx, &read_record);
+    if (ret == ESP_OK) {
+      // Verify CRC
+      uint16_t calc_crc =
+          crc16_ccitt((uint8_t *)&read_record,
+                      sizeof(sensor_record_t) - sizeof(uint16_t));
+      bool crc_ok = (calc_crc == read_record.crc16);
+
+      ESP_LOGI(TAG,
+               "  Record[%lu]: CO2=%u, T=%d.%02d°C, RH=%d.%02d%%, PM2.5=%d.%d, "
+               "CRC=%s",
+               read_idx, read_record.co2_ppm, read_record.temp_c_x100 / 100,
+               read_record.temp_c_x100 % 100, read_record.rh_x100 / 100,
+               read_record.rh_x100 % 100, read_record.pm25_x10 / 10,
+               read_record.pm25_x10 % 10, crc_ok ? "OK" : "FAIL");
+    } else {
+      ESP_LOGE(TAG, "  Failed to read record %lu: %s", read_idx,
+               esp_err_to_name(ret));
+    }
+  }
+
+  // Print filesystem info
+  uint64_t bytes_total = 0, bytes_free = 0;
+  esp_vfs_fat_info(kMountPoint, &bytes_total, &bytes_free);
+  ESP_LOGI(TAG, "FATFS after test: %llu KB total, %llu KB free",
+           bytes_total / 1024, bytes_free / 1024);
+
+  ESP_LOGI(TAG, "=== Sensor Record Test Complete ===");
 }

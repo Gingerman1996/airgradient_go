@@ -19,7 +19,8 @@ idf_component_register(
         "esp_epaper"
         "esp_lcd"
         "lvgl"
-        "spiffs_nand"
+        "espressif__spi_nand_flash"
+        "fatfs"
         "dps368"
 )
 

@@ -326,10 +326,11 @@ void GPS::update_time_from_tm(const struct tm* timeinfo, uint64_t now_ms) {
 }
 
 void GPS::log_status(uint64_t now_ms, uint64_t sentence_timeout_ms, uint64_t fix_timeout_ms) {
-    const uint64_t log_interval_ms = 1000;
+    const uint64_t log_interval_ms = 5000;  // Log every 5 seconds
     if (now_ms - last_status_log_ms_ < log_interval_ms) {
         return;
     }
+    last_status_log_ms_ = now_ms;
 
     bool has_sentence = has_recent_sentence(now_ms, sentence_timeout_ms);
     bool has_fix = has_recent_fix(now_ms, fix_timeout_ms);
@@ -342,18 +343,7 @@ void GPS::log_status(uint64_t now_ms, uint64_t sentence_timeout_ms, uint64_t fix
         ant = AntennaStatus::Unknown;
     }
 
-    bool changed = (ant != last_logged_antenna_) ||
-                   (has_fix != last_logged_fix_valid_) ||
-                   (fix_quality_ != last_logged_fix_quality_) ||
-                   (satellites_ != last_logged_sats_) ||
-                   (time_valid != last_logged_time_valid_) ||
-                   (time_valid && (hour != last_logged_hour_ || min != last_logged_min_));
-
-    if (!changed) {
-        return;
-    }
-
-    last_status_log_ms_ = now_ms;
+    // Update last logged values for tracking
     last_logged_antenna_ = ant;
     last_logged_fix_valid_ = has_fix;
     last_logged_fix_quality_ = fix_quality_;
