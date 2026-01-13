@@ -432,8 +432,11 @@ static void display_task(void *arg) {
         display->setPM25f(snapshot.sensor.pm25_mass);
         display->setVOC(snapshot.sensor.voc_index);
         display->setNOx(snapshot.sensor.nox_index);
-        display->setPressure(
-            1013); // TODO: Add pressure sensor when DPS368 is implemented
+        
+        // Set pressure from sensor (convert Pa to hPa)
+        int pressure_hpa = (snapshot.sensor.pressure_pa > 0) ? 
+                          (int)(snapshot.sensor.pressure_pa / 100.0f) : 1013;
+        display->setPressure(pressure_hpa);
 
         if (!last_display_refresh_ms) {
           last_display_refresh_ms = now_ms_u;

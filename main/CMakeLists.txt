@@ -20,6 +20,7 @@ idf_component_register(
         "esp_lcd"
         "lvgl"
         "spiffs_nand"
+        "dps368"
 )
 
 # Optimize for size (OTA partition is 1 MB)

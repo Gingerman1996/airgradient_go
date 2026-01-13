@@ -11,6 +11,7 @@
 #include "sgp4x.h"
 #include "sps30.h"
 #include "sensirion_gas_index_algorithm.h"
+#include "dps368.h"
 #include "driver/gpio.h"
 
 static const char *TAG_SENS = "sensors";
@@ -86,6 +87,11 @@ struct Sensors::SensorsState {
     // SPS30 PM sensor
     sps30_handle_t sps30_handle;
     sps30_measurement_t sps30_data;
+    
+    // DPS368 Pressure sensor
+    dps368_handle_t *dps368_handle;
+    dps368_data_t dps368_data;
+    int64_t last_dps_read;
 };
 
 // Constructor
@@ -106,6 +112,7 @@ Sensors::Sensors() {
     };
     state->sgp4x_handle = NULL;
     state->sps30_handle = NULL;
+    state->dps368_handle = NULL;
 
     // Initialize Gas Index Algorithms (1s sampling interval matches SGP4x update rate)
     GasIndexAlgorithm_init_with_sampling_interval(&state->voc_algo_params, GasIndexAlgorithm_ALGORITHM_TYPE_VOC, 1.0f);
@@ -273,6 +280,16 @@ static esp_err_t init_sps30_sensor(Sensors::SensorsState *state) {
     sps30_stop_measurement(state->sps30_handle);
     sps30_sleep(state->sps30_handle);
     ESP_LOGI(TAG_SENS, "SPS30 ready (sleep mode)");
+    
+    // Initialize DPS368 pressure sensor (address 0x77 per hardware config)
+    ret = dps368_init(state->i2c_bus_handle, DPS368_I2C_ADDR_SDO_VDD, &state->dps368_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_SENS, "DPS368 init failed (optional sensor): %s", esp_err_to_name(ret));
+        state->dps368_handle = NULL;
+    } else {
+        ESP_LOGI(TAG_SENS, "DPS368 pressure sensor ready");
+    }
+    
     return ESP_OK;
 }
 
@@ -513,6 +530,17 @@ void Sensors::update(int64_t current_millis) {
     update_stcc4(state, current_millis);
     update_sgp4x(state, current_millis);
     update_sps30(state, current_millis);
+    
+    // Read DPS368 pressure sensor (every second)
+    if (state->dps368_handle && (current_millis - state->last_dps_read >= 1000)) {
+        state->last_dps_read = current_millis;
+        esp_err_t ret = dps368_read(state->dps368_handle, &state->dps368_data);
+        if (ret == ESP_OK && state->dps368_data.pressure_valid) {
+            ESP_LOGD(TAG_SENS, "DPS368: Pressure=%.1f Pa (%.1f hPa), Temp=%.1f°C", 
+                     state->dps368_data.pressure_pa, state->dps368_data.pressure_pa / 100.0f, 
+                     state->dps368_data.temperature_c);
+        }
+    }
 }
 
 void Sensors::getValues(int64_t now_ms, sensor_values_t *out) {
@@ -531,6 +559,7 @@ void Sensors::getValues(int64_t now_ms, sensor_values_t *out) {
     out->nox_ticks = (int)state->sgp_nox_ticks;
     out->voc_index = (int)state->voc_index;
     out->nox_index = (int)state->nox_index;
+    out->pressure_pa = state->dps368_data.pressure_pa;
 }
 
 i2c_master_bus_handle_t Sensors::getI2CBusHandle(void) {

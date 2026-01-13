@@ -17,6 +17,8 @@
 static const char *TAG = "log_store";
 
 // W25N512GV SPI NAND configuration
+// Shares SPI2_HOST bus with e-paper display
+// E-paper must initialize the bus with MISO pin for NAND to work
 static const spi_host_device_t kNandSpiHost = SPI2_HOST;
 static const int kNandPinMosi = 25;
 static const int kNandPinMiso = 24;
@@ -86,41 +88,45 @@ static void nand_unlock(void) {
   }
 }
 
-static esp_err_t nand_transmit(const uint8_t *tx, size_t tx_len, uint8_t *rx,
-                               size_t rx_len, uint32_t dummy_bits) {
+static esp_err_t nand_transact(uint8_t cmd, uint32_t addr, uint8_t addr_bits,
+                               const uint8_t *tx, size_t tx_len, uint8_t *rx,
+                               size_t rx_len, uint8_t dummy_bits) {
   if (!g_nand_spi) {
     return ESP_ERR_INVALID_STATE;
   }
 
-  if (dummy_bits > 0) {
-    spi_transaction_ext_t t = {};
-    t.base.flags = SPI_TRANS_VARIABLE_DUMMY;
-    t.base.length = tx_len * 8;
-    t.base.tx_buffer = tx;
-    t.base.rxlength = rx_len * 8;
-    t.base.rx_buffer = rx;
-    t.dummy_bits = dummy_bits;
-    return spi_device_polling_transmit(g_nand_spi, &t.base);
+  spi_transaction_ext_t t = {};
+  t.base.flags = SPI_TRANS_VARIABLE_CMD;
+  t.command_bits = 8;
+  t.base.cmd = cmd;
+
+  if (addr_bits > 0) {
+    t.base.flags |= SPI_TRANS_VARIABLE_ADDR;
+    t.address_bits = addr_bits;
+    t.base.addr = addr;
   }
 
-  spi_transaction_t t = {};
-  t.length = tx_len * 8;
-  t.tx_buffer = tx;
-  t.rxlength = rx_len * 8;
-  t.rx_buffer = rx;
+  if (dummy_bits > 0) {
+    t.base.flags |= SPI_TRANS_VARIABLE_DUMMY;
+    t.dummy_bits = dummy_bits;
+  }
 
-  return spi_device_polling_transmit(g_nand_spi, &t);
+  t.base.length = tx_len * 8;
+  t.base.tx_buffer = tx;
+  t.base.rxlength = rx_len * 8;
+  t.base.rx_buffer = rx;
+
+  return spi_device_polling_transmit(g_nand_spi, &t.base);
 }
 
 static esp_err_t nand_write_enable(void) {
-  const uint8_t cmd = kCmdWriteEnable;
-  return nand_transmit(&cmd, 1, nullptr, 0, 0);
+  return nand_transact(kCmdWriteEnable, 0, 0, nullptr, 0, nullptr, 0, 0);
 }
 
 static esp_err_t nand_read_status(uint8_t reg_addr, uint8_t *out_status) {
-  uint8_t tx[2] = {kCmdReadStatus, reg_addr};
   uint8_t rx[1] = {0};
-  esp_err_t ret = nand_transmit(tx, sizeof(tx), rx, sizeof(rx), 0);
+  esp_err_t ret =
+      nand_transact(kCmdReadStatus, reg_addr, 8, nullptr, 0, rx, sizeof(rx), 0);
   if (ret == ESP_OK) {
     *out_status = rx[0];
   }
@@ -146,19 +152,26 @@ static esp_err_t nand_wait_ready(uint32_t timeout_ms) {
 }
 
 static esp_err_t nand_reset(void) {
-  const uint8_t cmd = kCmdReset;
-  esp_err_t ret = nand_transmit(&cmd, 1, nullptr, 0, 0);
+  ESP_LOGI(TAG, "Sending NAND reset command (0xFF)...");
+  esp_err_t ret = nand_transact(kCmdReset, 0, 0, nullptr, 0, nullptr, 0, 0);
   if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "NAND reset transact failed: %s", esp_err_to_name(ret));
     return ret;
   }
-  return nand_wait_ready(5);
+  ESP_LOGI(TAG, "NAND reset sent, waiting for ready...");
+  ret = nand_wait_ready(100);  // Increase timeout to 100ms
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "NAND wait_ready failed: %s", esp_err_to_name(ret));
+  }
+  return ret;
 }
 
 static esp_err_t nand_read_id(uint8_t *out_mfr, uint8_t *out_dev1,
                               uint8_t *out_dev2) {
-  const uint8_t cmd = kCmdReadId;
   uint8_t rx[3] = {0};
-  esp_err_t ret = nand_transmit(&cmd, 1, rx, sizeof(rx), 0);
+  // W25N512 Read ID: CMD (0x9F) + 8-bit dummy address (0x00) + read 3 bytes
+  esp_err_t ret =
+      nand_transact(kCmdReadId, 0, 8, nullptr, 0, rx, sizeof(rx), 0);
   if (ret == ESP_OK) {
     *out_mfr = rx[0];
     *out_dev1 = rx[1];
@@ -168,11 +181,7 @@ static esp_err_t nand_read_id(uint8_t *out_mfr, uint8_t *out_dev1,
 }
 
 static esp_err_t nand_page_read(uint32_t page) {
-  uint8_t cmd[4] = {kCmdPageRead,
-                    (uint8_t)((page >> 16) & 0xFF),
-                    (uint8_t)((page >> 8) & 0xFF),
-                    (uint8_t)(page & 0xFF)};
-  esp_err_t ret = nand_transmit(cmd, sizeof(cmd), nullptr, 0, 0);
+  esp_err_t ret = nand_transact(kCmdPageRead, page, 24, nullptr, 0, nullptr, 0, 0);
   if (ret != ESP_OK) {
     return ret;
   }
@@ -180,8 +189,7 @@ static esp_err_t nand_page_read(uint32_t page) {
 }
 
 static esp_err_t nand_read_cache(uint16_t column, uint8_t *dst, size_t len) {
-  uint8_t cmd[3] = {kCmdReadCache, (uint8_t)(column >> 8), (uint8_t)column};
-  return nand_transmit(cmd, sizeof(cmd), dst, len, 8);
+  return nand_transact(kCmdReadCache, column, 16, nullptr, 0, dst, len, 8);
 }
 
 static esp_err_t nand_read_page(uint32_t page, uint8_t *dst) {
@@ -203,31 +211,12 @@ static esp_err_t nand_program_page(uint32_t page, uint16_t column,
     return ret;
   }
 
-  uint8_t header[3] = {kCmdProgramLoad, (uint8_t)(column >> 8),
-                       (uint8_t)column};
-
-  spi_transaction_t t = {};
-  t.length = sizeof(header) * 8;
-  t.tx_buffer = header;
-  t.flags = SPI_TRANS_CS_KEEP_ACTIVE;
-  ret = spi_device_polling_transmit(g_nand_spi, &t);
+  ret = nand_transact(kCmdProgramLoad, column, 16, data, len, nullptr, 0, 0);
   if (ret != ESP_OK) {
     return ret;
   }
 
-  spi_transaction_t data_tx = {};
-  data_tx.length = len * 8;
-  data_tx.tx_buffer = data;
-  ret = spi_device_polling_transmit(g_nand_spi, &data_tx);
-  if (ret != ESP_OK) {
-    return ret;
-  }
-
-  uint8_t exec[4] = {kCmdProgramExecute,
-                     (uint8_t)((page >> 16) & 0xFF),
-                     (uint8_t)((page >> 8) & 0xFF),
-                     (uint8_t)(page & 0xFF)};
-  ret = nand_transmit(exec, sizeof(exec), nullptr, 0, 0);
+  ret = nand_transact(kCmdProgramExecute, page, 24, nullptr, 0, nullptr, 0, 0);
   if (ret != ESP_OK) {
     return ret;
   }
@@ -240,11 +229,7 @@ static esp_err_t nand_erase_block(uint32_t page) {
     return ret;
   }
 
-  uint8_t cmd[4] = {kCmdBlockErase,
-                    (uint8_t)((page >> 16) & 0xFF),
-                    (uint8_t)((page >> 8) & 0xFF),
-                    (uint8_t)(page & 0xFF)};
-  ret = nand_transmit(cmd, sizeof(cmd), nullptr, 0, 0);
+  ret = nand_transact(kCmdBlockErase, page, 24, nullptr, 0, nullptr, 0, 0);
   if (ret != ESP_OK) {
     return ret;
   }
@@ -591,13 +576,31 @@ static void log_storage_mount_task(void *param) {
   (void)param;
   vTaskDelay(pdMS_TO_TICKS(5000));
 
+  ESP_LOGI(TAG, "=== NAND Flash Debug ===");
+  ESP_LOGI(TAG, "SPI Host: SPI2_HOST, CS: GPIO%d, CLK: GPIO%d, MOSI: GPIO%d, MISO: GPIO%d",
+           kNandPinCs, kNandPinSclk, kNandPinMosi, kNandPinMiso);
+  ESP_LOGI(TAG, "SPI handle: %p", (void*)g_nand_spi);
+
+  if (!g_nand_spi) {
+    ESP_LOGE(TAG, "NAND SPI handle is NULL!");
+    vTaskDelete(nullptr);
+    return;
+  }
+
   if (!nand_lock(pdMS_TO_TICKS(1000))) {
     ESP_LOGE(TAG, "NAND lock timeout");
     vTaskDelete(nullptr);
     return;
   }
 
-  esp_err_t ret = nand_reset();
+  // Try read ID first (without reset) to see if chip responds at all
+  ESP_LOGI(TAG, "Trying Read ID before reset...");
+  uint8_t mfr = 0, dev1 = 0, dev2 = 0;
+  esp_err_t ret = nand_read_id(&mfr, &dev1, &dev2);
+  ESP_LOGI(TAG, "Pre-reset Read ID result: %s, ID: 0x%02X 0x%02X 0x%02X",
+           esp_err_to_name(ret), mfr, dev1, dev2);
+
+  ret = nand_reset();
   if (ret != ESP_OK) {
     nand_unlock();
     ESP_LOGE(TAG, "NAND reset failed: %s", esp_err_to_name(ret));
@@ -605,7 +608,7 @@ static void log_storage_mount_task(void *param) {
     return;
   }
 
-  uint8_t mfr = 0, dev1 = 0, dev2 = 0;
+  mfr = 0; dev1 = 0; dev2 = 0;
   ret = nand_read_id(&mfr, &dev1, &dev2);
   nand_unlock();
   if (ret != ESP_OK) {

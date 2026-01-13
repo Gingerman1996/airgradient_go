@@ -610,36 +610,29 @@ esp_err_t BQ25629::enable_pmid_5v_boost() {
   }
   vTaskDelay(pdMS_TO_TICKS(10));
 
-  // Step 3: Disable charging before enabling OTG
-  ret = enable_charging(false);
-  if (ret != ESP_OK) {
-    ESP_LOGW(TAG, "Failed to disable charging, continuing...");
-  }
-  vTaskDelay(pdMS_TO_TICKS(50));
-
-  // Step 4: Set VOTG to 5.0V
+  // Step 3: Set VOTG to 5.0V
   ret = set_votg_voltage(5000);
   if (ret != ESP_OK)
     return ret;
   vTaskDelay(pdMS_TO_TICKS(10));
 
-  // Step 5: Disable bypass OTG (we want boost mode, not bypass)
+  // Step 4: Disable bypass OTG (we want boost mode, not bypass)
   ret = enable_bypass_otg(false);
   if (ret != ESP_OK) {
     ESP_LOGW(TAG, "Failed to disable bypass OTG, continuing...");
   }
   vTaskDelay(pdMS_TO_TICKS(10));
 
-  // Step 6: Enable OTG boost mode
+  // Step 5: Enable OTG boost mode
   ret = enable_otg(true);
   if (ret != ESP_OK)
     return ret;
 
-  // Step 7: Wait for boost to stabilize (30ms per datasheet)
+  // Step 6: Wait for boost to stabilize (30ms per datasheet)
   ESP_LOGI(TAG, "Waiting for boost mode startup (30ms)...");
   vTaskDelay(pdMS_TO_TICKS(50));
 
-  // Step 8: Verify OTG mode is active by checking VBUS_STAT
+  // Step 7: Verify OTG mode is active by checking VBUS_STAT
   VBusStatus vbus_status;
   ret = get_vbus_status(vbus_status);
   if (ret == ESP_OK) {

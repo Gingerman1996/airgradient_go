@@ -16,6 +16,7 @@ typedef struct {
     int nox_ticks;        // SGP4x NOx ticks, 0 if unavailable
     int voc_index;        // VOC gas index (1-500), 0 during blackout
     int nox_index;        // NOx gas index (1-500), 0 during blackout
+    float pressure_pa;    // Atmospheric pressure in Pascals (DPS368), 0 if unavailable
 } sensor_values_t;
 
 class Sensors {

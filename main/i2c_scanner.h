@@ -25,7 +25,8 @@ static const I2cDevice I2C_KNOWN_DEVICES[] = {
     {0x62, "STCC4 / SCD4x (CO2 + Temp + RH)"},
     {0x69, "SPS30 (PM sensor primary)"},
     {0x6A, "BQ25628 (Battery charger)"},
-    {0x76, "DPS368 (Pressure)"},
+    {0x76, "DPS368 (Pressure, SDO=GND)"},
+    {0x77, "DPS368 (Pressure, SDO=VDD)"},
 };
 
 static const size_t I2C_NUM_KNOWN_DEVICES = 
