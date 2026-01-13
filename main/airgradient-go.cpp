@@ -1,8 +1,10 @@
 #include "bq25629.h"
 #include "cap1203.h"
 #include "gps.h"
+#include "log_storage.h"
 #include "sensor.h"
 #include "ui_display.h"
+#include "i2c_scanner.h"
 
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -508,6 +510,19 @@ extern "C" void app_main(void) {
   ESP_LOGI(TAG, "=== AirGradient GO - Phase 1.1 ===");
   ESP_LOGI(TAG, "Initializing display and sensors...");
 
+  xTaskCreatePinnedToCore(
+      [](void *param) {
+        (void)param;
+        vTaskDelay(pdMS_TO_TICKS(2000));
+        esp_err_t log_ret = log_storage_init();
+        if (log_ret != ESP_OK) {
+          ESP_LOGW(TAG, "Log storage init failed: %s",
+                   esp_err_to_name(log_ret));
+        }
+        vTaskDelete(NULL);
+      },
+      "LogInit", 8192, nullptr, 2, nullptr, tskNO_AFFINITY);
+
   // ==================== GPIO INITIALIZATION ====================
 
   // Configure QON button (GPIO5) as input with pull-up
@@ -539,6 +554,7 @@ extern "C" void app_main(void) {
   lv_init();
 
   // Configure e-paper display (144x296 SSD16xx-based, rotated 180°)
+  // MISO is set to GPIO24 to share SPI bus with W25N512 NAND flash
   epd_config_t epd_cfg = EPD_CONFIG_DEFAULT();
   epd_cfg.pins.busy = 10; // IO10
   epd_cfg.pins.rst = 9;   // IO9
@@ -546,6 +562,7 @@ extern "C" void app_main(void) {
   epd_cfg.pins.cs = 0;    // IO0
   epd_cfg.pins.sck = 23;  // IO23
   epd_cfg.pins.mosi = 25; // IO25
+  epd_cfg.pins.miso = 24; // IO24 - shared with NAND flash
   epd_cfg.spi.host = SPI2_HOST;
   epd_cfg.spi.speed_hz = 4000000; // 4 MHz (same as working ESP32-C6 code)
   epd_cfg.panel.type = EPD_PANEL_SSD16XX_290; // Try 2.9" config (128x296) -
@@ -669,6 +686,9 @@ extern "C" void app_main(void) {
     return;
   }
 
+  // Scan I2C bus for connected devices (enable/disable via #define)
+  i2c_scanner_scan(i2c_bus, 10);
+
   // ==================== CHARGER INITIALIZATION (BEFORE SENSORS!)
   // ====================
 
@@ -747,8 +767,23 @@ extern "C" void app_main(void) {
     }
 
     if (vbus_present) {
-      ESP_LOGI(TAG, "VBUS detected, skipping PMID boost to allow charging");
+      ESP_LOGI(TAG, "VBUS detected, keeping charging enabled");
     } else {
+      // Debounce VBUS on startup to avoid false OTG enable while VBUS is
+      // ramping.
+      vTaskDelay(pdMS_TO_TICKS(200));
+      ret = g_charger->read_status(charger_status);
+      if (ret == ESP_OK) {
+        vbus_present = vbus_present || (charger_status.vbus_status !=
+                                        drivers::VBusStatus::NO_ADAPTER);
+      }
+      ret = g_charger->read_adc(adc_data);
+      if (ret == ESP_OK) {
+        vbus_present = vbus_present || (adc_data.vbus_mv >= 4000);
+      }
+    }
+
+    if (!vbus_present) {
       // Enable PMID 5V boost using complete setup sequence
       ESP_LOGI(TAG, "Enabling PMID 5V boost output...");
       ret = g_charger->enable_pmid_5v_boost();
@@ -856,13 +891,17 @@ extern "C" void app_main(void) {
   const uint64_t GPS_FIX_TIMEOUT_MS = 5000;
   uint64_t last_charger_log_ms = 0;
   const uint64_t CHARGER_LOG_INTERVAL_MS = 2000; // Debug log interval
-  uint64_t last_power_path_switch_ms = 0;
-  const uint64_t POWER_PATH_SWITCH_MIN_INTERVAL_MS = 2000;
+  uint64_t last_power_path_check_ms = 0;
+  const uint64_t POWER_PATH_CHECK_INTERVAL_MS = 250;
+  const uint64_t VBUS_PRESENT_STABLE_MS = 1000;
+  const uint64_t VBUS_ABSENT_STABLE_MS = 1000;
+  uint64_t vbus_present_since_ms = 0;
+  uint64_t vbus_absent_since_ms = 0;
+  bool vbus_present_last = false;
   uint64_t last_wd_kick_ms = 0;
   const uint64_t WD_KICK_INTERVAL_MS = 10000; // Reset charger watchdog
   uint64_t last_hw_wd_kick_ms = 0;
   uint64_t last_gps_ui_ms = 0;
-  bool last_otg_active = false;
   bool boost_requested = pmid_boost_requested;
 
   while (true) {
@@ -926,6 +965,74 @@ extern "C" void app_main(void) {
       }
     }
 
+    if (g_charger &&
+        (now_ms_u - last_power_path_check_ms >= POWER_PATH_CHECK_INTERVAL_MS)) {
+      last_power_path_check_ms = now_ms_u;
+      drivers::VBusStatus vbus_status = drivers::VBusStatus::NO_ADAPTER;
+      esp_err_t vbus_ret = g_charger->get_vbus_status(vbus_status);
+      if (vbus_ret != ESP_OK) {
+        continue;
+      }
+
+      bool otg_active = (vbus_status == drivers::VBusStatus::OTG_MODE);
+      bool vbus_present =
+          (vbus_status != drivers::VBusStatus::NO_ADAPTER) && !otg_active;
+      if (otg_active) {
+        drivers::BQ25629_ADC_Data adc_data = {};
+        esp_err_t adc_ret = g_charger->read_adc(adc_data);
+        if (adc_ret == ESP_OK) {
+          vbus_present = adc_data.vbus_mv >= 4000;
+        }
+      }
+
+      if (vbus_present != vbus_present_last) {
+        if (vbus_present) {
+          vbus_present_since_ms = now_ms_u;
+          vbus_absent_since_ms = 0;
+        } else {
+          vbus_absent_since_ms = now_ms_u;
+          vbus_present_since_ms = 0;
+        }
+        vbus_present_last = vbus_present;
+      } else if (vbus_present) {
+        if (vbus_present_since_ms == 0)
+          vbus_present_since_ms = now_ms_u;
+      } else {
+        if (vbus_absent_since_ms == 0)
+          vbus_absent_since_ms = now_ms_u;
+      }
+
+      bool vbus_present_stable =
+          vbus_present &&
+          (now_ms_u - vbus_present_since_ms >= VBUS_PRESENT_STABLE_MS);
+      bool vbus_absent_stable =
+          !vbus_present &&
+          (now_ms_u - vbus_absent_since_ms >= VBUS_ABSENT_STABLE_MS);
+
+      if (vbus_absent_stable && !otg_active) {
+        ESP_LOGI(TAG, "VBUS removed, enabling PMID 5V boost");
+        esp_err_t boost_ret = g_charger->enable_pmid_5v_boost();
+        if (boost_ret != ESP_OK) {
+          ESP_LOGW(TAG, "Failed to enable PMID 5V boost: %s",
+                   esp_err_to_name(boost_ret));
+        } else {
+          boost_requested = true;
+        }
+      } else if (vbus_present_stable && (otg_active || boost_requested)) {
+        ESP_LOGI(TAG, "VBUS detected, disabling OTG and re-enabling charging");
+        esp_err_t otg_ret = g_charger->enable_otg(false);
+        if (otg_ret != ESP_OK) {
+          ESP_LOGW(TAG, "Failed to disable OTG: %s", esp_err_to_name(otg_ret));
+        }
+        esp_err_t chg_ret = g_charger->enable_charging(true);
+        if (chg_ret != ESP_OK) {
+          ESP_LOGW(TAG, "Failed to enable charging: %s",
+                   esp_err_to_name(chg_ret));
+        }
+        boost_requested = false;
+      }
+    }
+
     // Periodic charger watchdog reset to avoid OTG drop
     if (g_charger && (now_ms_u - last_wd_kick_ms >= WD_KICK_INTERVAL_MS)) {
       last_wd_kick_ms = now_ms_u;
@@ -976,43 +1083,6 @@ extern "C" void app_main(void) {
           xSemaphoreGive(g_display_data_mux);
         }
 
-        bool otg_active =
-            (charger_status.vbus_status == drivers::VBusStatus::OTG_MODE);
-        bool vbus_present =
-            (charger_status.vbus_status != drivers::VBusStatus::NO_ADAPTER) &&
-            !otg_active;
-
-        bool can_switch = (now_ms_u - last_power_path_switch_ms >=
-                           POWER_PATH_SWITCH_MIN_INTERVAL_MS);
-        if (can_switch && !vbus_present && !otg_active) {
-          ESP_LOGI(TAG, "VBUS removed, enabling PMID 5V boost");
-          esp_err_t boost_ret = g_charger->enable_pmid_5v_boost();
-          if (boost_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to enable PMID 5V boost: %s",
-                     esp_err_to_name(boost_ret));
-          } else {
-            boost_requested = true;
-          }
-          last_power_path_switch_ms = now_ms_u;
-        } else if (can_switch && vbus_present &&
-                   (last_otg_active || boost_requested)) {
-          ESP_LOGI(TAG,
-                   "VBUS detected, disabling OTG and re-enabling charging");
-          esp_err_t otg_ret = g_charger->enable_otg(false);
-          if (otg_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to disable OTG: %s",
-                     esp_err_to_name(otg_ret));
-          }
-          esp_err_t chg_ret = g_charger->enable_charging(true);
-          if (chg_ret != ESP_OK) {
-            ESP_LOGW(TAG, "Failed to enable charging: %s",
-                     esp_err_to_name(chg_ret));
-          }
-          boost_requested = false;
-          last_power_path_switch_ms = now_ms_u;
-        }
-
-        last_otg_active = otg_active;
       } else {
         ESP_LOGW(TAG, "BQ25629 status read failed: %s",
                  esp_err_to_name(status_ret));
