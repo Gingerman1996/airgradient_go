@@ -14,13 +14,17 @@ typedef struct {
 } I2cDevice;
 
 // Known I2C device addresses (based on AirGradient GO hardware)
+// Source: HARDWARE_MAP.md I2C Device Map section
 static const I2cDevice I2C_KNOWN_DEVICES[] = {
-    {0x31, "SHT4x (Temp/RH)"},
-    {0x39, "SGP41 (VOC/NOx)"},
-    {0x68, "STCC4 (CO2)"},
-    {0x69, "SPS30 (PM)"},
-    {0x54, "BQ25629 (Charger)"},
-    {0x28, "CAP1203 (Buttons)"},
+    {0x12, "PMSA003I (PM sensor alternative)"},
+    {0x18, "LIS2DH12 (Accelerometer)"},
+    {0x28, "CAP1203 (Capacitive buttons 3x)"},
+    {0x30, "LP5030/LP5036 (LED driver)"},
+    {0x44, "SHT40 (Temp/RH backup)"},
+    {0x59, "SGP41 (VOC + NOx)"},
+    {0x62, "STCC4 / SCD4x (CO2 + Temp + RH)"},
+    {0x69, "SPS30 (PM sensor primary)"},
+    {0x6A, "BQ25628 (Battery charger)"},
     {0x76, "DPS368 (Pressure)"},
 };
 
