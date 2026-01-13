@@ -356,6 +356,20 @@ public:
   esp_err_t is_charging(bool &charging);
 
   /**
+   * @brief Log charger limit registers (Charge Current, Voltage, Input Current,
+   * Voltage)
+   *
+   * Reads and logs the following registers:
+   * - 0x02: Charge Current Limit (mA)
+   * - 0x04: Charge Voltage Limit (mV)
+   * - 0x06: Input Current Limit (mA)
+   * - 0x08: Input Voltage Limit (mV)
+   *
+   * @return ESP_OK on success
+   */
+  esp_err_t log_charger_limits();
+
+  /**
    * @brief Read register (8-bit)
    * @param reg_addr Register address
    * @param value Output value

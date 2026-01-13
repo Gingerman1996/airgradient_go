@@ -214,8 +214,9 @@ esp_err_t BQ25629::set_charge_current(uint16_t current_ma) {
   if (current_ma > 2000)
     current_ma = 2000;
 
-  // Calculate register value: 40mA steps
-  uint16_t reg_value = (current_ma - 40) / 40 + 1;
+  // Calculate register value: 40mA steps starting at 40mA
+  // ICHG[5:0] = (ICHG_mA - 40) / 40
+  uint16_t reg_value = (current_ma - 40) / 40;
   reg_value = reg_value << 5; // Shift to bits [10:5]
 
   return write_register_16(BQ25629_REG::CHARGE_CURRENT_LIMIT, reg_value);
@@ -242,8 +243,9 @@ esp_err_t BQ25629::set_input_current_limit(uint16_t current_ma) {
   if (current_ma > 3200)
     current_ma = 3200;
 
-  // Calculate register value: 20mA steps
-  uint16_t reg_value = (current_ma - 100) / 20 + 5;
+  // Calculate register value: 20mA steps starting at 100mA
+  // IINDPM[7:0] = (IINDPM_mA - 100) / 20
+  uint16_t reg_value = (current_ma - 100) / 20;
   reg_value = reg_value << 4; // Shift to bits [11:4]
 
   return write_register_16(BQ25629_REG::INPUT_CURRENT_LIMIT, reg_value);
@@ -424,6 +426,65 @@ esp_err_t BQ25629::is_charging(bool &charging) {
   }
 
   charging = (status != ChargeStatus::NOT_CHARGING);
+  return ESP_OK;
+}
+
+esp_err_t BQ25629::log_charger_limits() {
+  esp_err_t ret;
+  uint16_t reg_value;
+
+  ESP_LOGI(TAG, "=== BQ25629 Charger Limit Registers ===");
+
+  // REG0x02: Charge Current Limit (ICHG)
+  // Bits [10:5], Range: 40-2000mA, Step: 40mA
+  ret = read_register_16(BQ25629_REG::CHARGE_CURRENT_LIMIT, reg_value);
+  if (ret == ESP_OK) {
+    uint16_t ichg_code = (reg_value >> 5) & 0x3F; // Extract bits [10:5]
+    uint16_t ichg_ma = 40 + ichg_code * 40;
+    ESP_LOGI(TAG, "REG0x02 (Charge Current Limit): 0x%04X → %u mA", reg_value,
+             ichg_ma);
+  } else {
+    ESP_LOGE(TAG, "Failed to read REG0x02: %s", esp_err_to_name(ret));
+  }
+
+  // REG0x04: Charge Voltage Limit (VBATREG)
+  // Bits [11:3], Range: 3500-4800mV, Step: 10mV
+  ret = read_register_16(BQ25629_REG::CHARGE_VOLTAGE_LIMIT, reg_value);
+  if (ret == ESP_OK) {
+    uint16_t vbatreg_code = (reg_value >> 3) & 0x1FF; // Extract bits [11:3]
+    uint16_t vbatreg_mv = vbatreg_code * 10;
+    ESP_LOGI(TAG, "REG0x04 (Charge Voltage Limit): 0x%04X → %u mV", reg_value,
+             vbatreg_mv);
+  } else {
+    ESP_LOGE(TAG, "Failed to read REG0x04: %s", esp_err_to_name(ret));
+  }
+
+  // REG0x06: Input Current Limit (IINDPM)
+  // Bits [11:4], Range: 100-3200mA, Step: 20mA
+  ret = read_register_16(BQ25629_REG::INPUT_CURRENT_LIMIT, reg_value);
+  if (ret == ESP_OK) {
+    uint16_t iindpm_code = (reg_value >> 4) & 0xFF; // Extract bits [11:4]
+    uint16_t iindpm_ma = 100 + iindpm_code * 20;
+    ESP_LOGI(TAG, "REG0x06 (Input Current Limit): 0x%04X → %u mA", reg_value,
+             iindpm_ma);
+  } else {
+    ESP_LOGE(TAG, "Failed to read REG0x06: %s", esp_err_to_name(ret));
+  }
+
+  // REG0x08: Input Voltage Limit (VINDPM)
+  // Bits [13:5], Range: 3800-21000mV, Step: 40mV
+  ret = read_register_16(BQ25629_REG::INPUT_VOLTAGE_LIMIT, reg_value);
+  if (ret == ESP_OK) {
+    uint16_t vindpm_code = (reg_value >> 5) & 0x1FF; // Extract bits [13:5]
+    uint16_t vindpm_mv = 3800 + vindpm_code * 40;
+    ESP_LOGI(TAG, "REG0x08 (Input Voltage Limit): 0x%04X → %u mV", reg_value,
+             vindpm_mv);
+  } else {
+    ESP_LOGE(TAG, "Failed to read REG0x08: %s", esp_err_to_name(ret));
+  }
+
+  ESP_LOGI(TAG, "=======================================");
+
   return ESP_OK;
 }
 

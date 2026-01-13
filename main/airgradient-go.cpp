@@ -721,6 +721,9 @@ extern "C" void app_main(void) {
   } else {
     ESP_LOGI(TAG, "BQ25629 initialized successfully");
 
+    // Log charger limit registers for verification
+    g_charger->log_charger_limits();
+
     // Verify PMID is working by reading ADC
     drivers::BQ25629_ADC_Data adc_data;
     bool vbus_adc_present = false;
