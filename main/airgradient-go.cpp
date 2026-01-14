@@ -2,6 +2,9 @@
 #include "cap1203.h"
 #include "gps.h"
 #include "log_storage.h"
+#include "lp5036.h"
+#include "color_utils.h"
+#include "led_effects.h"
 #include "sensor.h"
 #include "ui_display.h"
 #include "i2c_scanner.h"
@@ -43,6 +46,7 @@ static Display *g_display = nullptr;
 static epd_handle_t g_epd = nullptr;
 static lv_display_t *g_disp = nullptr;
 static drivers::BQ25629 *g_charger = nullptr;
+static drivers::LP5036 *g_led_driver = nullptr;
 static CAP1203 *g_buttons = nullptr;
 static Display::FocusTile g_focus_tile = Display::FocusTile::CO2;
 static volatile bool g_focus_dirty = true;
@@ -66,6 +70,9 @@ struct DisplaySnapshot {
   bool gps_time_valid = false;
   int gps_hour = 0;
   int gps_min = 0;
+  float gps_lat = 0.0f;
+  float gps_lon = 0.0f;
+  bool gps_fix_valid = false;
 };
 
 static DisplaySnapshot g_display_snapshot = {};
@@ -97,6 +104,81 @@ static int battery_percent_from_mv(uint16_t vbat_mv) {
   return (int)(((int)vbat_mv - kMinMv) * 100 / (kMaxMv - kMinMv));
 }
 
+// ==================== LED HELPER FUNCTIONS ====================
+
+// Show AQI status on LED ring
+static void led_show_aqi(uint16_t pm25_ugm3) {
+  if (g_led_driver == nullptr) return;
+  
+  color::RGB aqi_color = led_effects::aqi_to_color(pm25_ugm3);
+  g_led_driver->set_global_off(false);
+  
+  for (uint8_t i = 0; i < 12; i++) {
+    g_led_driver->set_led_brightness(i, 0xFF);
+    g_led_driver->set_led_color(i, aqi_color.r, aqi_color.g, aqi_color.b);
+  }
+}
+
+// Show battery status on LED ring (charging animation or battery level)
+static void led_show_battery(int battery_percent, bool charging) {
+  if (g_led_driver == nullptr) return;
+  
+  g_led_driver->set_global_off(false);
+  
+  if (charging) {
+    // Charging: breathing blue animation
+    uint32_t now_ms = esp_timer_get_time() / 1000;
+    float brightness = led_effects::breathing_effect(now_ms, 2000);
+    uint8_t brightness_8bit = static_cast<uint8_t>(brightness * 255);
+    
+    color::RGB blue = color::Colors::BLUE;
+    for (uint8_t i = 0; i < 12; i++) {
+      g_led_driver->set_led_brightness(i, brightness_8bit);
+      g_led_driver->set_led_color(i, blue.r, blue.g, blue.b);
+    }
+  } else {
+    // Battery level: progress bar (green/yellow/red based on level)
+    int lit_leds = (battery_percent * 12) / 100;
+    color::RGB color;
+    
+    if (battery_percent > 60) {
+      color = color::Colors::GREEN;
+    } else if (battery_percent > 20) {
+      color = color::Colors::YELLOW;
+    } else {
+      color = color::Colors::RED;
+    }
+    
+    for (uint8_t i = 0; i < 12; i++) {
+      if (i < lit_leds) {
+        g_led_driver->set_led_brightness(i, 0xFF);
+        g_led_driver->set_led_color(i, color.r, color.g, color.b);
+      } else {
+        g_led_driver->set_led_brightness(i, 0);
+      }
+    }
+  }
+}
+
+// Turn off all LEDs
+static void led_off() {
+  if (g_led_driver == nullptr) return;
+  g_led_driver->set_global_off(true);
+}
+
+// Brief notification flash (for button press, etc.)
+static void led_flash(const color::RGB& color, uint16_t duration_ms = 100) {
+  if (g_led_driver == nullptr) return;
+  
+  g_led_driver->set_global_off(false);
+  for (uint8_t i = 0; i < 12; i++) {
+    g_led_driver->set_led_brightness(i, 0xFF);
+    g_led_driver->set_led_color(i, color.r, color.g, color.b);
+  }
+  vTaskDelay(pdMS_TO_TICKS(duration_ms));
+  g_led_driver->set_global_off(true);
+}
+
 // Button callback for CAP1203 (called when button events occur)
 static void button_event_callback(ButtonState state, void *user_data) {
   static const char *TAG_BTN = "CAP1203";
@@ -120,6 +202,8 @@ static void button_event_callback(ButtonState state, void *user_data) {
   switch (state.event) {
   case ButtonEvent::PRESS:
     ESP_LOGI(TAG_BTN, "[%s] PRESS", button_name);
+    // Visual feedback: quick white flash
+    led_flash(color::Colors::WHITE, 50);
     break;
   case ButtonEvent::RELEASE:
     ESP_LOGI(TAG_BTN, "[%s] RELEASE (duration: %lu ms)", button_name,
@@ -158,6 +242,13 @@ static void button_event_callback(ButtonState state, void *user_data) {
     if (focus_changed) {
       g_focus_dirty = true;
       ESP_LOGI(TAG_BTN, "Focus set to %s tile", focus_label);
+      
+      // Visual feedback: brief color flash based on focus
+      if (g_focus_tile == Display::FocusTile::CO2) {
+        led_flash(color::Colors::CYAN, 150);
+      } else if (g_focus_tile == Display::FocusTile::PM25) {
+        led_flash(color::Colors::ORANGE, 150);
+      }
     }
   }
 }
@@ -474,6 +565,8 @@ static void display_task(void *arg) {
         display->setGPSStatus(snapshot.gps_status);
         display->setTimeHM(snapshot.gps_hour, snapshot.gps_min,
                            snapshot.gps_time_valid);
+        display->setLatLon(snapshot.gps_lat, snapshot.gps_lon,
+                           snapshot.gps_fix_valid);
         request_refresh = true;
       }
 
@@ -884,6 +977,74 @@ extern "C" void app_main(void) {
   // Wait a bit for PMID to stabilize
   vTaskDelay(pdMS_TO_TICKS(100));
 
+  // ==================== LP5036 LED INIT SEQUENCE ====================
+
+  ESP_LOGI(TAG, "Initializing LP5036 LED driver...");
+  g_led_driver = new drivers::LP5036(i2c_bus, drivers::LP5036_I2C::ADDR_33);
+  
+  if (g_led_driver == nullptr) {
+    ESP_LOGE(TAG, "Failed to allocate LP5036 driver");
+  } else {
+    ret = g_led_driver->init();
+    if (ret != ESP_OK) {
+      ESP_LOGW(TAG, "LP5036 init failed: %s", esp_err_to_name(ret));
+      delete g_led_driver;
+      g_led_driver = nullptr;
+    } else {
+      // Configure LED driver
+      g_led_driver->enable(true);
+      g_led_driver->set_log_scale(false);      // Linear brightness
+      g_led_driver->set_global_off(false);     // Turn on output
+      g_led_driver->set_bank_brightness(0xFF); // Full brightness
+      g_led_driver->set_power_save(false);     // Disable auto power save
+      
+      ESP_LOGI(TAG, "LP5036 initialized - Starting boot animation...");
+      
+      // Boot animation: Rainbow sweep with breathing
+      const int animation_steps = 24;
+      const int delay_ms = 80;
+      
+      for (int step = 0; step < animation_steps; step++) {
+        float progress = step / (float)animation_steps;
+        float brightness = led_effects::breathing_effect(step * delay_ms, 2000);
+        
+        for (uint8_t i = 0; i < 12; i++) {
+          // Rainbow wave effect
+          float hue = fmodf((progress * 360.0f) + (i * 30.0f), 360.0f);
+          color::HSV hsv(hue, 1.0f, brightness);
+          color::RGB rgb = color::hsv_to_rgb(hsv);
+          
+          g_led_driver->set_led_brightness(i, 0xFF);
+          g_led_driver->set_led_color(i, rgb.r, rgb.g, rgb.b);
+        }
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+      }
+      
+      // Success indicator: Green pulse
+      color::RGB green = color::Colors::GREEN;
+      for (int pulse = 0; pulse < 2; pulse++) {
+        for (int brightness = 0; brightness <= 255; brightness += 15) {
+          for (uint8_t i = 0; i < 12; i++) {
+            g_led_driver->set_led_brightness(i, brightness);
+            g_led_driver->set_led_color(i, green.r, green.g, green.b);
+          }
+          vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        vTaskDelay(pdMS_TO_TICKS(100));
+        for (int brightness = 255; brightness >= 0; brightness -= 15) {
+          for (uint8_t i = 0; i < 12; i++) {
+            g_led_driver->set_led_brightness(i, brightness);
+          }
+          vTaskDelay(pdMS_TO_TICKS(10));
+        }
+      }
+      
+      // Turn off LEDs after boot animation
+      g_led_driver->set_global_off(true);
+      ESP_LOGI(TAG, "LP5036 boot animation complete");
+    }
+  }
+
   // ==================== SENSOR INITIALIZATION ====================
 
   ESP_LOGI(TAG, "Initializing sensors (now that PMID power is ready)...");
@@ -1005,6 +1166,9 @@ extern "C" void app_main(void) {
       bool time_valid = has_sentence && gps.has_time();
       int hour = gps.utc_hour();
       int min = gps.utc_min();
+      bool fix_valid = gps.has_fix();
+      float lat = gps.latitude_deg();
+      float lon = gps.longitude_deg();
 
       if (g_display_data_mux &&
           xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -1012,6 +1176,9 @@ extern "C" void app_main(void) {
         g_display_snapshot.gps_time_valid = time_valid;
         g_display_snapshot.gps_hour = hour;
         g_display_snapshot.gps_min = min;
+        g_display_snapshot.gps_lat = lat;
+        g_display_snapshot.gps_lon = lon;
+        g_display_snapshot.gps_fix_valid = fix_valid;
         xSemaphoreGive(g_display_data_mux);
       }
     }

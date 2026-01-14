@@ -23,6 +23,7 @@ idf_component_register(
         "fatfs"
         "dps368"
         "lis2dh12"
+        "lp5036"
 )
 
 # Optimize for size (OTA partition is 1 MB)

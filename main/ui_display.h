@@ -52,6 +52,9 @@ public:
     void setTempCf(float v);
     void setRHf(float v);
 
+    // GPS coordinates (latitude and longitude)
+    void setLatLon(float lat, float lon, bool valid);
+
 private:
     struct DisplayState;
     DisplayState* state;};

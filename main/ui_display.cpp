@@ -98,6 +98,8 @@ struct Display::DisplayState {
   lv_obj_t *temp_label = nullptr;
   lv_obj_t *rh_label = nullptr;
   lv_obj_t *pressure_label = nullptr;
+  lv_obj_t *lat_label = nullptr;
+  lv_obj_t *lon_label = nullptr;
   lv_obj_t *bt_logo = nullptr;
   lv_obj_t *wifi_logo = nullptr;
   lv_obj_t *gps_logo = nullptr;
@@ -327,6 +329,21 @@ bool Display::init(uint16_t w, uint16_t h) {
   lv_obj_set_style_text_color(state->nox_label, lv_color_black(), 0);
   lv_obj_align_to(state->nox_label, state->rh_label, LV_ALIGN_OUT_BOTTOM_RIGHT,
                   -8, 0);
+
+  // GPS coordinates below VOC and NOx
+  state->lat_label = lv_label_create(state->root);
+  lv_label_set_text(state->lat_label, "--,--");
+  lv_obj_set_style_text_font(state->lat_label, &lv_font_montserrat_10, 0);
+  lv_obj_set_style_text_color(state->lat_label, lv_color_black(), 0);
+  lv_obj_align_to(state->lat_label, state->voc_label, LV_ALIGN_OUT_BOTTOM_LEFT,
+                  0, 0);
+
+  state->lon_label = lv_label_create(state->root);
+  lv_label_set_text(state->lon_label, "--,--");
+  lv_obj_set_style_text_font(state->lon_label, &lv_font_montserrat_10, 0);
+  lv_obj_set_style_text_color(state->lon_label, lv_color_black(), 0);
+  lv_obj_align_to(state->lon_label, state->nox_label, LV_ALIGN_OUT_BOTTOM_LEFT,
+                  0, 0);
 
   state->pressure_label = lv_label_create(state->root);
   lv_label_set_text(state->pressure_label, "----hPa");
