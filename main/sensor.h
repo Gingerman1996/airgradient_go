@@ -17,6 +17,13 @@ typedef struct {
     int voc_index;        // VOC gas index (1-500), 0 during blackout
     int nox_index;        // NOx gas index (1-500), 0 during blackout
     float pressure_pa;    // Atmospheric pressure in Pascals (DPS368), 0 if unavailable
+
+    // LIS2DH12 3-axis accelerometer
+    bool have_accel;      // true if accelerometer data available
+    int16_t accel_x_mg;   // X-axis acceleration in mg
+    int16_t accel_y_mg;   // Y-axis acceleration in mg
+    int16_t accel_z_mg;   // Z-axis acceleration in mg
+    bool motion_detected; // true if motion interrupt triggered
 } sensor_values_t;
 
 class Sensors {

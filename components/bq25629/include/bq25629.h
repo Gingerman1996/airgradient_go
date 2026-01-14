@@ -161,6 +161,28 @@ struct BQ25629_ADC_Data {
 };
 
 /**
+ * @brief NTC Temperature Zones (JEITA Profile)
+ */
+enum class TempZone : uint8_t {
+  TS_COLD = 0,   // < 0°C - Charging suspended
+  TS_COOL = 1,   // 0-10°C - 20% charge current (slow charge)
+  TS_NORMAL = 2, // 10-45°C - 100% charge current (normal)
+  TS_WARM = 3,   // 45-60°C - 20% charge current (slow charge)
+  TS_HOT = 4,    // > 60°C - Charging suspended
+  TS_UNKNOWN = 5 // Cannot determine temperature
+};
+
+/**
+ * @brief NTC Temperature Data
+ */
+struct BQ25629_NTC_Data {
+  float temperature_c; // Temperature in °C
+  float ts_percent;    // TS ADC reading (%)
+  float resistance_ohm; // Calculated NTC resistance (Ω)
+  TempZone zone;       // Temperature zone
+};
+
+/**
  * @brief BQ25629 Battery Charger Driver Class
  */
 class BQ25629 {
@@ -354,6 +376,46 @@ public:
    * @return ESP_OK on success
    */
   esp_err_t is_charging(bool &charging);
+
+  /**
+   * @brief Configure JEITA temperature profile
+   * 
+   * Sets temperature thresholds and charge current limits:
+   * - TH1 = 0°C (cold threshold)
+   * - TH2 = 10°C (cool threshold)
+   * - TH5 = 45°C (warm threshold)
+   * - TH6 = 60°C (hot threshold)
+   * - COOL/WARM zones: 20% charge current
+   * - NORMAL zone: 100% charge current
+   * 
+   * @return ESP_OK on success
+   */
+  esp_err_t configure_jeita_profile();
+
+  /**
+   * @brief Read NTC temperature and zone
+   * 
+   * Reads TS ADC value, converts to temperature using Steinhart-Hart equation,
+   * and determines the current temperature zone.
+   * 
+   * NTC: KNTC0805/10KF (R25=10kΩ, B=3950K)
+   * Divider: RT1=5.23kΩ, RT2=30.1kΩ
+   * 
+   * @param data Output: NTC temperature data
+   * @return ESP_OK on success
+   */
+  esp_err_t read_ntc_temperature(BQ25629_NTC_Data &data);
+
+  /**
+   * @brief Get current temperature zone from hardware TS_STAT register
+   * 
+   * Reads TS_STAT[2:0] from FAULT_STATUS_0 register to determine
+   * the hardware-detected temperature zone.
+   * 
+   * @param zone Output: Current temperature zone
+   * @return ESP_OK on success
+   */
+  esp_err_t get_temperature_zone(TempZone &zone);
 
   /**
    * @brief Log charger limit registers (Charge Current, Voltage, Input Current,

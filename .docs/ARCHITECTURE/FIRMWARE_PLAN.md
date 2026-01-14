@@ -1,6 +1,6 @@
 # AirGradient GO - Firmware Planning & Implementation Checklist
 
-## 📊 Current Progress (Updated: Jan 13, 2026)
+## 📊 Current Progress (Updated: Jan 14, 2026)
 
 ### Overall Status: ~40% MVP Complete
 
@@ -30,6 +30,9 @@
     - Full calibration coefficient reading (c0-c30)
     - 16x oversampling with P_SHIFT/T_SHIFT enabled
     - Compensated pressure (Pa) and temperature (°C) calculation
+  - **LIS2DH12 (Accelerometer @ 0x18) - INTEGRATED ✅** (Jan 14, 2026)
+    - Accel readouts + motion interrupt on INT1 (GPIO3)
+    - High-event motion config with HPF baseline reset for IA1
 - Display API (`Display` class) - fully implemented with all status bar elements
 - Sensor API (`Sensors` class) - working with ring buffer averaging
 - I2C bus initialization (GPIO 6=SCL, GPIO 7=SDA @ 100kHz)
@@ -103,15 +106,15 @@
 | VOC + NOx | SGP41 | Air quality index **(IN USE @ 0x59)** |
 | PM Sensor | SPS30 | Laser PM sensor **(IN USE @ 0x69)** |
 | PM Sensor (alt) | PMSA003I | Alternative PM option |
-| Pressure | DPS368 | Barometric pressure (hardware ready, not yet integrated) |
-| Accelerometer | LIS2DH12 | Motion detection (hardware ready, not yet integrated) |
+| Pressure | DPS368 | Barometric pressure + temperature (integrated) |
+| Accelerometer | LIS2DH12 | Accel read + motion interrupt (integrated) |
 
 > **Sensor Implementation Status (Jan 2026)**:
 > - ✅ **STCC4**: State machine with 10s measurement cycle, 5s moving average for CO2/Temp/RH
 > - ✅ **SGP41**: VOC/NOx raw ticks with Gas Index Algorithm (1-500 scale), 1s sampling
 > - ✅ **SPS30**: PM2.5 mass concentration (µg/m³)
 > - ✅ **DPS368**: I2C address 0x77, pressure (Pa) + temperature (°C) with full compensation
-> - ⏳ **LIS2DH12**: I2C address 0x18, driver pending
+> - ✅ **LIS2DH12**: I2C address 0x18, accel read + motion interrupt (INT1)
 
 ### 📍 GPS
 | Component | Part Number | Notes |
@@ -138,7 +141,7 @@
 | SHT40 | 0x44 | Main | Optional |
 | SGP41 | 0x59 | Main | ✅ Active |
 | DPS368 | 0x77 | Main | ✅ Active |
-| LIS2DH12 | 0x18 | Main | Hardware ready |
+| LIS2DH12 | 0x18 | Main | ✅ Active |
 | CAP1203 | 0x28 | Main | ✅ Component ready (CS1/CS2/CS3 mapped; UI: T1=Up, T2=Down, T3=Middle) |
 | LP5030/36 | 0x30 | Main | Pending Phase 5 |
 | BQ25629 | 0x6A | Main | ✅ Active |
@@ -175,7 +178,7 @@
 
 ## Implementation Phases
 
-> **📝 Current Code Architecture (Jan 11, 2026)**:
+> **📝 Current Code Architecture (Jan 14, 2026)**:
 > ```
 > main/
 >   ├── airgradient-go.cpp       ✅ Main loop with TEST SCREEN + sensor integration
@@ -184,6 +187,8 @@
 >   │       - STCC4 state machine (10s cycle, 5s averaging)
 >   │       - SGP4x VOC/NOx with Gas Index Algorithm
 >   │       - SPS30 PM sensor with load switch control (GPIO26)
+>   │       - DPS368 pressure/temperature
+>   │       - LIS2DH12 accel + motion interrupt (INT1)
 >   │       - getValues() for display-ready data
 >   ├── ui_display.cpp/.h        ✅ Complete UI with LVGL + partial refresh
 >   │   └── Display class:
@@ -199,6 +204,7 @@
 >   ├── esp_sgp4x/               ✅ SGP41 VOC/NOx sensor driver
 >   ├── sps30/                   ✅ SPS30 PM sensor driver
 >   ├── dps368/                  ✅ DPS368 pressure/temp sensor (Jan 13)
+>   ├── lis2dh12/                ✅ LIS2DH12 accelerometer driver (Jan 14)
 >   ├── sensirion_gas_index_algorithm/  ✅ Gas index calculation
 >   ├── bq25629/                 ✅ BQ25629 charger driver + log_charger_limits()
 >   └── cap1203/                 ✅ CAP1203 capacitive touch buttons (T1/T2/T3)
@@ -561,13 +567,13 @@ documents/
 ### HW-100: Power System
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| HW-101 | Battery voltage reading | Measure at known charge levels (0%, 25%, 50%, 75%, 100%) | ADC reading within ±5% of multimeter | [ ] |
+| HW-101 | Battery voltage reading | Measure at known charge levels (0%, 25%, 50%, 75%, 100%) | ADC reading within ±5% of multimeter | ✅ |
 | HW-102 | Charging detection | Connect/disconnect USB power | Charging flag toggles correctly | [ ] |
 | HW-103 | Charging current | Measure with current clamp during charge | Within spec (≤1A typical) | [ ] |
 | HW-104 | ShioMode entry | Long press 5s | Display clears, charger enters ship mode | [ ] |
 | HW-105 | ShioMode exit | Press QON button | Device boots, display initializes | [ ] |
 | HW-106 | Load switch (IO4) | Toggle load switch | SPS30 and peripherals power on/off | [ ] |
-| HW-107 | Watchdog reset | Allow 5min+ timeout | External watchdog resets device | [x] |
+| HW-107 | Watchdog reset | Allow 5min+ timeout | External watchdog resets device | ✅ |
 | HW-108 | Sleep current | Measure in ShioMode | < 10µA (target) | [ ] |
 | HW-109 | BQ25629 I2C comm | Read charger registers | Device ID and status readable | [ ] |
 | HW-10A | BQ25629 charge termination | Charge to 100% | Charging stops at correct voltage | [ ] |
@@ -577,12 +583,13 @@ documents/
 | HW-10E | DW01 protection | Short circuit simulation | BMS cuts off battery | [ ] |
 | HW-10F | DC-DC efficiency | Measure input/output power | Efficiency > 85% | [ ] |
 
+
 ### HW-110: Display (SSD1680 E-Paper)
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| HW-111 | Full refresh | Trigger full screen update | Clean B/W display, no ghosting | [ ] |
-| HW-112 | Partial refresh | Update single region | Only affected area changes | [ ] |
-| HW-113 | Refresh cycle time | Measure with scope | Full: <2s, Partial: <0.5s | [ ] |
+| HW-111 | Full refresh | Trigger full screen update | Clean B/W display, no ghosting | ✅ |
+| HW-112 | Partial refresh | Update single region | Only affected area changes | ✅ |
+| HW-113 | Refresh cycle time | Measure with scope | Full: <2s, Partial: <0.5s | ✅ |
 | HW-114 | Display clear on power-off | Enter ShioMode | Screen shows blank/off message | [ ] |
 | HW-115 | Gray levels (if supported) | Display gradient test pattern | Visible gray shades | [ ] |
 | HW-116 | Temperature effect | Test at 0°C, 25°C, 40°C | Display functional at all temps | [ ] |
@@ -590,37 +597,40 @@ documents/
 ### HW-120: Sensors
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| HW-121 | STCC4 CO2 range | Expose to 400-2000ppm | Readings match reference meter ±50ppm | [ ] |
-| HW-122 | STCC4 temperature | Compare to calibrated thermometer | Within ±0.5°C | [ ] |
-| HW-123 | STCC4 humidity | Compare to calibrated hygrometer | Within ±3% RH | [ ] |
-| HW-124 | SGP4x VOC response | Expose to alcohol vapor | VOC index rises significantly | [ ] |
-| HW-125 | SGP4x NOx response | Expose to source (match, etc.) | NOx index rises | [ ] |
-| HW-126 | SPS30 PM2.5 | Compare to reference PM monitor | Within ±10µg/m³ or ±25% | [ ] |
-| HW-127 | SPS30 fan | Listen/measure vibration | Fan runs, no rattling | [ ] |
-| HW-128 | Sensor warm-up | Power on from cold | Readings stabilize within spec time | [ ] |
-| HW-129 | I2C bus scan | Scan at startup | All sensors detected at expected addresses | [ ] |
-| HW-12A | DPS368 pressure range | Compare to reference barometer | Within ±1 hPa | [ ] |
+| HW-121 | STCC4 CO2 range | Expose to 400-2000ppm | Readings match reference meter ±50ppm | ✅ |
+| HW-122 | STCC4 temperature | Compare to calibrated thermometer | Within ±0.5°C | ✅ |
+| HW-123 | STCC4 humidity | Compare to calibrated hygrometer | Within ±3% RH | ✅ |
+| HW-124 | SGP4x VOC response | Expose to alcohol vapor | VOC index rises significantly | ✅ |
+| HW-125 | SGP4x NOx response | Expose to source (match, etc.) | NOx index rises | ✅ |
+| HW-126 | SPS30 PM2.5 | Compare to reference PM monitor | Within ±10µg/m³ or ±25% | ✅ |
+| HW-127 | SPS30 fan | Listen/measure vibration | Fan runs, no rattling | ✅ |
+| HW-128 | Sensor warm-up | Power on from cold | Readings stabilize within spec time | ✅ |
+| HW-129 | I2C bus scan | Scan at startup | All sensors detected at expected addresses | ✅ |
+| HW-12A | DPS368 pressure range | Compare to reference barometer | Within ±1 hPa | ✅ |
 | HW-12B | DPS368 altitude calc | At known elevation | Calculated altitude within ±10m | [ ] |
-| HW-12C | DPS368 temperature | Compare to thermometer | Within ±0.5°C | [ ] |
+| HW-12C | DPS368 temperature | Compare to thermometer | Within ±0.5°C | ✅ |
 | HW-12D | SHT40 temp/humidity | Compare to reference | T: ±0.2°C, RH: ±1.8% | [ ] |
 | HW-12E | Sensor cross-check | Compare STCC4 vs SHT40 temp | Within ±1°C of each other | [ ] |
+| HW-12F | SCD41 CO2 range | Expose to 400-2000ppm | Readings match reference meter ±50ppm | [ ] |
+| HW-12G | S12 CO2 range | Expose to 400-2000ppm | Readings match reference meter ±50ppm | [ ] |
+| HW-12H | PMSA003I PM2.5 | Compare to reference PM monitor | Within ±10µg/m³ or ±25% | [ ] |
 
 ### HW-130: GPS Module
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| HW-131 | UART communication | Check NMEA output | Valid NMEA sentences received | [ ] |
-| HW-132 | Cold start fix | Power on outdoors | Fix acquired within 60s | [ ] |
-| HW-133 | Hot start fix | Resume from sleep | Fix acquired within 10s | [ ] |
-| HW-134 | Position accuracy | Compare to known location | Within 5m CEP | [ ] |
-| HW-135 | Time sync | Get GPS time | RTC set to UTC ±1s | [ ] |
+| HW-131 | UART communication | Check NMEA output | Valid NMEA sentences received | ✅ |
+| HW-132 | Cold start fix | Power on outdoors | Fix acquired within 60s | ✅ |
+| HW-133 | Hot start fix | Resume from sleep | Fix acquired within 10s | ✅ |
+| HW-134 | Position accuracy | Compare to known location | Within 5m CEP | ✅ |
+| HW-135 | Time sync | Get GPS time | RTC set to UTC ±1s | ✅ |
 | HW-136 | Indoor behavior | Test indoors | No fix, timeout handled gracefully | [ ] |
 
 ### HW-140: Capacitive Buttons (3x)
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| HW-141 | Touch detection | Touch each button | Each button triggers event | [ ] |
-| HW-142 | Debounce | Rapid touches | No false triggers, clean edges | [ ] |
-| HW-143 | Long press detection | Hold for 3s | Long press event fires | [ ] |
+| HW-141 | Touch detection | Touch each button | Each button triggers event | ✅ |
+| HW-142 | Debounce | Rapid touches | No false triggers, clean edges | ✅ |
+| HW-143 | Long press detection | Hold for 3s | Long press event fires | ✅ |
 | HW-144 | Sensitivity | Touch with dry/wet finger | Works in both conditions | [ ] |
 | HW-145 | Touch through enclosure | Touch with case installed | All buttons responsive | [ ] |
 | HW-146 | No ghost touches | Leave device idle | No spurious button events | [ ] |
@@ -646,24 +656,26 @@ documents/
 ### HW-170: Accelerometer (LIS2DH12)
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| HW-171 | I2C communication | Read WHO_AM_I register | Returns 0x33 | [ ] |
-| HW-172 | X-axis reading | Tilt device left/right | X value changes ±1g | [ ] |
-| HW-173 | Y-axis reading | Tilt device forward/back | Y value changes ±1g | [ ] |
-| HW-174 | Z-axis reading | Flip device upside down | Z value flips sign | [ ] |
-| HW-175 | Orientation detection | Lay flat, portrait, landscape | Correct orientation detected | [ ] |
-| HW-176 | Motion interrupt | Shake device | INT pin triggers | [ ] |
+| HW-171 | I2C communication | Read WHO_AM_I register | Returns 0x33 | ✅ |
+| HW-172 | X-axis reading | Tilt device left/right | X value changes ±1g | ✅ |
+| HW-173 | Y-axis reading | Tilt device forward/back | Y value changes ±1g | ✅ |
+| HW-174 | Z-axis reading | Flip device upside down | Z value flips sign | ✅ |
+| HW-175 | Orientation detection | Lay flat, portrait, landscape | Correct orientation detected | ✅ |
+| HW-176 | Motion interrupt | Shake device | INT pin triggers | ✅ |
 | HW-177 | Free-fall detection | Drop test (protected) | Free-fall event detected | [ ] |
 | HW-178 | Low-power mode | Enable LP mode | Current < 10µA | [ ] |
 | HW-179 | Data rate setting | Set ODR 1Hz, 10Hz, 100Hz | Samples at correct rate | [ ] |
 
+Notes (Jan 14, 2026): WHO_AM_I read verified in logs for LIS2DH12.
+
 ### HW-180: Flash Memory (W25N512GVEIG)
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| HW-181 | SPI communication | Read JEDEC ID | Returns correct manufacturer/device ID | [ ] |
-| HW-182 | Page write | Write 2KB page | Data written without error | [ ] |
-| HW-183 | Page read | Read back written page | Data matches written | [ ] |
-| HW-184 | Block erase | Erase 128KB block | All bytes = 0xFF | [ ] |
-| HW-185 | Bad block check | Scan for bad blocks | Factory bad blocks identified | [ ] |
+| HW-181 | SPI communication | Read JEDEC ID | Returns correct manufacturer/device ID | ✅ |
+| HW-182 | Page write | Write 2KB page | Data written without error | ✅ |
+| HW-183 | Page read | Read back written page | Data matches written | ✅ |
+| HW-184 | Block erase | Erase 128KB block | All bytes = 0xFF | ✅ |
+| HW-185 | Bad block check | Scan for bad blocks | Factory bad blocks identified | ✅ |
 | HW-186 | ECC functionality | Write/read with bit flip | ECC corrects error | [ ] |
 | HW-187 | Write speed | Write 1MB data | Speed within spec (>1MB/s) | [ ] |
 | HW-188 | Read speed | Read 1MB data | Speed within spec (>10MB/s) | [ ] |
@@ -674,13 +686,13 @@ documents/
 ### HW-190: I2C Bus & Isolation (TMUX121)
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| HW-191 | TMUX121 enable | Toggle EN pin | I2C bus connects/disconnects | [ ] |
-| HW-192 | Bus isolation | Disable TMUX, scan | Isolated devices not visible | [ ] |
+| HW-191 | TMUX121 enable | Toggle EN pin | I2C bus connects/disconnects | ✅ |
+| HW-192 | Bus isolation | Disable TMUX, scan | Isolated devices not visible | ✅ |
 | HW-193 | Bus capacitance | Measure with scope | Rise time < 300ns | [ ] |
 | HW-194 | Multi-device scan | Scan all I2C devices | All expected addresses respond | [ ] |
 | HW-195 | Bus recovery | Force bus stuck low | Recovery sequence restores bus | [ ] |
 | HW-196 | Clock stretching | Device holds SCL | Master waits correctly | [ ] |
-| HW-197 | Bus speed 100kHz | Standard mode comms | All devices respond | [ ] |
+| HW-197 | Bus speed 100kHz | Standard mode comms | All devices respond | ✅ |
 | HW-198 | Bus speed 400kHz | Fast mode comms | All devices respond | [ ] |
 | HW-199 | Hot-plug device | Connect device while running | Device detected, no crash | [ ] |
 
@@ -691,15 +703,15 @@ documents/
 ### FW-200: Sensor Driver Unit Tests
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| FW-201 | STCC4 init | Call `sensors.init()` | Returns ESP_OK, sensors detected | [ ] |
-| FW-202 | STCC4 read cycle | Trigger measurement, wait, read | Valid CO2/T/RH values | [ ] |
+| FW-201 | STCC4 init | Call `sensors.init()` | Returns ESP_OK, sensors detected | ✅ |
+| FW-202 | STCC4 read cycle | Trigger measurement, wait, read | Valid CO2/T/RH values | ✅ |
 | FW-203 | STCC4 5s averaging | Push 5 samples | Average calculated correctly | [ ] |
-| FW-204 | SGP4x conditioning | First read after init | Conditioning flag set | [ ] |
-| FW-205 | SGP4x VOC/NOx read | Call measure_raw_signals() | Valid ticks returned | [ ] |
+| FW-204 | SGP4x conditioning | First read after init | Conditioning flag set | ✅ |
+| FW-205 | SGP4x VOC/NOx read | Call measure_raw_signals() | Valid ticks returned | ✅ |
 | FW-206 | SPS30 wake/sleep | Cycle wake/measure/sleep | PM values read between cycles | [ ] |
 | FW-207 | Sensor error handling | Disconnect I2C | Error logged, no crash | [ ] |
 | FW-208 | Sensor timeout | Block I2C bus | Timeout handled gracefully | [ ] |
-| FW-209 | DPS368 init | Initialize pressure sensor | Device ID correct (0x10) | [ ] |
+| FW-209 | DPS368 init | Initialize pressure sensor | Device ID correct (0x10) | ✅ |
 | FW-20A | DPS368 pressure read | Read pressure | Valid hPa value (800-1200) | [ ] |
 | FW-20B | DPS368 temperature read | Read temperature | Valid °C value | [ ] |
 | FW-20C | DPS368 oversampling | Set high precision mode | Readings more stable | [ ] |
@@ -709,40 +721,42 @@ documents/
 ### FW-205: Accelerometer Driver Tests (LIS2DH12)
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| FW-2A1 | LIS2DH12 init | Initialize driver | WHO_AM_I = 0x33 | [ ] |
-| FW-2A2 | Read XYZ axes | Get acceleration data | Valid mg values | [ ] |
+| FW-2A1 | LIS2DH12 init | Initialize driver | WHO_AM_I = 0x33 | ✅ |
+| FW-2A2 | Read XYZ axes | Get acceleration data | Valid mg values | ✅ |
 | FW-2A3 | Set data rate | Configure ODR | Samples at correct rate | [ ] |
 | FW-2A4 | Set full scale | Configure ±2g, ±4g, ±8g | Range changes correctly | [ ] |
 | FW-2A5 | Motion detection | Configure motion interrupt | Callback fires on movement | [ ] |
 | FW-2A6 | Orientation detect | Read orientation | Correct face-up/down | [ ] |
 | FW-2A7 | Low-power mode | Enable LP mode | Power consumption drops | [ ] |
-| FW-2A8 | FIFO mode | Enable FIFO | Buffer fills correctly | [ ] |
+| FW-2A8 | FIFO mode | Enable FIFO | Buffer fills correctly | ✅ |
+
+Notes (Jan 14, 2026): LIS2DH12 init and XYZ readouts verified in logs; motion INT tuning in progress.
 
 ### FW-206: Charger Driver Tests (BQ25629)
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| FW-2B1 | BQ25629 init | Initialize driver | Device ID readable | [ ] |
-| FW-2B2 | Read battery voltage | Get VBAT | Value matches ADC reading | [ ] |
-| FW-2B3 | Read charge status | Get charging state | Correct: charging/full/fault | [ ] |
-| FW-2B4 | Read input voltage | Get VBUS | Matches USB voltage | [ ] |
-| FW-2B5 | Set charge current | Configure ICHG | Register set correctly | [ ] |
-| FW-2B6 | Set charge voltage | Configure VREG | Register set correctly | [ ] |
-| FW-2B7 | Enter ShipMode | Send ship mode command | Device powers down | [ ] |
+| FW-2B1 | BQ25629 init | Initialize driver | Device ID readable | ✅ |
+| FW-2B2 | Read battery voltage | Get VBAT | Value matches ADC reading | ✅ |
+| FW-2B3 | Read charge status | Get charging state | Correct: charging/full/fault | ✅ |
+| FW-2B4 | Read input voltage | Get VBUS | Matches USB voltage | ✅ |
+| FW-2B5 | Set charge current | Configure ICHG | Register set correctly | ✅ |
+| FW-2B6 | Set charge voltage | Configure VREG | Register set correctly | ✅ |
+| FW-2B7 | Enter ShipMode | Send ship mode command | Device powers down | ✅ |
 | FW-2B8 | Read fault status | Get fault register | Faults reported correctly | [ ] |
-| FW-2B9 | NTC status | Read battery temperature | Temp within expected range | [ ] |
-| FW-2BA | Watchdog timer | Configure WDT | Timer resets correctly | [ ] |
+| FW-2B9 | NTC status | Read battery temperature | Temp within expected range | ✅ |
+| FW-2BA | Watchdog timer | Configure WDT | Timer resets correctly | ✅ |
 
 ### FW-207: Flash Storage Driver Tests (W25N512GVEIG)
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| FW-2C1 | Flash init | Initialize SPI driver | JEDEC ID correct | [ ] |
-| FW-2C2 | Write page | Write 2KB | Write completes | [ ] |
-| FW-2C3 | Read page | Read 2KB | Data matches written | [ ] |
-| FW-2C4 | Erase block | Erase 128KB | All 0xFF | [ ] |
-| FW-2C5 | Bad block table | Build BBT | Factory BBs identified | [ ] |
+| FW-2C1 | Flash init | Initialize SPI driver | JEDEC ID correct | ✅ |
+| FW-2C2 | Write page | Write 2KB | Write completes | ✅ |
+| FW-2C3 | Read page | Read 2KB | Data matches written | ✅ |
+| FW-2C4 | Erase block | Erase 128KB | All 0xFF | ✅ |
+| FW-2C5 | Bad block table | Build BBT | Factory BBs identified | ✅ |
 | FW-2C6 | Wear leveling | Use FTL layer | Writes distributed | [ ] |
-| FW-2C7 | File system mount | Mount LittleFS/SPIFFS | FS available | [ ] |
-| FW-2C8 | File write/read | Create file, read back | Content matches | [ ] |
+| FW-2C7 | File system mount | Mount LittleFS/SPIFFS | FS available | ✅ |
+| FW-2C8 | File write/read | Create file, read back | Content matches | ✅ |
 | FW-2C9 | Directory ops | Create/list/delete dir | All ops work | [ ] |
 | FW-2CA | Storage stats | Get free/used space | Values accurate | [ ] |
 | FW-2CB | Crash recovery | Simulate power loss | FS recovers cleanly | [ ] |
@@ -750,15 +764,15 @@ documents/
 ### FW-210: Display/UI Unit Tests
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| FW-211 | Display init | Call `display.init(w,h)` | Returns true, root created | [ ] |
+| FW-211 | Display init | Call `display.init(w,h)` | Returns true, root created | ✅ |
 | FW-212 | Set all values | Call all setter methods | Labels update correctly | [ ] |
-| FW-213 | Battery icon states | Set 0%, 50%, 100% | Icon changes appropriately | [ ] |
+| FW-213 | Battery icon states | Set 0%, 50%, 100% | Icon changes appropriately | ✅ |
 | FW-214 | Charging blink | Set charging=true | Icon blinks at 500ms | [ ] |
-| FW-215 | REC blink | Set recording=true | REC label blinks | [ ] |
-| FW-216 | Status icons | Set BLE/WiFi/GPS states | Icons update opacity | [ ] |
-| FW-217 | Alert indicator | Set alert=true | "!" appears | [ ] |
-| FW-218 | Time display | Set valid/invalid time | "HH:MM" or "--:--" shown | [ ] |
-| FW-219 | Float formatting | Set 25.67°C | Displays "25.7°C" (rounded) | [ ] |
+| FW-215 | REC blink | Set recording=true | REC label blinks | ✅ |
+| FW-216 | Status icons | Set BLE/WiFi/GPS states | Icons update opacity | ✅ |
+| FW-217 | Alert indicator | Set alert=true | "!" appears | ✅ |
+| FW-218 | Time display | Set valid/invalid time | "HH:MM" or "--:--" shown | ✅ |
+| FW-219 | Float formatting | Set 25.67°C | Displays "25.7°C" (rounded) | ✅ |
 
 ### FW-220: Recording System Tests
 | ID | Test Case | Procedure | Expected Result | Status |
@@ -775,10 +789,10 @@ documents/
 ### FW-230: GPS/Session Tests
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| FW-231 | NMEA parser | Feed valid NMEA strings | Lat/lon/time extracted | [ ] |
-| FW-232 | NMEA checksum | Feed invalid checksum | Sentence rejected | [ ] |
-| FW-233 | Fix detection | Parse GPGGA with fix | Fix status updated | [ ] |
-| FW-234 | No fix handling | Parse GPGGA without fix | Status shows "searching" | [ ] |
+| FW-231 | NMEA parser | Feed valid NMEA strings | Lat/lon/time extracted | ✅ |
+| FW-232 | NMEA checksum | Feed invalid checksum | Sentence rejected | ✅ |
+| FW-233 | Fix detection | Parse GPGGA with fix | Fix status updated | ✅ |
+| FW-234 | No fix handling | Parse GPGGA without fix | Status shows "searching" | ✅ |
 | FW-235 | Session start | Long press middle | Session created with ID | [ ] |
 | FW-236 | Session stop | Long press middle again | Session closed, summary shown | [ ] |
 | FW-237 | GPS in session | Run session with GPS | Points recorded at interval | [ ] |
@@ -796,14 +810,15 @@ documents/
 ### FW-250: Button/Menu Tests
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| FW-251 | Left button | Press left | Focus moves left | [ ] |
-| FW-252 | Right button | Press right | Focus moves right | [ ] |
-| FW-253 | Middle short press | Tap middle | Quick Menu opens | [ ] |
-| FW-254 | Middle long press | Hold middle 3s | Session toggles | [ ] |
-| FW-255 | Right long press | Hold right 3s | Touch lock toggles | [ ] |
-| FW-256 | Auto-lock | Wait 20s | Touch locked | [ ] |
-| FW-257 | Menu navigation | Navigate Quick Menu | All items selectable | [ ] |
-| FW-258 | Menu back/cancel | Exit menu | Returns to dashboard | [ ] |
+| FW-251 | Up button | Press up | Focus moves up | ✅ |
+| FW-252 | Down button | Press down | Focus moves down | ✅ |
+| FW-253 | Middle short press | Tap middle | Quick Menu opens | ✅|
+| FW-254 | Middle long press | Hold middle 3s | Session toggles | ✅ |
+| FW-255 | Down long press | Hold right 3s | Touch lock toggles | ✅ |
+| FW-256 | Up long press | Hold left 3s | Enters ShioMode | ✅ |
+| FW-257 | Auto-lock | Wait 20s | Touch locked | [ ] |
+| FW-258 | Menu navigation | Navigate Quick Menu | All items selectable | [ ] |
+| FW-259 | Menu back/cancel | Exit menu | Returns to dashboard | [ ] |
 
 ### FW-260: Settings Tests
 | ID | Test Case | Procedure | Expected Result | Status |
@@ -858,7 +873,7 @@ documents/
 ### FW-300: Sensor-to-Display Flow
 | ID | Test Case | Procedure | Expected Result | Status |
 |----|-----------|-----------|-----------------|--------|
-| FW-301 | Live sensor values | Run device | All sensor values update on display | [ ] |
+| FW-301 | Live sensor values | Run device | All sensor values update on display | ✅ |
 | FW-302 | Sensor averaging | Watch CO2/T/RH | 5s average displayed (not raw) | [ ] |
 | FW-303 | Sensor error display | Disconnect sensor | Error indicator shown | [ ] |
 

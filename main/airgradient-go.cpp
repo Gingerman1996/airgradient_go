@@ -9,6 +9,7 @@
 #include "driver/gpio.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_task_wdt.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -357,6 +358,9 @@ static void qon_button_task(void *arg) {
 
 // LVGL handler task (processes display updates)
 static void lv_handler_task(void *arg) {
+  // Unsubscribe from watchdog - LVGL operations can take time
+  esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
+  
   uint32_t task_delay_ms = LVGL_TASK_MAX_DELAY_MS;
   uint64_t last_refresh_ms = 0;
   while (1) {
@@ -731,13 +735,22 @@ extern "C" void app_main(void) {
     // Log charger limit registers for verification
     g_charger->log_charger_limits();
 
+    // Configure JEITA temperature profile
+    ret = g_charger->configure_jeita_profile();
+    if (ret != ESP_OK) {
+      ESP_LOGW(TAG, "Failed to configure JEITA profile: %s", esp_err_to_name(ret));
+    }
+    vTaskDelay(pdMS_TO_TICKS(50)); // Give UART time to flush
+
     // Verify PMID is working by reading ADC
     drivers::BQ25629_ADC_Data adc_data;
     bool vbus_adc_present = false;
     ret = g_charger->read_adc(adc_data);
     if (ret == ESP_OK) {
-      ESP_LOGI(TAG, "PMID voltage: %u mV, VSYS: %u mV, VBAT: %u mV",
-               adc_data.vpmid_mv, adc_data.vsys_mv, adc_data.vbat_mv);
+      ESP_LOGI(TAG, "ADC: VPMID=%umV VSYS=%umV VBAT=%umV VBUS=%umV",
+               adc_data.vpmid_mv, adc_data.vsys_mv, adc_data.vbat_mv, adc_data.vbus_mv);
+      ESP_LOGI(TAG, "     IBUS=%dmA IBAT=%dmA TS=%.1f%% TDIE=%d°C",
+               adc_data.ibus_ma, adc_data.ibat_ma, adc_data.ts_percent, adc_data.tdie_c);
       vbus_adc_present = adc_data.vbus_mv >= 4000;
 
       if (adc_data.vpmid_mv < 3000) {
@@ -748,6 +761,20 @@ extern "C" void app_main(void) {
     } else {
       ESP_LOGW(TAG, "Failed to read BQ25629 ADC: %s", esp_err_to_name(ret));
     }
+    vTaskDelay(pdMS_TO_TICKS(20)); // Give UART time to flush
+
+    // Read NTC temperature
+    drivers::BQ25629_NTC_Data ntc_data;
+    ret = g_charger->read_ntc_temperature(ntc_data);
+    if (ret == ESP_OK) {
+      const char* zone_names[] = {"COLD", "COOL", "NORM", "WARM", "HOT", "UNKN"};
+      ESP_LOGI(TAG, "NTC: %.1f°C (%.0fΩ) Zone=%s",
+               ntc_data.temperature_c, ntc_data.resistance_ohm, 
+               zone_names[static_cast<int>(ntc_data.zone)]);
+    } else {
+      ESP_LOGW(TAG, "Failed to read NTC temperature: %s", esp_err_to_name(ret));
+    }
+    vTaskDelay(pdMS_TO_TICKS(20)); // Give UART time to flush
 
     // Ensure PMID discharge is disabled (not forcing discharge)
     g_charger->enable_pmid_discharge(false);
@@ -1134,9 +1161,9 @@ extern "C" void app_main(void) {
       if (adc_ret == ESP_OK) {
         ESP_LOGI(
             TAG,
-            "BQ25629 adc - VPMID: %u mV, VBAT: %u mV, VSYS: %u mV, VBUS: %u mV",
+            "BQ25629 adc - VPMID: %u mV, VBAT: %u mV, VSYS: %u mV, VBUS: %u mV, IBAT: %d mA, IBUS: %d mA",
             adc_data.vpmid_mv, adc_data.vbat_mv, adc_data.vsys_mv,
-            adc_data.vbus_mv);
+            adc_data.vbus_mv, adc_data.ibat_ma, adc_data.ibus_ma);
         int battery_percent = battery_percent_from_mv(adc_data.vbat_mv);
         if (g_display_data_mux &&
             xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) == pdTRUE) {

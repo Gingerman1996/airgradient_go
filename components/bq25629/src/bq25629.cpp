@@ -7,6 +7,7 @@
 #include "esp_log.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include <cmath>
 #include <cstring>
 
 static const char *TAG = "BQ25629";
@@ -331,18 +332,22 @@ esp_err_t BQ25629::read_adc(BQ25629_ADC_Data &data) {
   uint16_t raw_value;
 
   // Read IBUS (2mA per LSB, 2's complement)
+  // Bits [15:1] contain the data, bit [0] is reserved
   ret = read_register_16(BQ25629_REG::IBUS_ADC, raw_value);
   if (ret == ESP_OK) {
-    data.ibus_ma = static_cast<int16_t>(raw_value >> 1) * 2;
+    int16_t signed_value = static_cast<int16_t>(raw_value) >> 1; // Arithmetic shift preserves sign
+    data.ibus_ma = signed_value * 2;
   }
 
   // Read IBAT (4mA per LSB, 2's complement)
+  // Bits [15:2] contain the data, bits [1:0] are reserved
   ret = read_register_16(BQ25629_REG::IBAT_ADC, raw_value);
   if (ret == ESP_OK) {
     if (raw_value == 0x8000) {
       data.ibat_ma = 0; // Polarity changed during measurement
     } else {
-      data.ibat_ma = static_cast<int16_t>(raw_value >> 2) * 4;
+      int16_t signed_value = static_cast<int16_t>(raw_value) >> 2; // Arithmetic shift preserves sign
+      data.ibat_ma = signed_value * 4;
     }
   }
 
@@ -789,6 +794,181 @@ esp_err_t BQ25629::system_power_reset() {
   }
 
   return ret;
+}
+
+esp_err_t BQ25629::configure_jeita_profile() {
+  ESP_LOGI(TAG, "Configuring JEITA temperature profile");
+  esp_err_t ret;
+
+  // REG0x1A (NTC_Control_0): Set COOL/WARM charge current to 20%
+  // Bits [7:6] TS_ISET_WARM = 01 (20%)
+  // Bits [5:4] TS_ISET_COOL = 01 (20%)
+  // Value: 0x25 = 0b00100101
+  ret = write_register(BQ25629_REG::NTC_CONTROL_0, 0x25);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to write NTC_CONTROL_0: %s", esp_err_to_name(ret));
+    return ret;
+  }
+  ESP_LOGD(TAG, "NTC_CONTROL_0 = 0x25 (WARM/COOL = 20%%)");
+
+  // REG0x1B (NTC_Control_1): Set temperature thresholds
+  // TS_TH6 [7:6] = 00 (60°C hot threshold)
+  // TS_TH5 [5:4] = 01 (45°C warm threshold)
+  // TS_TH2 [3:2] = 01 (10°C cool threshold)
+  // TS_TH1 [1:0] = 11 (0°C cold threshold)
+  // Value: 0x27 = 0b00100111
+  ret = write_register(BQ25629_REG::NTC_CONTROL_1, 0x27);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to write NTC_CONTROL_1: %s", esp_err_to_name(ret));
+    return ret;
+  }
+  ESP_LOGD(TAG, "NTC_CONTROL_1 = 0x27 (TH1=0°C, TH2=10°C, TH5=45°C, TH6=60°C)");
+
+  // REG0x1C (NTC_Control_2): Keep default voltage settings
+  // VRECHG_TH_PREWARM/PRECOOL unchanged
+  // Value: 0x3F (default)
+  ret = write_register(BQ25629_REG::NTC_CONTROL_2, 0x3F);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to write NTC_CONTROL_2: %s", esp_err_to_name(ret));
+    return ret;
+  }
+  ESP_LOGD(TAG, "NTC_CONTROL_2 = 0x3F (default voltage settings)");
+
+  ESP_LOGI(TAG, "JEITA profile OK (0/10/45/60\u00b0C, COOL/WARM=20%%)");
+
+  return ESP_OK;
+}
+
+esp_err_t BQ25629::read_ntc_temperature(BQ25629_NTC_Data &data) {
+  esp_err_t ret;
+
+  // Read TS ADC value (16-bit, 0.0961%/LSB)
+  uint16_t ts_adc_raw = 0;
+  ret = read_register_16(BQ25629_REG::TS_ADC, ts_adc_raw);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to read TS_ADC: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  // Convert ADC to percentage (0.0961% per LSB)
+  data.ts_percent = ts_adc_raw * 0.0961f;
+
+  // Calculate NTC resistance using voltage divider equation
+  // V_TS = V_BIAS * (RT2 || R_NTC) / (RT1 + (RT2 || R_NTC))
+  // Where RT1 = 5.23kΩ (pull-up), RT2 = 30.1kΩ (pull-down)
+  // 
+  // ADC reads: TS% = V_TS / V_BIAS * 100
+  // Let ratio = TS% / 100 = V_TS / V_BIAS
+  //
+  // Solving for R_NTC:
+  // Step 1: Find parallel resistance R_parallel = R_NTC || RT2
+  //   ratio = R_parallel / (RT1 + R_parallel)
+  //   R_parallel = (ratio * RT1) / (1 - ratio)
+  // Step 2: Solve for R_NTC from parallel equation
+  //   R_parallel = (R_NTC * RT2) / (R_NTC + RT2)
+  //   R_NTC = (R_parallel * RT2) / (RT2 - R_parallel)
+
+  const float RT1 = 5230.0f;  // 5.23kΩ
+  const float RT2 = 30100.0f; // 30.1kΩ
+  const float R25 = 10000.0f; // 10kΩ @ 25°C
+  const float B = 3950.0f;    // B constant (3950K)
+
+  float adc_ratio = data.ts_percent / 100.0f;
+
+  // Handle edge cases
+  if (adc_ratio <= 0.001f || adc_ratio >= 0.999f) {
+    data.resistance_ohm = 0.0f;
+    data.temperature_c = -999.0f;
+    data.zone = TempZone::TS_UNKNOWN;
+    ESP_LOGW(TAG, "TS ADC out of range: %.2f%%", data.ts_percent);
+    return ESP_OK;
+  }
+
+  // Calculate parallel resistance first
+  float r_parallel = (adc_ratio * RT1) / (1.0f - adc_ratio);
+  
+  // Check if parallel resistance is valid
+  if (r_parallel >= RT2 || r_parallel < 0.0f) {
+    data.resistance_ohm = 0.0f;
+    data.temperature_c = -999.0f;
+    data.zone = TempZone::TS_UNKNOWN;
+    ESP_LOGW(TAG, "Invalid parallel resistance: %.1fΩ (TS=%.2f%%)", r_parallel, data.ts_percent);
+    return ESP_OK;
+  }
+
+  // Calculate R_NTC from parallel resistance
+  data.resistance_ohm = (r_parallel * RT2) / (RT2 - r_parallel);
+
+  // Steinhart-Hart equation: 1/T = 1/T0 + (1/B) * ln(R/R0)
+  // Where T0 = 298.15K (25°C), R0 = R25 = 10kΩ
+  float t_kelvin = 1.0f / ((1.0f / 298.15f) + (logf(data.resistance_ohm / R25) / B));
+  data.temperature_c = t_kelvin - 273.15f;
+
+  // Determine temperature zone
+  if (data.temperature_c < 0.0f) {
+    data.zone = TempZone::TS_COLD;
+  } else if (data.temperature_c < 10.0f) {
+    data.zone = TempZone::TS_COOL;
+  } else if (data.temperature_c < 45.0f) {
+    data.zone = TempZone::TS_NORMAL;
+  } else if (data.temperature_c < 60.0f) {
+    data.zone = TempZone::TS_WARM;
+  } else {
+    data.zone = TempZone::TS_HOT;
+  }
+
+  ESP_LOGD(TAG, "NTC: %.2f°C (%.1fΩ, TS=%.1f%%), Zone=%d", 
+           data.temperature_c, data.resistance_ohm, data.ts_percent, 
+           static_cast<int>(data.zone));
+
+  return ESP_OK;
+}
+
+esp_err_t BQ25629::get_temperature_zone(TempZone &zone) {
+  esp_err_t ret;
+
+  // Read FAULT_STATUS_0 (0x1F) to get TS_STAT[2:0]
+  uint8_t fault_status = 0;
+  ret = read_register(BQ25629_REG::FAULT_STATUS_0, fault_status);
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG, "Failed to read FAULT_STATUS_0: %s", esp_err_to_name(ret));
+    return ret;
+  }
+
+  // Extract TS_STAT[2:0] bits
+  uint8_t ts_stat = fault_status & 0x07;
+
+  // Map TS_STAT to TempZone
+  // TS_STAT encoding (from datasheet):
+  // 000 = Normal
+  // 001 = Warm (VLTF < VTS < VHTF)
+  // 010 = Cool (VHTF < VTS < VLTF)
+  // 011 = Cold (VTS > VLTF)
+  // 100 = Hot (VTS < VHTF)
+  // 101-111 = Reserved
+  switch (ts_stat) {
+    case 0x00:
+      zone = TempZone::TS_NORMAL;
+      break;
+    case 0x01:
+      zone = TempZone::TS_WARM;
+      break;
+    case 0x02:
+      zone = TempZone::TS_COOL;
+      break;
+    case 0x03:
+      zone = TempZone::TS_COLD;
+      break;
+    case 0x04:
+      zone = TempZone::TS_HOT;
+      break;
+    default:
+      zone = TempZone::TS_UNKNOWN;
+      ESP_LOGW(TAG, "Unknown TS_STAT value: 0x%02X", ts_stat);
+      break;
+  }
+
+  return ESP_OK;
 }
 
 } // namespace drivers

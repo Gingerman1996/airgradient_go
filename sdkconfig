@@ -2297,6 +2297,12 @@ CONFIG_WIFI_PROV_STA_ALL_CHANNEL_SCAN=y
 # end of Wi-Fi Provisioning Manager
 
 #
+# SPI NAND Flash configuration
+#
+# CONFIG_NAND_FLASH_VERIFY_WRITE is not set
+# end of SPI NAND Flash configuration
+
+#
 # LVGL configuration
 #
 CONFIG_LV_CONF_SKIP=y

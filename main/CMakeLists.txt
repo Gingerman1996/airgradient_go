@@ -22,6 +22,7 @@ idf_component_register(
         "espressif__spi_nand_flash"
         "fatfs"
         "dps368"
+        "lis2dh12"
 )
 
 # Optimize for size (OTA partition is 1 MB)

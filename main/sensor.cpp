@@ -12,6 +12,7 @@
 #include "sps30.h"
 #include "sensirion_gas_index_algorithm.h"
 #include "dps368.h"
+#include "lis2dh12.h"
 #include "driver/gpio.h"
 
 static const char *TAG_SENS = "sensors";
@@ -24,6 +25,9 @@ static const char *TAG_SENS = "sensors";
 
 // PM Sensor Power Control
 #define EN_PM1_GPIO          26     // GPIO 26 - PM sensor load switch + I2C isolator enable
+
+// LIS2DH12 Accelerometer Interrupt Pin
+#define LIS2DH12_INT1_GPIO   3      // GPIO 3 - Motion detection interrupt
 
 // CO2 ring buffer capacity
 #define CO2_RING_CAP 12
@@ -89,6 +93,14 @@ struct Sensors::SensorsState {
     dps368_handle_t *dps368_handle;
     dps368_data_t dps368_data;
     int64_t last_dps_read;
+
+    // LIS2DH12 Accelerometer
+    drivers::LIS2DH12 *lis2dh12;
+    drivers::AccelData accel_data;
+    bool have_accel_data;
+    bool motion_detected;
+    int64_t last_accel_read;
+    volatile bool motion_interrupt_triggered;
 };
 
 // Constructor
@@ -110,6 +122,11 @@ Sensors::Sensors() {
     state->sgp4x_handle = NULL;
     state->sps30_handle = NULL;
     state->dps368_handle = NULL;
+    state->lis2dh12 = nullptr;
+    state->have_accel_data = false;
+    state->motion_detected = false;
+    state->last_accel_read = 0;
+    state->motion_interrupt_triggered = false;
 
     // Initialize Gas Index Algorithms (1s sampling interval matches SGP4x update rate)
     GasIndexAlgorithm_init_with_sampling_interval(&state->voc_algo_params, GasIndexAlgorithm_ALGORITHM_TYPE_VOC, 1.0f);
@@ -286,6 +303,71 @@ static esp_err_t init_sps30_sensor(Sensors::SensorsState *state) {
         state->dps368_handle = NULL;
     } else {
         ESP_LOGI(TAG_SENS, "DPS368 pressure sensor ready");
+    }
+
+    // Initialize LIS2DH12 accelerometer (address 0x18, SA0=GND)
+    state->lis2dh12 = new drivers::LIS2DH12(state->i2c_bus_handle, drivers::LIS2DH12_I2C::ADDR_SA0_LOW);
+    ret = state->lis2dh12->init();
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_SENS, "LIS2DH12 init failed (optional sensor): %s", esp_err_to_name(ret));
+        delete state->lis2dh12;
+        state->lis2dh12 = nullptr;
+    } else {
+        // Configure motion detection: threshold=250mg (above typical ±20mg noise), duration=0
+        // Higher threshold reduces false triggers from vibration/noise
+        // Will still detect deliberate movement (>0.25g acceleration)
+        drivers::MotionConfig motion_cfg = {
+            .threshold_mg = 250,
+            .duration_ms = 0,  // 0 = immediate trigger, no minimum duration required
+            .enable_x = true,
+            .enable_y = true,
+            .enable_z = true
+        };
+        ret = state->lis2dh12->configure_motion_detect(motion_cfg);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG_SENS, "LIS2DH12 motion detection configured (threshold=250mg, duration=0ms)");
+            
+            // Clear any pending interrupt by reading INT1_SRC (important for latched mode)
+            uint8_t int_src = 0;
+            state->lis2dh12->get_int1_source(&int_src);
+            ESP_LOGI(TAG_SENS, "LIS2DH12 cleared INT1_SRC=0x%02X", int_src);
+        }
+
+        // Enable sleep-to-wake: activity threshold=80mg, inactivity duration=30s
+        drivers::SleepToWakeConfig sleep_cfg = {
+            .activity_threshold_mg = 80,
+            .inactivity_duration_s = 30
+        };
+        ret = state->lis2dh12->enable_sleep_to_wake(sleep_cfg);
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG_SENS, "LIS2DH12 sleep-to-wake enabled (30s inactivity)");
+        }
+
+        // Configure GPIO3 for interrupt input
+        // INT1 is configured as active-high: LOW (idle) -> HIGH (interrupt)
+        gpio_config_t io_int_conf = {};
+        io_int_conf.intr_type = GPIO_INTR_POSEDGE; // Rising edge (LOW→HIGH) for active-high
+        io_int_conf.mode = GPIO_MODE_INPUT;
+        io_int_conf.pin_bit_mask = (1ULL << LIS2DH12_INT1_GPIO);
+        io_int_conf.pull_down_en = GPIO_PULLDOWN_ENABLE;  // Pull-down for active-high signal
+        io_int_conf.pull_up_en = GPIO_PULLUP_DISABLE;
+        ret = gpio_config(&io_int_conf);
+        if (ret == ESP_OK) {
+            // Install ISR service if not already installed
+            gpio_install_isr_service(0);
+            gpio_isr_handler_add((gpio_num_t)LIS2DH12_INT1_GPIO, 
+                                  [](void *arg) {
+                                      Sensors::SensorsState *st = (Sensors::SensorsState *)arg;
+                                      if (st) {
+                                          st->motion_interrupt_triggered = true;
+                                      }
+                                  }, state);
+            ESP_LOGI(TAG_SENS, "LIS2DH12 INT1 configured on GPIO%d", LIS2DH12_INT1_GPIO);
+        } else {
+            ESP_LOGW(TAG_SENS, "Failed to configure INT1 GPIO: %s", esp_err_to_name(ret));
+        }
+
+        ESP_LOGI(TAG_SENS, "LIS2DH12 accelerometer ready");
     }
     
     return ESP_OK;
@@ -503,6 +585,42 @@ void Sensors::update(int64_t current_millis) {
                      state->dps368_data.temperature_c);
         }
     }
+
+    // Read LIS2DH12 accelerometer (every 1 second)
+    if (state->lis2dh12 && (current_millis - state->last_accel_read >= 1000)) {
+        state->last_accel_read = current_millis;
+        
+        // Debug: Poll INT1_SRC register to see if interrupt is being generated
+        uint8_t int_src = 0;
+        esp_err_t ret = state->lis2dh12->get_int1_source(&int_src);
+        if (ret == ESP_OK && int_src != 0) {
+            // Read GPIO3 pin level
+            int gpio_level = gpio_get_level((gpio_num_t)LIS2DH12_INT1_GPIO);
+            ESP_LOGI(TAG_SENS, "LIS2DH12: INT1_SRC=0x%02X (IA=%d) GPIO3=%d, flag=%d",
+                     int_src, (int_src >> 6) & 1, gpio_level, state->motion_interrupt_triggered);
+        }
+        
+        // Check if motion interrupt was triggered
+        if (state->motion_interrupt_triggered) {
+            state->motion_interrupt_triggered = false;
+            state->motion_detected = true;
+            ESP_LOGI(TAG_SENS, "LIS2DH12: *** Motion interrupt via ISR! ***");
+            // TODO: Trigger GPS tagging here
+        }
+        
+        // Check if data is ready
+        bool data_ready = false;
+        ret = state->lis2dh12->is_data_ready(&data_ready);
+        
+        if (ret == ESP_OK && data_ready) {
+            ret = state->lis2dh12->read_accel(&state->accel_data);
+            if (ret == ESP_OK) {
+                state->have_accel_data = true;
+                ESP_LOGD(TAG_SENS, "LIS2DH12: X=%d mg, Y=%d mg, Z=%d mg",
+                         state->accel_data.x_mg, state->accel_data.y_mg, state->accel_data.z_mg);
+            }
+        }
+    }
 }
 
 void Sensors::getValues(int64_t now_ms, sensor_values_t *out) {
@@ -522,6 +640,15 @@ void Sensors::getValues(int64_t now_ms, sensor_values_t *out) {
     out->voc_index = (int)state->voc_index;
     out->nox_index = (int)state->nox_index;
     out->pressure_pa = state->dps368_data.pressure_pa;
+
+    // Accelerometer data
+    out->have_accel = state->have_accel_data;
+    if (state->have_accel_data) {
+        out->accel_x_mg = state->accel_data.x_mg;
+        out->accel_y_mg = state->accel_data.y_mg;
+        out->accel_z_mg = state->accel_data.z_mg;
+    }
+    out->motion_detected = state->motion_detected;
 }
 
 i2c_master_bus_handle_t Sensors::getI2CBusHandle(void) {
