@@ -565,3 +565,17 @@ void Display::setRHf(float v) {
   lv_snprintf(buf, sizeof(buf), "RH:%s", val);
   lv_label_set_text(state->rh_label, buf);
 }
+
+void Display::setLatLon(float lat, float lon, bool valid) {
+  if (!valid) {
+    lv_label_set_text(state->lat_label, "--,--");
+    lv_label_set_text(state->lon_label, "--,--");
+  } else {
+    char lat_buf[16];
+    char lon_buf[16];
+    lv_snprintf(lat_buf, sizeof(lat_buf), "%.4f", lat);
+    lv_snprintf(lon_buf, sizeof(lon_buf), "%.4f", lon);
+    lv_label_set_text(state->lat_label, lat_buf);
+    lv_label_set_text(state->lon_label, lon_buf);
+  }
+}
