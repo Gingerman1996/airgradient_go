@@ -806,9 +806,9 @@ extern "C" void app_main(void) {
 
   drivers::BQ25629_Config charger_cfg = {
       .charge_voltage_mv = 4200,      // 4.2V (full charge for Li-ion)
-      .charge_current_ma = 1000,      // 1A charging
+      .charge_current_ma = 500,       // 500mA charging
       .input_current_limit_ma = 1500, // 1.5A input limit
-      .input_voltage_limit_mv = 5500, // 5.5V VINDPM (higher threshold for USB-C)
+      .input_voltage_limit_mv = 4600, // 4.6V VINDPM (works with 5V input)
       .min_system_voltage_mv = 3520,  // 3.52V minimum
       .precharge_current_ma = 30,     // 30mA pre-charge
       .term_current_ma = 20,          // 20mA termination
