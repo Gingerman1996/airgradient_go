@@ -1106,6 +1106,10 @@ extern "C" void app_main(void) {
   uint64_t last_sensor_summary_ms = 0;
   const uint64_t SENSOR_SUMMARY_INTERVAL_MS = 5000; // Sensor summary every 5s
   bool boost_requested = pmid_boost_requested;
+  bool vbus_stable_known = false;
+  bool vbus_stable_last = false;
+  const int64_t SPS30_READ_STALE_MS = 3000;
+  const uint16_t PMID_LOW_MV = 4000;
 
   while (true) {
     int64_t now_ms = esp_timer_get_time() / 1000;
@@ -1226,6 +1230,49 @@ extern "C" void app_main(void) {
       bool vbus_absent_stable =
           !vbus_present &&
           (now_ms_u - vbus_absent_since_ms >= VBUS_ABSENT_STABLE_MS);
+
+      bool vbus_stable_event = false;
+      bool vbus_stable_present = false;
+      if (vbus_present_stable || vbus_absent_stable) {
+        vbus_stable_present = vbus_present_stable;
+        if (!vbus_stable_known || vbus_stable_present != vbus_stable_last) {
+          vbus_stable_event = true;
+          vbus_stable_last = vbus_stable_present;
+          vbus_stable_known = true;
+        }
+      }
+
+      if (vbus_stable_event) {
+        bool sps30_reading = sensors.isSps30Reading(now_ms, SPS30_READ_STALE_MS);
+        if (!sps30_reading) {
+          ESP_LOGW(TAG, "VBUS changed (%s), SPS30 not reading",
+                   vbus_stable_present ? "present" : "absent");
+          drivers::BQ25629_ADC_Data adc_data = {};
+          esp_err_t adc_ret = g_charger->read_adc(adc_data);
+          if (adc_ret == ESP_OK) {
+            if (adc_data.vpmid_mv < PMID_LOW_MV) {
+              ESP_LOGW(TAG, "PMID low (%u mV), attempting recovery", adc_data.vpmid_mv);
+              if (!vbus_stable_present) {
+                esp_err_t boost_ret = g_charger->enable_pmid_5v_boost();
+                if (boost_ret != ESP_OK) {
+                  ESP_LOGW(TAG, "Failed to enable PMID 5V boost: %s",
+                           esp_err_to_name(boost_ret));
+                } else {
+                  boost_requested = true;
+                }
+              } else {
+                esp_err_t chg_ret = g_charger->enable_charging(true);
+                if (chg_ret != ESP_OK) {
+                  ESP_LOGW(TAG, "Failed to enable charging: %s",
+                           esp_err_to_name(chg_ret));
+                }
+              }
+            }
+          } else {
+            ESP_LOGW(TAG, "PMID check failed: %s", esp_err_to_name(adc_ret));
+          }
+        }
+      }
 
       if (vbus_absent_stable && !otg_active) {
         ESP_LOGI(TAG, "VBUS removed, enabling PMID 5V boost");

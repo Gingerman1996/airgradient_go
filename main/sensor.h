@@ -47,6 +47,9 @@ public:
     // Retrieve current display-ready values. Uses 5s average for CO2/Temp/RH.
     void getValues(int64_t now_ms, sensor_values_t *out);
 
+    // Check if SPS30 has a recent successful read.
+    bool isSps30Reading(int64_t now_ms, int64_t max_age_ms);
+
     // Get I2C bus handle (for sharing with other components like CAP1203)
     i2c_master_bus_handle_t getI2CBusHandle(void);
 

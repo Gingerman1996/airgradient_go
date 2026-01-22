@@ -9,6 +9,7 @@
 **Latest Commit**: `feat: continuous sensor reading and timing updates`
 - ✅ STCC4 CO2 sensor changed to **continuous measurement mode** (1s interval)
 - ✅ SPS30 PM sensor reading every 1 second (continuous)
+- ✅ SPS30 recovery on VBUS transitions (PMID check + auto restart when data-ready stalls)
 - ✅ SGP4x VOC/NOx reading every 1 second
 - ✅ DPS368 pressure sensor reading every **5 seconds** (reduced from 1s)
 - ✅ GPS status logging every **5 seconds** (was 1s on change only)

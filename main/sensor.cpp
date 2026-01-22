@@ -88,6 +88,8 @@ struct Sensors::SensorsState {
     // SPS30 PM sensor
     sps30_handle_t sps30_handle;
     sps30_measurement_t sps30_data;
+    int64_t sps30_last_read;
+    int sps30_not_ready_count;
     
     // DPS368 Pressure sensor
     dps368_handle_t *dps368_handle;
@@ -502,6 +504,8 @@ static void update_sps30(Sensors::SensorsState *st, int64_t now_ms) {
                 ESP_LOGI(TAG_SENS, "SPS30: Waking up sensor");
                 sps30_state = SPS30_START;
                 sps30_state_time = now_ms;
+                st->sps30_not_ready_count = 0;
+                st->sps30_last_read = 0;
             }
             break;
             
@@ -513,6 +517,7 @@ static void update_sps30(Sensors::SensorsState *st, int64_t now_ms) {
                     ESP_LOGI(TAG_SENS, "SPS30: Starting continuous measurement mode");
                     sps30_state = SPS30_WARMUP;
                     sps30_state_time = now_ms;
+                    st->sps30_not_ready_count = 0;
                 } else {
                     ESP_LOGE(TAG_SENS, "SPS30: Failed to start measurement");
                     sps30_sleep(st->sps30_handle);
@@ -530,6 +535,7 @@ static void update_sps30(Sensors::SensorsState *st, int64_t now_ms) {
                 sps30_state = SPS30_MEASURING;
                 sps30_state_time = now_ms;
                 last_read_time = now_ms;
+                st->sps30_not_ready_count = 0;
             }
             break;
             
@@ -543,11 +549,25 @@ static void update_sps30(Sensors::SensorsState *st, int64_t now_ms) {
                 ret = sps30_read_data_ready(st->sps30_handle, &ready);
                 
                 if (ret == ESP_OK && ready) {
+                    st->sps30_not_ready_count = 0;
                     ret = sps30_read_measurement(st->sps30_handle, &st->sps30_data);
                     if (ret == ESP_OK) {
+                        st->sps30_last_read = now_ms;
                         ESP_LOGD(TAG_SENS, "SPS30: PM1.0=%.1f, PM2.5=%.1f, PM4.0=%.1f, PM10=%.1f µg/m³",
                                  st->sps30_data.pm1p0_mass, st->sps30_data.pm2p5_mass,
                                  st->sps30_data.pm4p0_mass, st->sps30_data.pm10p0_mass);
+                    }
+                } else if (ret == ESP_OK && !ready) {
+                    st->sps30_not_ready_count++;
+                    if (st->sps30_not_ready_count > 2) {
+                        ESP_LOGW(TAG_SENS, "SPS30: Data-ready not ready too long, restarting");
+                        sps30_stop_measurement(st->sps30_handle);
+                        sps30_sleep(st->sps30_handle);
+                        st->sps30_not_ready_count = 0;
+                        st->sps30_last_read = 0;
+                        sps30_state = SPS30_INIT;
+                        sps30_state_time = now_ms;
+                        last_read_time = 0;
                     }
                 } else if (ret != ESP_OK) {
                     ESP_LOGW(TAG_SENS, "SPS30: Data ready check failed");
@@ -621,6 +641,12 @@ void Sensors::update(int64_t current_millis) {
             }
         }
     }
+}
+
+bool Sensors::isSps30Reading(int64_t now_ms, int64_t max_age_ms) {
+    if (!state || !state->sps30_handle) return false;
+    if (state->sps30_last_read <= 0) return false;
+    return (now_ms - state->sps30_last_read) <= max_age_ms;
 }
 
 void Sensors::getValues(int64_t now_ms, sensor_values_t *out) {
