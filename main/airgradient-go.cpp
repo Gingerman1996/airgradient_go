@@ -58,6 +58,10 @@ static SemaphoreHandle_t g_display_data_mux = nullptr;
 static const uint64_t kRecordingIntervalMs =
     10000; // 10s default, matches UI interval
 static const uint64_t kUiBlinkIntervalMs = 500;
+static const float kBatteryCapacityMah = 2000.0f;
+static const uint16_t kBatteryEmptyMv = 3300;
+static const uint16_t kBatteryFullMv = 4200;
+static const int16_t kBatteryRelaxedCurrentMa = 50;
 
 struct DisplaySnapshot {
   sensor_values_t sensor = {};
@@ -79,6 +83,7 @@ static DisplaySnapshot g_display_snapshot = {};
 
 static const char *charge_status_to_string(drivers::ChargeStatus status);
 static int battery_percent_from_mv(uint16_t vbat_mv);
+static int battery_percent_from_soc(float soc_pct);
 static void led_show_aqi(uint16_t pm25_ugm3);
 static void led_show_battery(int battery_percent, bool charging);
 static void led_off();
@@ -301,7 +306,7 @@ extern "C" void app_main(void) {
   drivers::BQ25629_Config charger_cfg = {
       .charge_voltage_mv = 4200,      // 4.2V (full charge for Li-ion)
       .charge_current_ma = 500,       // 500mA charging
-      .input_current_limit_ma = 500, // 500mA input limit
+      .input_current_limit_ma = 1500, // 1500mA input limit
       .input_voltage_limit_mv = 4600, // 4.6V VINDPM (works with 5V input)
       .min_system_voltage_mv = 3520,  // 3.52V minimum
       .precharge_current_ma = 30,     // 30mA pre-charge
@@ -611,6 +616,13 @@ extern "C" void app_main(void) {
   bool vbus_stable_last = false;
   const int64_t SPS30_READ_STALE_MS = 3000;
   const uint16_t PMID_LOW_MV = 4000;
+  float battery_soc_pct = 0.0f;
+  bool battery_soc_initialized = false;
+  uint64_t last_battery_soc_ms = 0;
+  bool battery_charging = false;
+  bool battery_charging_valid = false;
+  drivers::ChargeStatus last_charge_status = drivers::ChargeStatus::NOT_CHARGING;
+  bool charge_status_valid = false;
 
   while (true) {
     int64_t now_ms = esp_timer_get_time() / 1000;
@@ -874,6 +886,8 @@ extern "C" void app_main(void) {
       if (status_ret == ESP_OK) {
         const char *charge_status =
             charge_status_to_string(charger_status.charge_status);
+        last_charge_status = charger_status.charge_status;
+        charge_status_valid = true;
         ESP_LOGI(TAG,
                  "BQ25629 dbg - VBUS: %d, CHG: %d (%s), IOTG_REG: %d, "
                  "VOTG_REG: %d, WD: %d",
@@ -881,8 +895,9 @@ extern "C" void app_main(void) {
                  (int)charger_status.charge_status, charge_status,
                  charger_status.iindpm_stat, charger_status.vindpm_stat,
                  charger_status.wd_stat);
-        bool battery_charging = (charger_status.charge_status !=
-                                 drivers::ChargeStatus::NOT_CHARGING);
+        battery_charging = (charger_status.charge_status !=
+                            drivers::ChargeStatus::NOT_CHARGING);
+        battery_charging_valid = true;
         if (g_display_data_mux &&
             xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) == pdTRUE) {
           g_display_snapshot.battery_charging = battery_charging;
@@ -892,6 +907,8 @@ extern "C" void app_main(void) {
       } else {
         ESP_LOGW(TAG, "BQ25629 status read failed: %s",
                  esp_err_to_name(status_ret));
+        charge_status_valid = false;
+        battery_charging_valid = false;
       }
 
       if (fault_ret == ESP_OK) {
@@ -919,11 +936,49 @@ extern "C" void app_main(void) {
             "BQ25629 adc - VPMID: %u mV, VBAT: %u mV, VSYS: %u mV, VBUS: %u mV, IBAT: %d mA, IBUS: %d mA",
             adc_data.vpmid_mv, adc_data.vbat_mv, adc_data.vsys_mv,
             adc_data.vbus_mv, adc_data.ibat_ma, adc_data.ibus_ma);
-        int battery_percent = battery_percent_from_mv(adc_data.vbat_mv);
+        if (!battery_soc_initialized) {
+          battery_soc_pct = (float)battery_percent_from_mv(adc_data.vbat_mv);
+          battery_soc_initialized = true;
+          last_battery_soc_ms = now_ms_u;
+        } else if (last_battery_soc_ms > 0) {
+          uint64_t dt_ms = now_ms_u - last_battery_soc_ms;
+          last_battery_soc_ms = now_ms_u;
+          float delta_pct =
+              ((float)adc_data.ibat_ma * (float)dt_ms * 100.0f) /
+              (kBatteryCapacityMah * 3600000.0f);
+          battery_soc_pct += delta_pct;
+        } else {
+          last_battery_soc_ms = now_ms_u;
+        }
+
+        if (battery_soc_initialized) {
+          int16_t ibat_abs = adc_data.ibat_ma < 0 ? (int16_t)-adc_data.ibat_ma
+                                                 : adc_data.ibat_ma;
+          if (charge_status_valid &&
+              last_charge_status ==
+                  drivers::ChargeStatus::TOPOFF_TIMER_ACTIVE) {
+            battery_soc_pct = 100.0f;
+          } else if (charge_status_valid &&
+                     last_charge_status ==
+                         drivers::ChargeStatus::TAPER_CHARGE &&
+                     adc_data.vbat_mv >= (kBatteryFullMv - 10) &&
+                     ibat_abs <= kBatteryRelaxedCurrentMa) {
+            battery_soc_pct = 100.0f;
+          } else if (battery_charging_valid && !battery_charging &&
+                     adc_data.vbat_mv <= kBatteryEmptyMv) {
+            battery_soc_pct = 0.0f;
+          }
+          if (battery_soc_pct < 0.0f)
+            battery_soc_pct = 0.0f;
+          if (battery_soc_pct > 100.0f)
+            battery_soc_pct = 100.0f;
+        }
+
+        int battery_percent = battery_percent_from_soc(battery_soc_pct);
         if (g_display_data_mux &&
             xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) == pdTRUE) {
           g_display_snapshot.battery_percent = battery_percent;
-          g_display_snapshot.battery_valid = true;
+          g_display_snapshot.battery_valid = battery_soc_initialized;
           xSemaphoreGive(g_display_data_mux);
         }
         if (adc_data.vpmid_mv < 4000) {
@@ -955,15 +1010,21 @@ static const char *charge_status_to_string(drivers::ChargeStatus status) {
 }
 
 static int battery_percent_from_mv(uint16_t vbat_mv) {
-  const int kMinMv = 3300;
-  const int kMaxMv = 4200;
-
-  if (vbat_mv <= kMinMv)
+  if (vbat_mv <= kBatteryEmptyMv)
     return 0;
-  if (vbat_mv >= kMaxMv)
+  if (vbat_mv >= kBatteryFullMv)
     return 100;
 
-  return (int)(((int)vbat_mv - kMinMv) * 100 / (kMaxMv - kMinMv));
+  return (int)(((int)vbat_mv - kBatteryEmptyMv) * 100 /
+               (kBatteryFullMv - kBatteryEmptyMv));
+}
+
+static int battery_percent_from_soc(float soc_pct) {
+  if (soc_pct < 0.0f)
+    soc_pct = 0.0f;
+  if (soc_pct > 100.0f)
+    soc_pct = 100.0f;
+  return (int)(soc_pct + 0.5f);
 }
 
 // ==================== LED HELPER FUNCTIONS ====================

@@ -675,10 +675,10 @@ esp_err_t BQ25629::enable_pmid_5v_boost() {
     return ret;
   vTaskDelay(pdMS_TO_TICKS(10));
 
-  // Step 2: Set TS_IGNORE if no thermistor connected
-  ret = set_ts_ignore(true);
+  // Step 2: Enable TS check (do not ignore for safety)
+  ret = set_ts_ignore(false);
   if (ret != ESP_OK) {
-    ESP_LOGW(TAG, "Failed to set TS_IGNORE, continuing...");
+    ESP_LOGW(TAG, "Failed to enable TS check, continuing...");
   }
   vTaskDelay(pdMS_TO_TICKS(10));
 

@@ -314,7 +314,7 @@ public:
    *
    * This function performs all steps needed to enable PMID 5V boost:
    * 1. Disable HIZ mode
-   * 2. Set TS_IGNORE (if no thermistor)
+   * 2. Enable TS check (do not ignore)
    * 3. Set VOTG to 5V
    * 4. Disable bypass OTG
    * 5. Enable OTG boost mode
