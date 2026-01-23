@@ -199,19 +199,19 @@ bool Display::init(uint16_t w, uint16_t h) {
   lv_label_set_text(state->bt_logo, LV_SYMBOL_BLUETOOTH);
   lv_obj_set_style_text_color(state->bt_logo, lv_color_black(), 0);
   lv_obj_set_style_text_font(state->bt_logo, &lv_font_montserrat_16, 0);
-  lv_obj_align(state->bt_logo, LV_ALIGN_TOP_MID, -50, 2);
+  lv_obj_align(state->bt_logo, LV_ALIGN_TOP_MID, -55, 2);
 
   state->wifi_logo = lv_label_create(state->root);
   lv_label_set_text(state->wifi_logo, LV_SYMBOL_WIFI);
   lv_obj_set_style_text_color(state->wifi_logo, lv_color_black(), 0);
   lv_obj_set_style_text_font(state->wifi_logo, &lv_font_montserrat_16, 0);
-  lv_obj_align(state->wifi_logo, LV_ALIGN_TOP_MID, -25, 2);
+  lv_obj_align(state->wifi_logo, LV_ALIGN_TOP_MID, -30, 2);
 
   state->gps_logo = lv_label_create(state->root);
   lv_label_set_text(state->gps_logo, LV_SYMBOL_GPS);
   lv_obj_set_style_text_color(state->gps_logo, lv_color_black(), 0);
   lv_obj_set_style_text_font(state->gps_logo, &lv_font_montserrat_16, 0);
-  lv_obj_align(state->gps_logo, LV_ALIGN_TOP_MID, 0, 2);
+  lv_obj_align(state->gps_logo, LV_ALIGN_TOP_MID, -5, 2);
 
   state->battery_logo = lv_label_create(state->root);
   lv_label_set_text(state->battery_logo, LV_SYMBOL_BATTERY_EMPTY);
@@ -444,12 +444,12 @@ void Display::setBattery(int percent, bool charging) {
       state->last_batt_blink_ms = 0;
     }
     lv_obj_set_style_text_font(state->battery_percent_label,
-                               &lv_font_montserrat_20, 0);
+                               &lv_font_montserrat_16, 0);
     lv_label_set_text(state->battery_logo,
                       kBatteryChargeAnimSymbols[state->batt_anim_index]);
   } else {
     lv_obj_set_style_text_font(state->battery_percent_label,
-                               &lv_font_montserrat_16, 0);
+                               &lv_font_montserrat_12, 0);
     lv_label_set_text(state->battery_logo, battery_symbol_for_percent(percent));
     state->batt_blink_state = true;
     state->last_batt_blink_ms = 0;

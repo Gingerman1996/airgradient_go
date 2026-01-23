@@ -77,529 +77,23 @@ struct DisplaySnapshot {
 
 static DisplaySnapshot g_display_snapshot = {};
 
-static const char *charge_status_to_string(drivers::ChargeStatus status) {
-  switch (status) {
-  case drivers::ChargeStatus::NOT_CHARGING:
-    return "NOT_CHARGING";
-  case drivers::ChargeStatus::TRICKLE_PRECHARGE_FASTCHARGE:
-    return "PRECHARGE_OR_FAST";
-  case drivers::ChargeStatus::TAPER_CHARGE:
-    return "TAPER";
-  case drivers::ChargeStatus::TOPOFF_TIMER_ACTIVE:
-    return "TOPOFF";
-  default:
-    return "UNKNOWN";
-  }
-}
-
-static int battery_percent_from_mv(uint16_t vbat_mv) {
-  const int kMinMv = 3300;
-  const int kMaxMv = 4200;
-
-  if (vbat_mv <= kMinMv)
-    return 0;
-  if (vbat_mv >= kMaxMv)
-    return 100;
-
-  return (int)(((int)vbat_mv - kMinMv) * 100 / (kMaxMv - kMinMv));
-}
-
-// ==================== LED HELPER FUNCTIONS ====================
-
-// Show AQI status on LED ring
-static void led_show_aqi(uint16_t pm25_ugm3) {
-  if (g_led_driver == nullptr) return;
-  
-  color::RGB aqi_color = led_effects::aqi_to_color(pm25_ugm3);
-  g_led_driver->set_global_off(false);
-  
-  for (uint8_t i = 0; i < 12; i++) {
-    g_led_driver->set_led_brightness(i, 0xFF);
-    g_led_driver->set_led_color(i, aqi_color.r, aqi_color.g, aqi_color.b);
-  }
-}
-
-// Show battery status on LED ring (charging animation or battery level)
-static void led_show_battery(int battery_percent, bool charging) {
-  if (g_led_driver == nullptr) return;
-  
-  g_led_driver->set_global_off(false);
-  
-  if (charging) {
-    // Charging: breathing blue animation
-    uint32_t now_ms = esp_timer_get_time() / 1000;
-    float brightness = led_effects::breathing_effect(now_ms, 2000);
-    uint8_t brightness_8bit = static_cast<uint8_t>(brightness * 255);
-    
-    color::RGB blue = color::Colors::BLUE;
-    for (uint8_t i = 0; i < 12; i++) {
-      g_led_driver->set_led_brightness(i, brightness_8bit);
-      g_led_driver->set_led_color(i, blue.r, blue.g, blue.b);
-    }
-  } else {
-    // Battery level: progress bar (green/yellow/red based on level)
-    int lit_leds = (battery_percent * 12) / 100;
-    color::RGB color;
-    
-    if (battery_percent > 60) {
-      color = color::Colors::GREEN;
-    } else if (battery_percent > 20) {
-      color = color::Colors::YELLOW;
-    } else {
-      color = color::Colors::RED;
-    }
-    
-    for (uint8_t i = 0; i < 12; i++) {
-      if (i < lit_leds) {
-        g_led_driver->set_led_brightness(i, 0xFF);
-        g_led_driver->set_led_color(i, color.r, color.g, color.b);
-      } else {
-        g_led_driver->set_led_brightness(i, 0);
-      }
-    }
-  }
-}
-
-// Turn off all LEDs
-static void led_off() {
-  if (g_led_driver == nullptr) return;
-  g_led_driver->set_global_off(true);
-}
-
-// Brief notification flash (for button press, etc.)
-static void led_flash(const color::RGB& color, uint16_t duration_ms = 100) {
-  if (g_led_driver == nullptr) return;
-  
-  g_led_driver->set_global_off(false);
-  for (uint8_t i = 0; i < 12; i++) {
-    g_led_driver->set_led_brightness(i, 0xFF);
-    g_led_driver->set_led_color(i, color.r, color.g, color.b);
-  }
-  vTaskDelay(pdMS_TO_TICKS(duration_ms));
-  g_led_driver->set_global_off(true);
-}
-
-// Button callback for CAP1203 (called when button events occur)
-static void button_event_callback(ButtonState state, void *user_data) {
-  static const char *TAG_BTN = "CAP1203";
-
-  const char *button_name = "UNKNOWN";
-  switch (state.id) {
-  case ButtonID::BUTTON_LEFT:
-    button_name = "T1 (Up)";
-    break;
-  case ButtonID::BUTTON_MIDDLE:
-    button_name = "T2 (Down)";
-    break;
-  case ButtonID::BUTTON_RIGHT:
-    button_name = "T3 (Middle)";
-    break;
-  default:
-    button_name = "NONE";
-    break;
-  }
-
-  switch (state.event) {
-  case ButtonEvent::PRESS:
-    ESP_LOGI(TAG_BTN, "[%s] PRESS", button_name);
-    // Visual feedback: quick white flash
-    led_flash(color::Colors::WHITE, 50);
-    break;
-  case ButtonEvent::RELEASE:
-    ESP_LOGI(TAG_BTN, "[%s] RELEASE (duration: %lu ms)", button_name,
-             state.press_duration_ms);
-    break;
-  case ButtonEvent::SHORT_PRESS:
-    ESP_LOGI(TAG_BTN, "[%s] SHORT_PRESS", button_name);
-    break;
-  case ButtonEvent::LONG_PRESS:
-    ESP_LOGI(TAG_BTN, "[%s] LONG_PRESS (duration: %lu ms)", button_name,
-             state.press_duration_ms);
-    break;
-  default:
-    break;
-  }
-
-  bool focus_event = (state.event == ButtonEvent::PRESS ||
-                      state.event == ButtonEvent::SHORT_PRESS ||
-                      state.event == ButtonEvent::LONG_PRESS);
-  if (focus_event) {
-    bool focus_changed = false;
-    const char *focus_label = nullptr;
-    if (state.id == ButtonID::BUTTON_LEFT) {
-      if (g_focus_tile != Display::FocusTile::CO2) {
-        g_focus_tile = Display::FocusTile::CO2;
-        focus_changed = true;
-        focus_label = "CO2";
-      }
-    } else if (state.id == ButtonID::BUTTON_MIDDLE) {
-      if (g_focus_tile != Display::FocusTile::PM25) {
-        g_focus_tile = Display::FocusTile::PM25;
-        focus_changed = true;
-        focus_label = "PM2.5";
-      }
-    }
-    if (focus_changed) {
-      g_focus_dirty = true;
-      ESP_LOGI(TAG_BTN, "Focus set to %s tile", focus_label);
-      
-      // Visual feedback: brief color flash based on focus
-      if (g_focus_tile == Display::FocusTile::CO2) {
-        led_flash(color::Colors::CYAN, 150);
-      } else if (g_focus_tile == Display::FocusTile::PM25) {
-        led_flash(color::Colors::ORANGE, 150);
-      }
-    }
-  }
-}
-
-static esp_err_t init_cap1203(i2c_master_bus_handle_t i2c_bus) {
-  static const char *TAG_BTN = "CAP1203";
-  if (i2c_bus == NULL) {
-    ESP_LOGE(TAG_BTN, "I2C bus handle is NULL");
-    return ESP_ERR_INVALID_ARG;
-  }
-
-  if (g_buttons) {
-    ESP_LOGW(TAG_BTN, "CAP1203 already initialized");
-    return ESP_OK;
-  }
-
-  g_buttons = new CAP1203(i2c_bus);
-  esp_err_t ret = g_buttons->init();
-  if (ret != ESP_OK) {
-    ESP_LOGE(TAG_BTN, "CAP1203 init failed: %s", esp_err_to_name(ret));
-    delete g_buttons;
-    g_buttons = nullptr;
-    return ret;
-  }
-
-  g_buttons->setButtonCallback(button_event_callback, NULL);
-  ESP_LOGI(TAG_BTN, "Button callback registered. Touch T1/T2/T3 to test!");
-
-  xTaskCreatePinnedToCore(
-      [](void *param) {
-        CAP1203 *buttons = (CAP1203 *)param;
-        while (true) {
-          buttons->processButtons();
-          vTaskDelay(pdMS_TO_TICKS(10)); // Poll every 10ms
-        }
-      },
-      "ButtonTask", 4096, g_buttons,
-      5, // Priority
-      NULL, tskNO_AFFINITY);
-
-  ESP_LOGI(TAG_BTN, "CAP1203 initialized successfully");
-  return ESP_OK;
-}
-
-// LVGL tick timer callback (increments LVGL internal tick counter)
-static void lv_tick_timer_cb(void *arg) { lv_tick_inc(LVGL_TICK_PERIOD_MS); }
-
-// Lock LVGL mutex (blocking)
-static bool lvgl_lock(int timeout_ms) {
-  const TickType_t timeout_ticks =
-      (timeout_ms < 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
-  return xSemaphoreTake(lvgl_mux, timeout_ticks) == pdTRUE;
-}
-
-// Unlock LVGL mutex
-static void lvgl_unlock(void) { xSemaphoreGive(lvgl_mux); }
-
-static void request_lvgl_refresh(void) {
-  g_lvgl_refresh_requested = true;
-  if (g_lvgl_task_handle) {
-    xTaskNotifyGive(g_lvgl_task_handle);
-  }
-}
-
-static void request_lvgl_refresh_urgent(void) {
-  g_lvgl_refresh_urgent = true;
-  if (g_lvgl_task_handle) {
-    xTaskNotifyGive(g_lvgl_task_handle);
-  }
-}
-
-// Shutdown sequence with visual feedback
-static void initiate_shutdown(void) {
-  static const char *TAG = "Shutdown";
-  ESP_LOGI(TAG, "========== SHUTDOWN SEQUENCE STARTED ==========");
-
-  // Phase 1: Stopping sensors
-  ESP_LOGI(TAG, "Phase 1: Stopping sensors...");
-  if (lvgl_lock(1000) && g_display) {
-    lv_obj_t *label = lv_label_create(lv_screen_active());
-    lv_label_set_text(label, "Shutting down...\n\nStopping sensors...");
-    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-    lvgl_unlock();
-  }
-  request_lvgl_refresh();
-  vTaskDelay(pdMS_TO_TICKS(800));
-
-  // TODO: Stop sensor tasks when implemented
-
-  // Phase 2: Stopping recording
-  ESP_LOGI(TAG, "Phase 2: Stopping recording...");
-  if (lvgl_lock(1000) && g_display) {
-    lv_obj_t *label = lv_label_create(lv_screen_active());
-    lv_label_set_text(label, "Shutting down...\n\nStopping recording...");
-    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-    lvgl_unlock();
-  }
-  request_lvgl_refresh();
-  vTaskDelay(pdMS_TO_TICKS(800));
-
-  // TODO: Stop recording when implemented
-
-  // Phase 3: Saving data
-  ESP_LOGI(TAG, "Phase 3: Saving data...");
-  if (lvgl_lock(1000) && g_display) {
-    lv_obj_t *label = lv_label_create(lv_screen_active());
-    lv_label_set_text(label, "Shutting down...\n\nSaving data...");
-    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-    lvgl_unlock();
-  }
-  request_lvgl_refresh();
-  vTaskDelay(pdMS_TO_TICKS(800));
-
-  // TODO: Save pending data to flash when implemented
-
-  // Phase 4: Powering off
-  ESP_LOGI(TAG, "Phase 4: Powering off...");
-  if (lvgl_lock(1000) && g_display) {
-    lv_obj_t *label = lv_label_create(lv_screen_active());
-    lv_label_set_text(label, "Powering off...\n\nGoodbye!");
-    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
-    lvgl_unlock();
-  }
-  request_lvgl_refresh();
-  vTaskDelay(pdMS_TO_TICKS(1000));
-
-  // Phase 5: Clear display (prevent ghosting)
-  ESP_LOGI(TAG, "Phase 5: Clearing display...");
-  if (g_epd) {
-    epd_clear(g_epd);
-    vTaskDelay(pdMS_TO_TICKS(100)); // Wait for clear to complete
-  }
-
-  // Phase 6: Enter ship mode
-  ESP_LOGI(TAG, "Phase 6: Entering ship mode...");
-  if (g_charger) {
-    g_charger->enter_ship_mode();
-    ESP_LOGI(TAG, "Ship mode command sent. System will power off shortly.");
-  } else {
-    ESP_LOGW(TAG, "Charger not initialized, cannot enter ship mode!");
-  }
-
-  // Wait for ship mode to take effect (system should power off)
-  // If we reach here, ship mode failed
-  ESP_LOGI(TAG, "Waiting for power off...");
-  vTaskDelay(pdMS_TO_TICKS(2000));
-
-  ESP_LOGE(TAG, "System did not power off! Ship mode may have failed.");
-  while (1) {
-    vTaskDelay(pdMS_TO_TICKS(1000));
-  }
-}
-
-// QON button monitor task
-static void qon_button_task(void *arg) {
-  static const char *TAG = "QON_Button";
-
-  uint64_t qon_press_start_ms = 0;
-  bool was_pressed = false;
-
-  ESP_LOGI(TAG, "QON button monitor started on GPIO%d", QON_PIN);
-  ESP_LOGI(TAG, "Hold for %d ms to initiate shutdown", SHUTDOWN_HOLD_MS);
-
-  while (1) {
-    // Active low (pressed = 0)
-    bool is_pressed = (gpio_get_level(QON_PIN) == 0);
-    uint64_t now_ms = esp_timer_get_time() / 1000;
-
-    if (is_pressed && !was_pressed) {
-      // Button just pressed
-      qon_press_start_ms = now_ms;
-      ESP_LOGI(TAG, "QON button pressed");
-    } else if (is_pressed && was_pressed && !shutdown_requested) {
-      // Button still held
-      uint64_t hold_duration_ms = now_ms - qon_press_start_ms;
-
-      if (hold_duration_ms >= SHUTDOWN_HOLD_MS) {
-        ESP_LOGI(TAG, "QON button held for %llu ms - SHUTDOWN!",
-                 hold_duration_ms);
-        shutdown_requested = true;
-        initiate_shutdown();
-      }
-    } else if (!is_pressed && was_pressed) {
-      // Button released
-      uint64_t hold_duration_ms = now_ms - qon_press_start_ms;
-      ESP_LOGI(TAG, "QON button released after %llu ms", hold_duration_ms);
-      qon_press_start_ms = 0;
-    }
-
-    was_pressed = is_pressed;
-    vTaskDelay(pdMS_TO_TICKS(50)); // Poll every 50ms
-  }
-}
-
-// LVGL handler task (processes display updates)
-static void lv_handler_task(void *arg) {
-  // Unsubscribe from watchdog - LVGL operations can take time
-  esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
-  
-  uint32_t task_delay_ms = LVGL_TASK_MAX_DELAY_MS;
-  uint64_t last_refresh_ms = 0;
-  while (1) {
-    bool do_refresh = false;
-    uint64_t now_ms = esp_timer_get_time() / 1000;
-    if (g_lvgl_refresh_urgent) {
-      g_lvgl_refresh_urgent = false;
-      g_lvgl_refresh_requested = false;
-      do_refresh = true;
-      last_refresh_ms = now_ms;
-    } else if (g_lvgl_refresh_requested) {
-      if (now_ms - last_refresh_ms >= LVGL_REFRESH_MIN_INTERVAL_MS) {
-        g_lvgl_refresh_requested = false;
-        do_refresh = true;
-        last_refresh_ms = now_ms;
-      }
-    }
-    if (lvgl_lock(-1)) {
-      task_delay_ms = lv_timer_handler();
-      if (do_refresh && g_disp) {
-        epd_lvgl_refresh(g_disp);
-      }
-      lvgl_unlock();
-    }
-    if (task_delay_ms > LVGL_TASK_MAX_DELAY_MS) {
-      task_delay_ms = LVGL_TASK_MAX_DELAY_MS;
-    } else if (task_delay_ms < LVGL_TASK_MIN_DELAY_MS) {
-      task_delay_ms = LVGL_TASK_MIN_DELAY_MS;
-    }
-    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(task_delay_ms));
-  }
-}
-
-static void display_task(void *arg) {
-  Display *display = static_cast<Display *>(arg);
-  DisplaySnapshot snapshot = {};
-  uint64_t last_sensor_update_ms = 0;
-  uint64_t last_display_refresh_ms = 0;
-  uint64_t last_ui_refresh_ms = 0;
-  bool sensor_initialized = false;
-  bool gps_initialized = false;
-  bool battery_initialized = false;
-  Display::GPSStatus last_gps_status = Display::GPSStatus::Off;
-  bool last_gps_time_valid = false;
-  int last_gps_hour = -1;
-  int last_gps_min = -1;
-  int last_battery_percent = -1;
-  bool last_battery_charging = false;
-
-  while (true) {
-    uint64_t now_ms_u = (uint64_t)(esp_timer_get_time() / 1000);
-    if (g_display_data_mux &&
-        xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) == pdTRUE) {
-      snapshot = g_display_snapshot;
-      xSemaphoreGive(g_display_data_mux);
-    }
-
-    bool request_refresh = false;
-    bool request_refresh_urgent = false;
-
-    if (lvgl_lock(100)) {
-      if (snapshot.sensor_valid &&
-          (!sensor_initialized ||
-           snapshot.sensor_update_ms != last_sensor_update_ms)) {
-        sensor_initialized = true;
-        last_sensor_update_ms = snapshot.sensor_update_ms;
-
-        if (snapshot.sensor.have_co2_avg) {
-          display->setCO2(snapshot.sensor.co2_ppm_avg);
-          display->setTempCf(snapshot.sensor.temp_c_avg);
-          display->setRHf(snapshot.sensor.rh_avg);
-        }
-        display->setPM25f(snapshot.sensor.pm25_mass);
-        display->setVOC(snapshot.sensor.voc_index);
-        display->setNOx(snapshot.sensor.nox_index);
-        
-        // Set pressure from sensor (convert Pa to hPa)
-        int pressure_hpa = (snapshot.sensor.pressure_pa > 0) ? 
-                          (int)(snapshot.sensor.pressure_pa / 100.0f) : 1013;
-        display->setPressure(pressure_hpa);
-
-        if (!last_display_refresh_ms) {
-          last_display_refresh_ms = now_ms_u;
-        }
-        request_refresh = true;
-      }
-
-      if (snapshot.battery_valid &&
-          (!battery_initialized ||
-           snapshot.battery_percent != last_battery_percent ||
-           snapshot.battery_charging != last_battery_charging)) {
-        battery_initialized = true;
-        last_battery_percent = snapshot.battery_percent;
-        last_battery_charging = snapshot.battery_charging;
-        display->setBattery(snapshot.battery_percent,
-                            snapshot.battery_charging);
-        request_refresh = true;
-      }
-
-      bool gps_changed =
-          !gps_initialized || snapshot.gps_status != last_gps_status ||
-          snapshot.gps_time_valid != last_gps_time_valid ||
-          (snapshot.gps_time_valid && (snapshot.gps_hour != last_gps_hour ||
-                                       snapshot.gps_min != last_gps_min));
-      if (gps_changed) {
-        gps_initialized = true;
-        last_gps_status = snapshot.gps_status;
-        last_gps_time_valid = snapshot.gps_time_valid;
-        last_gps_hour = snapshot.gps_hour;
-        last_gps_min = snapshot.gps_min;
-        display->setGPSStatus(snapshot.gps_status);
-        display->setTimeHM(snapshot.gps_hour, snapshot.gps_min,
-                           snapshot.gps_time_valid);
-        display->setLatLon(snapshot.gps_lat, snapshot.gps_lon,
-                           snapshot.gps_fix_valid);
-        request_refresh = true;
-      }
-
-      if (g_focus_dirty) {
-        display->setFocusTile(g_focus_tile);
-        g_focus_dirty = false;
-        request_refresh_urgent = true;
-        last_display_refresh_ms = now_ms_u;
-      }
-
-      display->update(now_ms_u);
-      lvgl_unlock();
-    }
-
-    if (now_ms_u - last_ui_refresh_ms >= kUiBlinkIntervalMs) {
-      last_ui_refresh_ms = now_ms_u;
-      request_refresh = true;
-    }
-
-    if (now_ms_u - last_display_refresh_ms >= kRecordingIntervalMs) {
-      last_display_refresh_ms = now_ms_u;
-      request_refresh = true;
-    }
-
-    if (request_refresh_urgent) {
-      request_lvgl_refresh_urgent();
-    } else if (request_refresh) {
-      request_lvgl_refresh();
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(50));
-  }
-}
+static const char *charge_status_to_string(drivers::ChargeStatus status);
+static int battery_percent_from_mv(uint16_t vbat_mv);
+static void led_show_aqi(uint16_t pm25_ugm3);
+static void led_show_battery(int battery_percent, bool charging);
+static void led_off();
+static void led_flash(const color::RGB& color, uint16_t duration_ms = 100);
+static void button_event_callback(ButtonState state, void *user_data);
+static esp_err_t init_cap1203(i2c_master_bus_handle_t i2c_bus);
+static void lv_tick_timer_cb(void *arg);
+static bool lvgl_lock(int timeout_ms);
+static void lvgl_unlock(void);
+static void request_lvgl_refresh(void);
+static void request_lvgl_refresh_urgent(void);
+static void initiate_shutdown(void);
+static void qon_button_task(void *arg);
+static void lv_handler_task(void *arg);
+static void display_task(void *arg);
 
 // Application entry point.
 // Phase 1.1: Dashboard display with real sensor data
@@ -1392,6 +886,530 @@ extern "C" void app_main(void) {
       } else {
         ESP_LOGW(TAG, "BQ25629 adc read failed: %s", esp_err_to_name(adc_ret));
       }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+}
+
+static const char *charge_status_to_string(drivers::ChargeStatus status) {
+  switch (status) {
+  case drivers::ChargeStatus::NOT_CHARGING:
+    return "NOT_CHARGING";
+  case drivers::ChargeStatus::TRICKLE_PRECHARGE_FASTCHARGE:
+    return "PRECHARGE_OR_FAST";
+  case drivers::ChargeStatus::TAPER_CHARGE:
+    return "TAPER";
+  case drivers::ChargeStatus::TOPOFF_TIMER_ACTIVE:
+    return "TOPOFF";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+static int battery_percent_from_mv(uint16_t vbat_mv) {
+  const int kMinMv = 3300;
+  const int kMaxMv = 4200;
+
+  if (vbat_mv <= kMinMv)
+    return 0;
+  if (vbat_mv >= kMaxMv)
+    return 100;
+
+  return (int)(((int)vbat_mv - kMinMv) * 100 / (kMaxMv - kMinMv));
+}
+
+// ==================== LED HELPER FUNCTIONS ====================
+
+// Show AQI status on LED ring
+static void led_show_aqi(uint16_t pm25_ugm3) {
+  if (g_led_driver == nullptr) return;
+  
+  color::RGB aqi_color = led_effects::aqi_to_color(pm25_ugm3);
+  g_led_driver->set_global_off(false);
+  
+  for (uint8_t i = 0; i < 12; i++) {
+    g_led_driver->set_led_brightness(i, 0xFF);
+    g_led_driver->set_led_color(i, aqi_color.r, aqi_color.g, aqi_color.b);
+  }
+}
+
+// Show battery status on LED ring (charging animation or battery level)
+static void led_show_battery(int battery_percent, bool charging) {
+  if (g_led_driver == nullptr) return;
+  
+  g_led_driver->set_global_off(false);
+  
+  if (charging) {
+    // Charging: breathing blue animation
+    uint32_t now_ms = esp_timer_get_time() / 1000;
+    float brightness = led_effects::breathing_effect(now_ms, 2000);
+    uint8_t brightness_8bit = static_cast<uint8_t>(brightness * 255);
+    
+    color::RGB blue = color::Colors::BLUE;
+    for (uint8_t i = 0; i < 12; i++) {
+      g_led_driver->set_led_brightness(i, brightness_8bit);
+      g_led_driver->set_led_color(i, blue.r, blue.g, blue.b);
+    }
+  } else {
+    // Battery level: progress bar (green/yellow/red based on level)
+    int lit_leds = (battery_percent * 12) / 100;
+    color::RGB color;
+    
+    if (battery_percent > 60) {
+      color = color::Colors::GREEN;
+    } else if (battery_percent > 20) {
+      color = color::Colors::YELLOW;
+    } else {
+      color = color::Colors::RED;
+    }
+    
+    for (uint8_t i = 0; i < 12; i++) {
+      if (i < lit_leds) {
+        g_led_driver->set_led_brightness(i, 0xFF);
+        g_led_driver->set_led_color(i, color.r, color.g, color.b);
+      } else {
+        g_led_driver->set_led_brightness(i, 0);
+      }
+    }
+  }
+}
+
+// Turn off all LEDs
+static void led_off() {
+  if (g_led_driver == nullptr) return;
+  g_led_driver->set_global_off(true);
+}
+
+// Brief notification flash (for button press, etc.)
+static void led_flash(const color::RGB& color, uint16_t duration_ms) {
+  if (g_led_driver == nullptr) return;
+  
+  g_led_driver->set_global_off(false);
+  for (uint8_t i = 0; i < 12; i++) {
+    g_led_driver->set_led_brightness(i, 0xFF);
+    g_led_driver->set_led_color(i, color.r, color.g, color.b);
+  }
+  vTaskDelay(pdMS_TO_TICKS(duration_ms));
+  g_led_driver->set_global_off(true);
+}
+
+// Button callback for CAP1203 (called when button events occur)
+static void button_event_callback(ButtonState state, void *user_data) {
+  static const char *TAG_BTN = "CAP1203";
+
+  const char *button_name = "UNKNOWN";
+  switch (state.id) {
+  case ButtonID::BUTTON_LEFT:
+    button_name = "T1 (Up)";
+    break;
+  case ButtonID::BUTTON_MIDDLE:
+    button_name = "T2 (Down)";
+    break;
+  case ButtonID::BUTTON_RIGHT:
+    button_name = "T3 (Middle)";
+    break;
+  default:
+    button_name = "NONE";
+    break;
+  }
+
+  switch (state.event) {
+  case ButtonEvent::PRESS:
+    ESP_LOGI(TAG_BTN, "[%s] PRESS", button_name);
+    // Visual feedback: quick white flash
+    led_flash(color::Colors::WHITE, 50);
+    break;
+  case ButtonEvent::RELEASE:
+    ESP_LOGI(TAG_BTN, "[%s] RELEASE (duration: %lu ms)", button_name,
+             state.press_duration_ms);
+    break;
+  case ButtonEvent::SHORT_PRESS:
+    ESP_LOGI(TAG_BTN, "[%s] SHORT_PRESS", button_name);
+    break;
+  case ButtonEvent::LONG_PRESS:
+    ESP_LOGI(TAG_BTN, "[%s] LONG_PRESS (duration: %lu ms)", button_name,
+             state.press_duration_ms);
+    break;
+  default:
+    break;
+  }
+
+  bool focus_event = (state.event == ButtonEvent::PRESS ||
+                      state.event == ButtonEvent::SHORT_PRESS ||
+                      state.event == ButtonEvent::LONG_PRESS);
+  if (focus_event) {
+    bool focus_changed = false;
+    const char *focus_label = nullptr;
+    if (state.id == ButtonID::BUTTON_LEFT) {
+      if (g_focus_tile != Display::FocusTile::CO2) {
+        g_focus_tile = Display::FocusTile::CO2;
+        focus_changed = true;
+        focus_label = "CO2";
+      }
+    } else if (state.id == ButtonID::BUTTON_MIDDLE) {
+      if (g_focus_tile != Display::FocusTile::PM25) {
+        g_focus_tile = Display::FocusTile::PM25;
+        focus_changed = true;
+        focus_label = "PM2.5";
+      }
+    }
+    if (focus_changed) {
+      g_focus_dirty = true;
+      ESP_LOGI(TAG_BTN, "Focus set to %s tile", focus_label);
+      
+      // Visual feedback: brief color flash based on focus
+      if (g_focus_tile == Display::FocusTile::CO2) {
+        led_flash(color::Colors::CYAN, 150);
+      } else if (g_focus_tile == Display::FocusTile::PM25) {
+        led_flash(color::Colors::ORANGE, 150);
+      }
+    }
+  }
+}
+
+static esp_err_t init_cap1203(i2c_master_bus_handle_t i2c_bus) {
+  static const char *TAG_BTN = "CAP1203";
+  if (i2c_bus == NULL) {
+    ESP_LOGE(TAG_BTN, "I2C bus handle is NULL");
+    return ESP_ERR_INVALID_ARG;
+  }
+
+  if (g_buttons) {
+    ESP_LOGW(TAG_BTN, "CAP1203 already initialized");
+    return ESP_OK;
+  }
+
+  g_buttons = new CAP1203(i2c_bus);
+  esp_err_t ret = g_buttons->init();
+  if (ret != ESP_OK) {
+    ESP_LOGE(TAG_BTN, "CAP1203 init failed: %s", esp_err_to_name(ret));
+    delete g_buttons;
+    g_buttons = nullptr;
+    return ret;
+  }
+
+  g_buttons->setButtonCallback(button_event_callback, NULL);
+  ESP_LOGI(TAG_BTN, "Button callback registered. Touch T1/T2/T3 to test!");
+
+  xTaskCreatePinnedToCore(
+      [](void *param) {
+        CAP1203 *buttons = (CAP1203 *)param;
+        while (true) {
+          buttons->processButtons();
+          vTaskDelay(pdMS_TO_TICKS(10)); // Poll every 10ms
+        }
+      },
+      "ButtonTask", 4096, g_buttons,
+      5, // Priority
+      NULL, tskNO_AFFINITY);
+
+  ESP_LOGI(TAG_BTN, "CAP1203 initialized successfully");
+  return ESP_OK;
+}
+
+// LVGL tick timer callback (increments LVGL internal tick counter)
+static void lv_tick_timer_cb(void *arg) { lv_tick_inc(LVGL_TICK_PERIOD_MS); }
+
+// Lock LVGL mutex (blocking)
+static bool lvgl_lock(int timeout_ms) {
+  const TickType_t timeout_ticks =
+      (timeout_ms < 0) ? portMAX_DELAY : pdMS_TO_TICKS(timeout_ms);
+  return xSemaphoreTake(lvgl_mux, timeout_ticks) == pdTRUE;
+}
+
+// Unlock LVGL mutex
+static void lvgl_unlock(void) { xSemaphoreGive(lvgl_mux); }
+
+static void request_lvgl_refresh(void) {
+  g_lvgl_refresh_requested = true;
+  if (g_lvgl_task_handle) {
+    xTaskNotifyGive(g_lvgl_task_handle);
+  }
+}
+
+static void request_lvgl_refresh_urgent(void) {
+  g_lvgl_refresh_urgent = true;
+  if (g_lvgl_task_handle) {
+    xTaskNotifyGive(g_lvgl_task_handle);
+  }
+}
+
+// Shutdown sequence with visual feedback
+static void initiate_shutdown(void) {
+  static const char *TAG = "Shutdown";
+  ESP_LOGI(TAG, "========== SHUTDOWN SEQUENCE STARTED ==========");
+
+  // Phase 1: Stopping sensors
+  ESP_LOGI(TAG, "Phase 1: Stopping sensors...");
+  if (lvgl_lock(1000) && g_display) {
+    lv_obj_t *label = lv_label_create(lv_screen_active());
+    lv_label_set_text(label, "Shutting down...\n\nStopping sensors...");
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lvgl_unlock();
+  }
+  request_lvgl_refresh();
+  vTaskDelay(pdMS_TO_TICKS(800));
+
+  // TODO: Stop sensor tasks when implemented
+
+  // Phase 2: Stopping recording
+  ESP_LOGI(TAG, "Phase 2: Stopping recording...");
+  if (lvgl_lock(1000) && g_display) {
+    lv_obj_t *label = lv_label_create(lv_screen_active());
+    lv_label_set_text(label, "Shutting down...\n\nStopping recording...");
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lvgl_unlock();
+  }
+  request_lvgl_refresh();
+  vTaskDelay(pdMS_TO_TICKS(800));
+
+  // TODO: Stop recording when implemented
+
+  // Phase 3: Saving data
+  ESP_LOGI(TAG, "Phase 3: Saving data...");
+  if (lvgl_lock(1000) && g_display) {
+    lv_obj_t *label = lv_label_create(lv_screen_active());
+    lv_label_set_text(label, "Shutting down...\n\nSaving data...");
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lvgl_unlock();
+  }
+  request_lvgl_refresh();
+  vTaskDelay(pdMS_TO_TICKS(800));
+
+  // TODO: Save pending data to flash when implemented
+
+  // Phase 4: Powering off
+  ESP_LOGI(TAG, "Phase 4: Powering off...");
+  if (lvgl_lock(1000) && g_display) {
+    lv_obj_t *label = lv_label_create(lv_screen_active());
+    lv_label_set_text(label, "Powering off...\n\nGoodbye!");
+    lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lvgl_unlock();
+  }
+  request_lvgl_refresh();
+  vTaskDelay(pdMS_TO_TICKS(1000));
+
+  // Phase 5: Clear display (prevent ghosting)
+  ESP_LOGI(TAG, "Phase 5: Clearing display...");
+  if (g_epd) {
+    epd_clear(g_epd);
+    vTaskDelay(pdMS_TO_TICKS(100)); // Wait for clear to complete
+  }
+
+  // Phase 6: Enter ship mode
+  ESP_LOGI(TAG, "Phase 6: Entering ship mode...");
+  if (g_charger) {
+    g_charger->enter_ship_mode();
+    ESP_LOGI(TAG, "Ship mode command sent. System will power off shortly.");
+  } else {
+    ESP_LOGW(TAG, "Charger not initialized, cannot enter ship mode!");
+  }
+
+  // Wait for ship mode to take effect (system should power off)
+  // If we reach here, ship mode failed
+  ESP_LOGI(TAG, "Waiting for power off...");
+  vTaskDelay(pdMS_TO_TICKS(2000));
+
+  ESP_LOGE(TAG, "System did not power off! Ship mode may have failed.");
+  while (1) {
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
+// QON button monitor task
+static void qon_button_task(void *arg) {
+  static const char *TAG = "QON_Button";
+
+  uint64_t qon_press_start_ms = 0;
+  bool was_pressed = false;
+
+  ESP_LOGI(TAG, "QON button monitor started on GPIO%d", QON_PIN);
+  ESP_LOGI(TAG, "Hold for %d ms to initiate shutdown", SHUTDOWN_HOLD_MS);
+
+  while (1) {
+    // Active low (pressed = 0)
+    bool is_pressed = (gpio_get_level(QON_PIN) == 0);
+    uint64_t now_ms = esp_timer_get_time() / 1000;
+
+    if (is_pressed && !was_pressed) {
+      // Button just pressed
+      qon_press_start_ms = now_ms;
+      ESP_LOGI(TAG, "QON button pressed");
+    } else if (is_pressed && was_pressed && !shutdown_requested) {
+      // Button still held
+      uint64_t hold_duration_ms = now_ms - qon_press_start_ms;
+
+      if (hold_duration_ms >= SHUTDOWN_HOLD_MS) {
+        ESP_LOGI(TAG, "QON button held for %llu ms - SHUTDOWN!",
+                 hold_duration_ms);
+        shutdown_requested = true;
+        initiate_shutdown();
+      }
+    } else if (!is_pressed && was_pressed) {
+      // Button released
+      uint64_t hold_duration_ms = now_ms - qon_press_start_ms;
+      ESP_LOGI(TAG, "QON button released after %llu ms", hold_duration_ms);
+      qon_press_start_ms = 0;
+    }
+
+    was_pressed = is_pressed;
+    vTaskDelay(pdMS_TO_TICKS(50)); // Poll every 50ms
+  }
+}
+
+// LVGL handler task (processes display updates)
+static void lv_handler_task(void *arg) {
+  // Unsubscribe from watchdog - LVGL operations can take time
+  esp_task_wdt_delete(xTaskGetCurrentTaskHandle());
+  
+  uint32_t task_delay_ms = LVGL_TASK_MAX_DELAY_MS;
+  uint64_t last_refresh_ms = 0;
+  while (1) {
+    bool do_refresh = false;
+    uint64_t now_ms = esp_timer_get_time() / 1000;
+    if (g_lvgl_refresh_urgent) {
+      g_lvgl_refresh_urgent = false;
+      g_lvgl_refresh_requested = false;
+      do_refresh = true;
+      last_refresh_ms = now_ms;
+    } else if (g_lvgl_refresh_requested) {
+      if (now_ms - last_refresh_ms >= LVGL_REFRESH_MIN_INTERVAL_MS) {
+        g_lvgl_refresh_requested = false;
+        do_refresh = true;
+        last_refresh_ms = now_ms;
+      }
+    }
+    if (lvgl_lock(-1)) {
+      task_delay_ms = lv_timer_handler();
+      if (do_refresh && g_disp) {
+        epd_lvgl_refresh(g_disp);
+      }
+      lvgl_unlock();
+    }
+    if (task_delay_ms > LVGL_TASK_MAX_DELAY_MS) {
+      task_delay_ms = LVGL_TASK_MAX_DELAY_MS;
+    } else if (task_delay_ms < LVGL_TASK_MIN_DELAY_MS) {
+      task_delay_ms = LVGL_TASK_MIN_DELAY_MS;
+    }
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(task_delay_ms));
+  }
+}
+
+static void display_task(void *arg) {
+  Display *display = static_cast<Display *>(arg);
+  DisplaySnapshot snapshot = {};
+  uint64_t last_sensor_update_ms = 0;
+  uint64_t last_display_refresh_ms = 0;
+  uint64_t last_ui_refresh_ms = 0;
+  bool sensor_initialized = false;
+  bool gps_initialized = false;
+  bool battery_initialized = false;
+  Display::GPSStatus last_gps_status = Display::GPSStatus::Off;
+  bool last_gps_time_valid = false;
+  int last_gps_hour = -1;
+  int last_gps_min = -1;
+  int last_battery_percent = -1;
+  bool last_battery_charging = false;
+
+  while (true) {
+    uint64_t now_ms_u = (uint64_t)(esp_timer_get_time() / 1000);
+    if (g_display_data_mux &&
+        xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) == pdTRUE) {
+      snapshot = g_display_snapshot;
+      xSemaphoreGive(g_display_data_mux);
+    }
+
+    bool request_refresh = false;
+    bool request_refresh_urgent = false;
+
+    if (lvgl_lock(100)) {
+      if (snapshot.sensor_valid &&
+          (!sensor_initialized ||
+           snapshot.sensor_update_ms != last_sensor_update_ms)) {
+        sensor_initialized = true;
+        last_sensor_update_ms = snapshot.sensor_update_ms;
+
+        if (snapshot.sensor.have_co2_avg) {
+          display->setCO2(snapshot.sensor.co2_ppm_avg);
+          display->setTempCf(snapshot.sensor.temp_c_avg);
+          display->setRHf(snapshot.sensor.rh_avg);
+        }
+        display->setPM25f(snapshot.sensor.pm25_mass);
+        display->setVOC(snapshot.sensor.voc_index);
+        display->setNOx(snapshot.sensor.nox_index);
+        
+        // Set pressure from sensor (convert Pa to hPa)
+        int pressure_hpa = (snapshot.sensor.pressure_pa > 0) ? 
+                          (int)(snapshot.sensor.pressure_pa / 100.0f) : 1013;
+        display->setPressure(pressure_hpa);
+
+        if (!last_display_refresh_ms) {
+          last_display_refresh_ms = now_ms_u;
+        }
+        request_refresh = true;
+      }
+
+      if (snapshot.battery_valid &&
+          (!battery_initialized ||
+           snapshot.battery_percent != last_battery_percent ||
+           snapshot.battery_charging != last_battery_charging)) {
+        battery_initialized = true;
+        last_battery_percent = snapshot.battery_percent;
+        last_battery_charging = snapshot.battery_charging;
+        display->setBattery(snapshot.battery_percent,
+                            snapshot.battery_charging);
+        request_refresh = true;
+      }
+
+      bool gps_changed =
+          !gps_initialized || snapshot.gps_status != last_gps_status ||
+          snapshot.gps_time_valid != last_gps_time_valid ||
+          (snapshot.gps_time_valid && (snapshot.gps_hour != last_gps_hour ||
+                                       snapshot.gps_min != last_gps_min));
+      if (gps_changed) {
+        gps_initialized = true;
+        last_gps_status = snapshot.gps_status;
+        last_gps_time_valid = snapshot.gps_time_valid;
+        last_gps_hour = snapshot.gps_hour;
+        last_gps_min = snapshot.gps_min;
+        display->setGPSStatus(snapshot.gps_status);
+        display->setTimeHM(snapshot.gps_hour, snapshot.gps_min,
+                           snapshot.gps_time_valid);
+        display->setLatLon(snapshot.gps_lat, snapshot.gps_lon,
+                           snapshot.gps_fix_valid);
+        request_refresh = true;
+      }
+
+      if (g_focus_dirty) {
+        display->setFocusTile(g_focus_tile);
+        g_focus_dirty = false;
+        request_refresh_urgent = true;
+        last_display_refresh_ms = now_ms_u;
+      }
+
+      display->update(now_ms_u);
+      lvgl_unlock();
+    }
+
+    if (now_ms_u - last_ui_refresh_ms >= kUiBlinkIntervalMs) {
+      last_ui_refresh_ms = now_ms_u;
+      request_refresh = true;
+    }
+
+    if (now_ms_u - last_display_refresh_ms >= kRecordingIntervalMs) {
+      last_display_refresh_ms = now_ms_u;
+      request_refresh = true;
+    }
+
+    if (request_refresh_urgent) {
+      request_lvgl_refresh_urgent();
+    } else if (request_refresh) {
+      request_lvgl_refresh();
     }
 
     vTaskDelay(pdMS_TO_TICKS(50));
