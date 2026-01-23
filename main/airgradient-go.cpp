@@ -301,7 +301,7 @@ extern "C" void app_main(void) {
   drivers::BQ25629_Config charger_cfg = {
       .charge_voltage_mv = 4200,      // 4.2V (full charge for Li-ion)
       .charge_current_ma = 500,       // 500mA charging
-      .input_current_limit_ma = 1500, // 1.5A input limit
+      .input_current_limit_ma = 500, // 500mA input limit
       .input_voltage_limit_mv = 4600, // 4.6V VINDPM (works with 5V input)
       .min_system_voltage_mv = 3520,  // 3.52V minimum
       .precharge_current_ma = 30,     // 30mA pre-charge
@@ -590,9 +590,16 @@ extern "C" void app_main(void) {
   const uint64_t POWER_PATH_CHECK_INTERVAL_MS = 250;
   const uint64_t VBUS_PRESENT_STABLE_MS = 1000;
   const uint64_t VBUS_ABSENT_STABLE_MS = 1000;
+  const uint64_t VBUS_HANDOVER_DELAY_MS = 1000;
+  const uint64_t VBUS_HANDOVER_LOG_INTERVAL_MS = 2000;
+  const uint16_t VBUS_OK_MV = 4300;
+  const uint16_t VSYS_OK_MV = 3500;
   uint64_t vbus_present_since_ms = 0;
   uint64_t vbus_absent_since_ms = 0;
   bool vbus_present_last = false;
+  bool vbus_handover_active = false;
+  uint64_t vbus_handover_start_ms = 0;
+  uint64_t vbus_handover_last_log_ms = 0;
   uint64_t last_wd_kick_ms = 0;
   const uint64_t WD_KICK_INTERVAL_MS = 10000; // Reset charger watchdog
   uint64_t last_hw_wd_kick_ms = 0;
@@ -769,6 +776,7 @@ extern "C" void app_main(void) {
       }
 
       if (vbus_absent_stable && !otg_active) {
+        vbus_handover_active = false;
         ESP_LOGI(TAG, "VBUS removed, enabling PMID 5V boost");
         esp_err_t boost_ret = g_charger->enable_pmid_5v_boost();
         if (boost_ret != ESP_OK) {
@@ -778,17 +786,56 @@ extern "C" void app_main(void) {
           boost_requested = true;
         }
       } else if (vbus_present_stable && (otg_active || boost_requested)) {
-        ESP_LOGI(TAG, "VBUS detected, disabling OTG and re-enabling charging");
-        esp_err_t otg_ret = g_charger->enable_otg(false);
-        if (otg_ret != ESP_OK) {
-          ESP_LOGW(TAG, "Failed to disable OTG: %s", esp_err_to_name(otg_ret));
+        if (!vbus_handover_active) {
+          vbus_handover_active = true;
+          vbus_handover_start_ms = now_ms_u;
+          vbus_handover_last_log_ms = 0;
+          ESP_LOGI(TAG, "VBUS stable, starting OTG->charge handover");
+          esp_err_t chg_ret = g_charger->enable_charging(true);
+          if (chg_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to enable charging: %s",
+                     esp_err_to_name(chg_ret));
+          }
         }
-        esp_err_t chg_ret = g_charger->enable_charging(true);
-        if (chg_ret != ESP_OK) {
-          ESP_LOGW(TAG, "Failed to enable charging: %s",
-                   esp_err_to_name(chg_ret));
+
+        if (now_ms_u - vbus_handover_start_ms >= VBUS_HANDOVER_DELAY_MS) {
+          drivers::BQ25629_ADC_Data adc_data = {};
+          esp_err_t adc_ret = g_charger->read_adc(adc_data);
+          if (adc_ret == ESP_OK) {
+            bool vbus_ok = adc_data.vbus_mv >= VBUS_OK_MV;
+            bool vsys_ok = adc_data.vsys_mv >= VSYS_OK_MV;
+            if (vbus_ok && vsys_ok) {
+              ESP_LOGI(TAG, "VBUS/VSYS stable, disabling OTG boost");
+              esp_err_t otg_ret = g_charger->enable_otg(false);
+              if (otg_ret != ESP_OK) {
+                ESP_LOGW(TAG, "Failed to disable OTG: %s",
+                         esp_err_to_name(otg_ret));
+              } else {
+                boost_requested = false;
+                vbus_handover_active = false;
+                esp_err_t chg_ret = g_charger->enable_charging(true);
+                if (chg_ret != ESP_OK) {
+                  ESP_LOGW(TAG, "Failed to enable charging: %s",
+                           esp_err_to_name(chg_ret));
+                }
+              }
+            } else if (now_ms_u - vbus_handover_last_log_ms >=
+                       VBUS_HANDOVER_LOG_INTERVAL_MS) {
+              vbus_handover_last_log_ms = now_ms_u;
+              ESP_LOGW(TAG,
+                       "VBUS handover waiting: VBUS=%u mV VSYS=%u mV "
+                       "(keeping boost)",
+                       adc_data.vbus_mv, adc_data.vsys_mv);
+            }
+          } else if (now_ms_u - vbus_handover_last_log_ms >=
+                     VBUS_HANDOVER_LOG_INTERVAL_MS) {
+            vbus_handover_last_log_ms = now_ms_u;
+            ESP_LOGW(TAG, "VBUS handover ADC read failed: %s",
+                     esp_err_to_name(adc_ret));
+          }
         }
-        boost_requested = false;
+      } else {
+        vbus_handover_active = false;
       }
     }
 
