@@ -16,6 +16,12 @@
 static const char* TAG = "gps";
 static const bool kLogRawNmea = true;
 
+// TAU1113 antenna configuration
+// Note: ANT_BIAS GPIO may need hardware-specific configuration
+// For now, this is a placeholder. Update with actual GPIO if hardware supports it.
+static constexpr gpio_num_t kAntBiasPin = GPIO_NUM_NC;  // Not Connected - update if needed
+static constexpr bool kAntBiasHasHardwareControl = false;  // Set true if GPIO is available
+
 static bool contains_token(const char* data, size_t len, const char* token) {
     if (!data || !token) {
         return false;
@@ -52,6 +58,7 @@ static float position_to_decimal(const nmea_position* pos) {
 
 GPS::GPS()
     : initialized_(false)
+    , antenna_type_(AntennaType::Passive)  // Default to passive antenna
     , fix_valid_(false)
     , fix_quality_(0)
     , satellites_(0)
@@ -122,7 +129,65 @@ esp_err_t GPS::init() {
     initialized_ = true;
     ESP_LOGI(TAG, "GPS UART initialized (baud=%d, TX=%d, RX=%d)",
              kGpsBaud, (int)kGpsTxPin, (int)kGpsRxPin);
+    ESP_LOGI(TAG, "Antenna mode: %s (ANT_BIAS: %s)",
+             antenna_type_ == AntennaType::Passive ? "PASSIVE" : "ACTIVE",
+             antenna_type_ == AntennaType::Active ? "enabled" : "disabled");
     return ESP_OK;
+}
+
+esp_err_t GPS::set_antenna_type(AntennaType type) {
+    if (!initialized_) {
+        ESP_LOGE(TAG, "GPS not initialized, call init() first");
+        return ESP_ERR_INVALID_STATE;
+    }
+
+    antenna_type_ = type;
+
+    if (type == AntennaType::Active) {
+        ESP_LOGI(TAG, "Configuring ACTIVE antenna (with ANT_BIAS)");
+        
+        // If hardware supports ANT_BIAS control via GPIO
+        if (kAntBiasHasHardwareControl && kAntBiasPin != GPIO_NUM_NC) {
+            // Configure ANT_BIAS pin as output
+            gpio_config_t ant_cfg = {
+                .pin_bit_mask = (1ULL << kAntBiasPin),
+                .mode = GPIO_MODE_OUTPUT,
+                .pull_up_en = GPIO_PULLUP_DISABLE,
+                .pull_down_en = GPIO_PULLDOWN_DISABLE,
+                .intr_type = GPIO_INTR_DISABLE,
+            };
+            esp_err_t ret = gpio_config(&ant_cfg);
+            if (ret != ESP_OK) {
+                ESP_LOGE(TAG, "Failed to configure ANT_BIAS GPIO: %s", esp_err_to_name(ret));
+                return ret;
+            }
+            
+            // Enable ANT_BIAS (active high)
+            gpio_set_level(kAntBiasPin, 1);
+            ESP_LOGI(TAG, "ANT_BIAS enabled on GPIO%d (max 25 mA)", (int)kAntBiasPin);
+            ESP_LOGI(TAG, "Active antenna status detection enabled (ANT_OK/ANT_OPEN/ANT_SHORT)");
+        } else {
+            ESP_LOGW(TAG, "Active antenna mode set, but hardware control not available");
+            ESP_LOGW(TAG, "ANT_BIAS control must be handled externally or via hardware jumper");
+        }
+    } else {
+        ESP_LOGI(TAG, "Configuring PASSIVE antenna (no ANT_BIAS)");
+        
+        // Disable ANT_BIAS if hardware control is available
+        if (kAntBiasHasHardwareControl && kAntBiasPin != GPIO_NUM_NC) {
+            gpio_set_level(kAntBiasPin, 0);
+            ESP_LOGI(TAG, "ANT_BIAS disabled on GPIO%d", (int)kAntBiasPin);
+        }
+        
+        ESP_LOGI(TAG, "Using built-in LNA with internal bias");
+        ESP_LOGI(TAG, "Suitable for patch antenna, whip antenna, or short cable");
+    }
+
+    return ESP_OK;
+}
+
+GPS::AntennaType GPS::get_antenna_type() const {
+    return antenna_type_;
 }
 
 void GPS::update(uint64_t now_ms) {
@@ -357,32 +422,66 @@ void GPS::log_status(uint64_t now_ms, uint64_t sentence_timeout_ms, uint64_t fix
     if (ant == AntennaStatus::Ok) ant_str = "OK";
     else if (ant == AntennaStatus::Open) ant_str = "OPEN";
     else if (ant == AntennaStatus::Short) ant_str = "SHORT";
+    
+    // Antenna mode string (only show status for active antenna)
+    const char* ant_mode = antenna_type_ == AntennaType::Passive ? "PASSIVE" : "ACTIVE";
+    bool show_ant_status = (antenna_type_ == AntennaType::Active);
 
     if (time_valid) {
         if (has_fix) {
-            ESP_LOGI(TAG,
-                     "GPS status=%s fix_q=%d sats=%d time=%02d:%02d ant=%s "
-                     "lat=%.5f lon=%.5f",
-                     status_str, fix_quality_, satellites_, hour, min, ant_str,
-                     lat_deg_, lon_deg_);
+            if (show_ant_status) {
+                ESP_LOGI(TAG,
+                         "GPS status=%s fix_q=%d sats=%d time=%02d:%02d ant=%s(%s) "
+                         "lat=%.5f lon=%.5f",
+                         status_str, fix_quality_, satellites_, hour, min, ant_mode, ant_str,
+                         lat_deg_, lon_deg_);
+            } else {
+                ESP_LOGI(TAG,
+                         "GPS status=%s fix_q=%d sats=%d time=%02d:%02d ant=%s "
+                         "lat=%.5f lon=%.5f",
+                         status_str, fix_quality_, satellites_, hour, min, ant_mode,
+                         lat_deg_, lon_deg_);
+            }
         } else {
-            ESP_LOGI(TAG,
-                     "GPS status=%s fix_q=%d sats=%d time=%02d:%02d ant=%s "
-                     "lat=-- lon=--",
-                     status_str, fix_quality_, satellites_, hour, min, ant_str);
+            if (show_ant_status) {
+                ESP_LOGI(TAG,
+                         "GPS status=%s fix_q=%d sats=%d time=%02d:%02d ant=%s(%s) "
+                         "lat=-- lon=--",
+                         status_str, fix_quality_, satellites_, hour, min, ant_mode, ant_str);
+            } else {
+                ESP_LOGI(TAG,
+                         "GPS status=%s fix_q=%d sats=%d time=%02d:%02d ant=%s "
+                         "lat=-- lon=--",
+                         status_str, fix_quality_, satellites_, hour, min, ant_mode);
+            }
         }
     } else {
         if (has_fix) {
-            ESP_LOGI(TAG,
-                     "GPS status=%s fix_q=%d sats=%d time=--:-- ant=%s "
-                     "lat=%.5f lon=%.5f",
-                     status_str, fix_quality_, satellites_, ant_str, lat_deg_,
-                     lon_deg_);
+            if (show_ant_status) {
+                ESP_LOGI(TAG,
+                         "GPS status=%s fix_q=%d sats=%d time=--:-- ant=%s(%s) "
+                         "lat=%.5f lon=%.5f",
+                         status_str, fix_quality_, satellites_, ant_mode, ant_str,
+                         lat_deg_, lon_deg_);
+            } else {
+                ESP_LOGI(TAG,
+                         "GPS status=%s fix_q=%d sats=%d time=--:-- ant=%s "
+                         "lat=%.5f lon=%.5f",
+                         status_str, fix_quality_, satellites_, ant_mode,
+                         lat_deg_, lon_deg_);
+            }
         } else {
-            ESP_LOGI(TAG,
-                     "GPS status=%s fix_q=%d sats=%d time=--:-- ant=%s "
-                     "lat=-- lon=--",
-                     status_str, fix_quality_, satellites_, ant_str);
+            if (show_ant_status) {
+                ESP_LOGI(TAG,
+                         "GPS status=%s fix_q=%d sats=%d time=--:-- ant=%s(%s) "
+                         "lat=-- lon=--",
+                         status_str, fix_quality_, satellites_, ant_mode, ant_str);
+            } else {
+                ESP_LOGI(TAG,
+                         "GPS status=%s fix_q=%d sats=%d time=--:-- ant=%s "
+                         "lat=-- lon=--",
+                         status_str, fix_quality_, satellites_, ant_mode);
+            }
         }
     }
 }

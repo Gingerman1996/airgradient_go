@@ -24,6 +24,7 @@ idf_component_register(
         "dps368"
         "lis2dh12"
         "lp5036"
+        "nvs_flash"
 )
 
 # Optimize for size (OTA partition is 1 MB)

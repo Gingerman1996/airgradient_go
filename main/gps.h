@@ -11,6 +11,27 @@
 
 class GPS {
 public:
+    /**
+     * @brief Antenna type configuration
+     * 
+     * Passive: Uses built-in LNA with internal bias
+     *   - For patch antenna on PCB, whip antenna, or short cable
+     *   - No external power needed (ANT_BIAS disabled)
+     *   - RF_IN connected directly with 50Ω matching
+     *   - No 82 nH inductor required
+     * 
+     * Active: Uses external LNA in antenna with ANT_BIAS power
+     *   - For long cable runs, poor signal environments, or enclosed installations
+     *   - Requires ANT_BIAS enable (up to 25 mA)
+     *   - Supports short/open circuit detection (ANT_OK/ANT_OPEN/ANT_SHORT)
+     *   - More stable in difficult RF conditions
+     */
+    enum class AntennaType { Passive, Active };
+    
+    /**
+     * @brief Antenna status reported by GPS module
+     * Only valid when AntennaType::Active is configured
+     */
     enum class AntennaStatus { Unknown, Ok, Open, Short };
 
     GPS();
@@ -18,6 +39,22 @@ public:
 
     // Initialize UART for NMEA input. Returns ESP_OK on success.
     esp_err_t init();
+
+    /**
+     * @brief Configure antenna type and enable/disable ANT_BIAS
+     * @param type Passive (default, no external power) or Active (with ANT_BIAS)
+     * @return ESP_OK on success
+     * 
+     * Must be called after init() if Active antenna is desired.
+     * Default is Passive antenna.
+     */
+    esp_err_t set_antenna_type(AntennaType type);
+    
+    /**
+     * @brief Get current antenna type configuration
+     * @return Current antenna type
+     */
+    AntennaType get_antenna_type() const;
 
     // Read and parse NMEA data (non-blocking). Call periodically.
     void update(uint64_t now_ms);
@@ -49,6 +86,7 @@ private:
     void update_time_from_tm(const struct tm* timeinfo, uint64_t now_ms);
 
     bool initialized_;
+    AntennaType antenna_type_;  // Passive or Active antenna configuration
     bool fix_valid_;
     int fix_quality_;
     int satellites_;

@@ -13,6 +13,8 @@
 #include "esp_log.h"
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
+#include "nvs_flash.h"
+#include "nvs.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
@@ -63,6 +65,16 @@ static const uint16_t kBatteryEmptyMv = 3300;
 static const uint16_t kBatteryFullMv = 4200;
 static const int16_t kBatteryRelaxedCurrentMa = 50;
 
+// Global battery SOC state for persistence across restarts and shutdown
+struct BatterySOCState {
+  float soc_pct = 0.0f;
+  uint16_t last_vbat_mv = 0;
+  bool initialized = false;
+  SemaphoreHandle_t mutex = nullptr;
+};
+
+static BatterySOCState g_battery_soc = {};
+
 struct DisplaySnapshot {
   sensor_values_t sensor = {};
   bool sensor_valid = false;
@@ -84,6 +96,9 @@ static DisplaySnapshot g_display_snapshot = {};
 static const char *charge_status_to_string(drivers::ChargeStatus status);
 static int battery_percent_from_mv(uint16_t vbat_mv);
 static int battery_percent_from_soc(float soc_pct);
+static esp_err_t battery_soc_nvs_init(void);
+static esp_err_t battery_soc_nvs_load(float *soc_pct, uint16_t *last_vbat_mv);
+static esp_err_t battery_soc_nvs_save(float soc_pct, uint16_t vbat_mv);
 static void led_show_aqi(uint16_t pm25_ugm3);
 static void led_show_battery(int battery_percent, bool charging);
 static void led_off();
@@ -108,6 +123,24 @@ extern "C" void app_main(void) {
 
   ESP_LOGI(TAG, "=== AirGradient GO - Phase 1.1 ===");
   ESP_LOGI(TAG, "Initializing display and sensors...");
+
+  // ==================== NVS INITIALIZATION ====================
+  
+  // Initialize NVS for battery SOC persistence
+  esp_err_t nvs_ret = battery_soc_nvs_init();
+  if (nvs_ret != ESP_OK) {
+    ESP_LOGW(TAG, "NVS init failed: %s (battery SOC persistence disabled)", 
+             esp_err_to_name(nvs_ret));
+  } else {
+    ESP_LOGI(TAG, "NVS initialized for battery SOC storage");
+  }
+
+  // Create battery SOC mutex
+  g_battery_soc.mutex = xSemaphoreCreateMutex();
+  if (g_battery_soc.mutex == NULL) {
+    ESP_LOGE(TAG, "Failed to create battery SOC mutex");
+    return;
+  }
 
   xTaskCreatePinnedToCore(
       [](void *param) {
@@ -616,9 +649,9 @@ extern "C" void app_main(void) {
   bool vbus_stable_last = false;
   const int64_t SPS30_READ_STALE_MS = 3000;
   const uint16_t PMID_LOW_MV = 4000;
-  float battery_soc_pct = 0.0f;
-  bool battery_soc_initialized = false;
   uint64_t last_battery_soc_ms = 0;
+  uint64_t last_battery_soc_save_ms = 0;
+  const uint64_t BATTERY_SOC_SAVE_INTERVAL_MS = 60000; // Save to NVS every 60s
   bool battery_charging = false;
   bool battery_charging_valid = false;
   drivers::ChargeStatus last_charge_status = drivers::ChargeStatus::NOT_CHARGING;
@@ -936,50 +969,120 @@ extern "C" void app_main(void) {
             "BQ25629 adc - VPMID: %u mV, VBAT: %u mV, VSYS: %u mV, VBUS: %u mV, IBAT: %d mA, IBUS: %d mA",
             adc_data.vpmid_mv, adc_data.vbat_mv, adc_data.vsys_mv,
             adc_data.vbus_mv, adc_data.ibat_ma, adc_data.ibus_ma);
-        if (!battery_soc_initialized) {
-          battery_soc_pct = (float)battery_percent_from_mv(adc_data.vbat_mv);
-          battery_soc_initialized = true;
+        if (!g_battery_soc.initialized && g_battery_soc.mutex &&
+            xSemaphoreTake(g_battery_soc.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          // Try to load SOC from NVS first
+          float nvs_soc_pct = 0.0f;
+          uint16_t nvs_vbat_mv = 0;
+          esp_err_t nvs_err = battery_soc_nvs_load(&nvs_soc_pct, &nvs_vbat_mv);
+          
+          if (nvs_err == ESP_OK && nvs_vbat_mv > 0) {
+            // Calculate voltage difference
+            int16_t vbat_diff_mv = (int16_t)adc_data.vbat_mv - (int16_t)nvs_vbat_mv;
+            ESP_LOGI(TAG, "Battery SOC loaded from NVS: %.1f%% (saved at %u mV, current %u mV, diff %d mV)",
+                     nvs_soc_pct, nvs_vbat_mv, adc_data.vbat_mv, vbat_diff_mv);
+            
+            // If voltage difference is small (<100mV), trust the saved SOC
+            if (vbat_diff_mv >= -100 && vbat_diff_mv <= 100) {
+              g_battery_soc.soc_pct = nvs_soc_pct;
+              ESP_LOGI(TAG, "Using saved SOC (voltage stable)");
+            } else if (vbat_diff_mv > 100) {
+              // Voltage increased significantly - battery was charged
+              // Estimate SOC increase based on voltage change
+              float soc_from_voltage = (float)battery_percent_from_mv(adc_data.vbat_mv);
+              g_battery_soc.soc_pct = (nvs_soc_pct + soc_from_voltage) / 2.0f;
+              ESP_LOGI(TAG, "Voltage increased - estimating SOC: %.1f%% (blend of saved and voltage-based)",
+                       g_battery_soc.soc_pct);
+            } else {
+              // Voltage decreased significantly - battery self-discharged or measurement error
+              g_battery_soc.soc_pct = nvs_soc_pct - 2.0f; // Conservative 2% penalty
+              if (g_battery_soc.soc_pct < 0.0f) g_battery_soc.soc_pct = 0.0f;
+              ESP_LOGI(TAG, "Voltage decreased - applying 2%% penalty: %.1f%%", g_battery_soc.soc_pct);
+            }
+          } else {
+            // No saved SOC, calculate from voltage
+            g_battery_soc.soc_pct = (float)battery_percent_from_mv(adc_data.vbat_mv);
+            ESP_LOGI(TAG, "No saved SOC in NVS - initializing from voltage: %.1f%%", g_battery_soc.soc_pct);
+          }
+          
+          g_battery_soc.last_vbat_mv = adc_data.vbat_mv;
+          g_battery_soc.initialized = true;
           last_battery_soc_ms = now_ms_u;
-        } else if (last_battery_soc_ms > 0) {
+          last_battery_soc_save_ms = now_ms_u;
+          xSemaphoreGive(g_battery_soc.mutex);
+        } else if (last_battery_soc_ms > 0 && g_battery_soc.mutex &&
+                   xSemaphoreTake(g_battery_soc.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           uint64_t dt_ms = now_ms_u - last_battery_soc_ms;
           last_battery_soc_ms = now_ms_u;
           float delta_pct =
               ((float)adc_data.ibat_ma * (float)dt_ms * 100.0f) /
               (kBatteryCapacityMah * 3600000.0f);
-          battery_soc_pct += delta_pct;
+          g_battery_soc.soc_pct += delta_pct;
+          g_battery_soc.last_vbat_mv = adc_data.vbat_mv;
+          xSemaphoreGive(g_battery_soc.mutex);
         } else {
           last_battery_soc_ms = now_ms_u;
         }
 
-        if (battery_soc_initialized) {
+        if (g_battery_soc.initialized && g_battery_soc.mutex &&
+            xSemaphoreTake(g_battery_soc.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
           int16_t ibat_abs = adc_data.ibat_ma < 0 ? (int16_t)-adc_data.ibat_ma
                                                  : adc_data.ibat_ma;
           if (charge_status_valid &&
               last_charge_status ==
                   drivers::ChargeStatus::TOPOFF_TIMER_ACTIVE) {
-            battery_soc_pct = 100.0f;
+            g_battery_soc.soc_pct = 100.0f;
           } else if (charge_status_valid &&
                      last_charge_status ==
                          drivers::ChargeStatus::TAPER_CHARGE &&
                      adc_data.vbat_mv >= (kBatteryFullMv - 10) &&
                      ibat_abs <= kBatteryRelaxedCurrentMa) {
-            battery_soc_pct = 100.0f;
+            g_battery_soc.soc_pct = 100.0f;
           } else if (battery_charging_valid && !battery_charging &&
                      adc_data.vbat_mv <= kBatteryEmptyMv) {
-            battery_soc_pct = 0.0f;
+            g_battery_soc.soc_pct = 0.0f;
           }
-          if (battery_soc_pct < 0.0f)
-            battery_soc_pct = 0.0f;
-          if (battery_soc_pct > 100.0f)
-            battery_soc_pct = 100.0f;
+          if (g_battery_soc.soc_pct < 0.0f)
+            g_battery_soc.soc_pct = 0.0f;
+          if (g_battery_soc.soc_pct > 100.0f)
+            g_battery_soc.soc_pct = 100.0f;
+          g_battery_soc.last_vbat_mv = adc_data.vbat_mv;
+          xSemaphoreGive(g_battery_soc.mutex);
         }
 
-        int battery_percent = battery_percent_from_soc(battery_soc_pct);
+        // Update display snapshot
+        int battery_percent = 0;
+        if (g_battery_soc.mutex &&
+            xSemaphoreTake(g_battery_soc.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          battery_percent = battery_percent_from_soc(g_battery_soc.soc_pct);
+          xSemaphoreGive(g_battery_soc.mutex);
+        }
+        
         if (g_display_data_mux &&
             xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) == pdTRUE) {
           g_display_snapshot.battery_percent = battery_percent;
-          g_display_snapshot.battery_valid = battery_soc_initialized;
+          g_display_snapshot.battery_valid = g_battery_soc.initialized;
           xSemaphoreGive(g_display_data_mux);
+        }
+        
+        // Periodically save SOC to NVS
+        if (g_battery_soc.initialized && 
+            (now_ms_u - last_battery_soc_save_ms) >= BATTERY_SOC_SAVE_INTERVAL_MS &&
+            g_battery_soc.mutex &&
+            xSemaphoreTake(g_battery_soc.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          float soc_to_save = g_battery_soc.soc_pct;
+          uint16_t vbat_to_save = g_battery_soc.last_vbat_mv;
+          xSemaphoreGive(g_battery_soc.mutex);
+          
+          last_battery_soc_save_ms = now_ms_u;
+          esp_err_t save_err = battery_soc_nvs_save(soc_to_save, vbat_to_save);
+          if (save_err == ESP_OK) {
+            ESP_LOGD(TAG, "Battery SOC saved to NVS: %.1f%% at %u mV", 
+                     soc_to_save, vbat_to_save);
+          } else {
+            ESP_LOGW(TAG, "Failed to save battery SOC to NVS: %s", 
+                     esp_err_to_name(save_err));
+          }
         }
         if (adc_data.vpmid_mv < 4000) {
           ESP_LOGW(TAG, "PMID low: %u mV (VBAT: %u mV)", adc_data.vpmid_mv,
@@ -1025,6 +1128,93 @@ static int battery_percent_from_soc(float soc_pct) {
   if (soc_pct > 100.0f)
     soc_pct = 100.0f;
   return (int)(soc_pct + 0.5f);
+}
+
+// ==================== NVS BATTERY SOC FUNCTIONS ====================
+
+static const char *TAG_NVS = "BatterySOC_NVS";
+
+/**
+ * @brief Initialize NVS for battery SOC storage
+ * @return ESP_OK on success
+ */
+static esp_err_t battery_soc_nvs_init(void) {
+  esp_err_t err = nvs_flash_init();
+  if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+    ESP_LOGW(TAG_NVS, "NVS partition was truncated, erasing...");
+    ESP_ERROR_CHECK(nvs_flash_erase());
+    err = nvs_flash_init();
+  }
+  return err;
+}
+
+/**
+ * @brief Load battery SOC from NVS
+ * @param soc_pct Output pointer for SOC percentage (0.0-100.0)
+ * @param last_vbat_mv Output pointer for last saved VBAT voltage in mV
+ * @return ESP_OK if loaded successfully, ESP_ERR_NVS_NOT_FOUND if no saved data
+ */
+static esp_err_t battery_soc_nvs_load(float *soc_pct, uint16_t *last_vbat_mv) {
+  if (!soc_pct || !last_vbat_mv) {
+    return ESP_ERR_INVALID_ARG;
+  }
+  
+  nvs_handle_t nvs_handle;
+  esp_err_t err = nvs_open("battery", NVS_READONLY, &nvs_handle);
+  if (err != ESP_OK) {
+    return err;
+  }
+  
+  // Load SOC as float (stored as blob for precision)
+  size_t soc_size = sizeof(float);
+  err = nvs_get_blob(nvs_handle, "soc_pct", soc_pct, &soc_size);
+  if (err != ESP_OK) {
+    nvs_close(nvs_handle);
+    return err;
+  }
+  
+  // Load last VBAT voltage
+  err = nvs_get_u16(nvs_handle, "vbat_mv", last_vbat_mv);
+  if (err != ESP_OK) {
+    nvs_close(nvs_handle);
+    return err;
+  }
+  
+  nvs_close(nvs_handle);
+  return ESP_OK;
+}
+
+/**
+ * @brief Save battery SOC to NVS
+ * @param soc_pct SOC percentage (0.0-100.0) to save
+ * @param vbat_mv Current VBAT voltage in mV
+ * @return ESP_OK on success
+ */
+static esp_err_t battery_soc_nvs_save(float soc_pct, uint16_t vbat_mv) {
+  nvs_handle_t nvs_handle;
+  esp_err_t err = nvs_open("battery", NVS_READWRITE, &nvs_handle);
+  if (err != ESP_OK) {
+    return err;
+  }
+  
+  // Save SOC as blob for float precision
+  err = nvs_set_blob(nvs_handle, "soc_pct", &soc_pct, sizeof(float));
+  if (err != ESP_OK) {
+    nvs_close(nvs_handle);
+    return err;
+  }
+  
+  // Save VBAT voltage
+  err = nvs_set_u16(nvs_handle, "vbat_mv", vbat_mv);
+  if (err != ESP_OK) {
+    nvs_close(nvs_handle);
+    return err;
+  }
+  
+  // Commit changes
+  err = nvs_commit(nvs_handle);
+  nvs_close(nvs_handle);
+  return err;
 }
 
 // ==================== LED HELPER FUNCTIONS ====================
@@ -1287,6 +1477,23 @@ static void initiate_shutdown(void) {
   }
   request_lvgl_refresh();
   vTaskDelay(pdMS_TO_TICKS(800));
+
+  // Save battery SOC to NVS
+  if (g_battery_soc.initialized && g_battery_soc.mutex &&
+      xSemaphoreTake(g_battery_soc.mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+    float soc_to_save = g_battery_soc.soc_pct;
+    uint16_t vbat_to_save = g_battery_soc.last_vbat_mv;
+    xSemaphoreGive(g_battery_soc.mutex);
+    
+    esp_err_t save_err = battery_soc_nvs_save(soc_to_save, vbat_to_save);
+    if (save_err == ESP_OK) {
+      ESP_LOGI(TAG, "Battery SOC saved to NVS on shutdown: %.1f%% at %u mV", 
+               soc_to_save, vbat_to_save);
+    } else {
+      ESP_LOGW(TAG, "Failed to save battery SOC on shutdown: %s", 
+               esp_err_to_name(save_err));
+    }
+  }
 
   // TODO: Save pending data to flash when implemented
 
