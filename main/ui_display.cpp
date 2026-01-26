@@ -238,7 +238,7 @@ bool Display::init(uint16_t w, uint16_t h) {
   state->rec_label = lv_label_create(state->root);
   lv_label_set_text(state->rec_label, "");
   lv_obj_set_style_text_color(state->rec_label, lv_color_black(), 0);
-  lv_obj_set_style_text_font(state->rec_label, &lv_font_montserrat_16, 0);
+  lv_obj_set_style_text_font(state->rec_label, &lv_font_montserrat_12, 0);
   lv_obj_align(state->rec_label, LV_ALIGN_BOTTOM_LEFT, 35, -20);
 
   state->time_label = lv_label_create(state->root);

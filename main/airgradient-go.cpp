@@ -604,6 +604,14 @@ extern "C" void app_main(void) {
   } else {
     gps_ready = true;
     esp_log_level_set("gps", ESP_LOG_DEBUG);
+    
+    // Configure for Active Antenna (with ANT_BIAS)
+    ret = gps.set_antenna_type(GPS::AntennaType::Active);
+    if (ret == ESP_OK) {
+      ESP_LOGI(TAG, "GPS configured for Active Antenna");
+    } else {
+      ESP_LOGW(TAG, "Failed to set GPS antenna type: %s", esp_err_to_name(ret));
+    }
   }
 
   // ==================== QON BUTTON TASK ====================

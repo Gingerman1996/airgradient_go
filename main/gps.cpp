@@ -221,7 +221,7 @@ void GPS::update(uint64_t now_ms) {
                             line_buf_[log_len - 1] == '\n') {
                             log_len -= 2;
                         }
-                        ESP_LOGV(TAG, "NMEA RX: %.*s", (int)log_len, line_buf_);
+                        ESP_LOGD(TAG, "NMEA RX: %.*s", (int)log_len, line_buf_);
                     }
                     handle_sentence(line_buf_, line_len_, now_ms);
                 }
