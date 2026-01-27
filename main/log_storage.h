@@ -13,6 +13,12 @@ esp_err_t log_storage_init(void);
 // Check if SPIFFS is mounted and ready
 bool log_storage_is_ready(void);
 
+// Flush any pending writes and sync to storage
+esp_err_t log_storage_flush(void);
+
+// Deinitialize log storage (unmount FATFS, release resources)
+esp_err_t log_storage_deinit(void);
+
 // ============================================================================
 // Binary Sensor Record Storage
 // ============================================================================

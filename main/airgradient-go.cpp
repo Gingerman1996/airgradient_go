@@ -44,12 +44,16 @@
 
 static SemaphoreHandle_t lvgl_mux = NULL;
 static bool shutdown_requested = false;
+static volatile bool display_task_running = true;
 static Display *g_display = nullptr;
 static epd_handle_t g_epd = nullptr;
 static lv_display_t *g_disp = nullptr;
 static drivers::BQ25629 *g_charger = nullptr;
 static drivers::LP5036 *g_led_driver = nullptr;
 static CAP1203 *g_buttons = nullptr;
+static GPS *g_gps = nullptr;
+static Sensors *g_sensors = nullptr;
+static TaskHandle_t g_display_task_handle = nullptr;
 static Display::FocusTile g_focus_tile = Display::FocusTile::CO2;
 static volatile bool g_focus_dirty = true;
 static volatile bool g_lvgl_refresh_requested = false;
@@ -309,7 +313,7 @@ extern "C" void app_main(void) {
 
   // ==================== DISPLAY UPDATE TASK ====================
   xTaskCreatePinnedToCore(display_task, "DisplayTask", 6 * 1024, &display, 4,
-                          NULL, tskNO_AFFINITY);
+                          &g_display_task_handle, tskNO_AFFINITY);
 
   // ==================== I2C BUS INITIALIZATION ====================
 
@@ -317,6 +321,8 @@ extern "C" void app_main(void) {
   ESP_LOGI(TAG, "Initializing I2C bus...");
   Sensors sensors;
   GPS gps;
+  g_sensors = &sensors;  // Set global pointer for shutdown access
+  g_gps = &gps;          // Set global pointer for shutdown access
   bool gps_ready = false;
   bool pmid_boost_requested = false;
   i2c_master_bus_handle_t i2c_bus = sensors.getI2CBusHandle();
@@ -1446,41 +1452,118 @@ static void initiate_shutdown(void) {
   static const char *TAG = "Shutdown";
   ESP_LOGI(TAG, "========== SHUTDOWN SEQUENCE STARTED ==========");
 
+  // Stop display task first to prevent UI update conflicts
+  ESP_LOGI(TAG, "Stopping display task...");
+  display_task_running = false;
+  if (g_display_task_handle) {
+    // Wait for display task to exit (max 1 second)
+    for (int i = 0; i < 20 && eTaskGetState(g_display_task_handle) != eDeleted; i++) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+    ESP_LOGI(TAG, "Display task stopped");
+  }
+
   // Phase 1: Stopping sensors
   ESP_LOGI(TAG, "Phase 1: Stopping sensors...");
   if (lvgl_lock(1000) && g_display) {
-    lv_obj_t *label = lv_label_create(lv_screen_active());
+    lv_obj_t *screen = lv_screen_active();
+    lv_obj_clean(screen);  // Remove all UI elements
+    lv_obj_set_style_bg_color(screen, lv_color_white(), 0);  // White background
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);  // Opaque
+    
+    // Create rotated container (like ui_display.cpp)
+    lv_obj_t *root = lv_obj_create(screen);
+    lv_obj_remove_style_all(root);
+    lv_obj_set_size(root, 296, 144);  // Display dimensions
+    lv_obj_align(root, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_transform_pivot_x(root, 296 / 2, 0);
+    lv_obj_set_style_transform_pivot_y(root, 144 / 2, 0);
+    lv_obj_set_style_transform_rotation(root, 1800, 0);  // Rotate 180 degrees
+    
+    lv_obj_t *label = lv_label_create(root);
     lv_label_set_text(label, "Shutting down...\n\nStopping sensors...");
     lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(label, lv_color_black(), 0);  // Black text
     lvgl_unlock();
   }
   request_lvgl_refresh();
   vTaskDelay(pdMS_TO_TICKS(800));
 
-  // TODO: Stop sensor tasks when implemented
+  // Stop GPS to release UART resources
+  if (g_gps) {
+    ESP_LOGI(TAG, "Stopping GPS...");
+    g_gps->stop();
+  }
+
+  // Turn off LEDs
+  if (g_led_driver) {
+    ESP_LOGI(TAG, "Turning off LEDs...");
+    g_led_driver->set_global_off(true);
+  }
+
+  // Note: Sensors class doesn't have stop() yet, but I2C will be released
+  // when device enters ship mode. SPS30 fan will stop with power off.
+  ESP_LOGI(TAG, "Phase 1 complete");
 
   // Phase 2: Stopping recording
   ESP_LOGI(TAG, "Phase 2: Stopping recording...");
   if (lvgl_lock(1000) && g_display) {
-    lv_obj_t *label = lv_label_create(lv_screen_active());
+    lv_obj_t *screen = lv_screen_active();
+    lv_obj_clean(screen);  // Remove all UI elements
+    lv_obj_set_style_bg_color(screen, lv_color_white(), 0);  // White background
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);  // Opaque
+    
+    // Create rotated container (like ui_display.cpp)
+    lv_obj_t *root = lv_obj_create(screen);
+    lv_obj_remove_style_all(root);
+    lv_obj_set_size(root, 296, 144);  // Display dimensions
+    lv_obj_align(root, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_transform_pivot_x(root, 296 / 2, 0);
+    lv_obj_set_style_transform_pivot_y(root, 144 / 2, 0);
+    lv_obj_set_style_transform_rotation(root, 1800, 0);  // Rotate 180 degrees
+    
+    lv_obj_t *label = lv_label_create(root);
     lv_label_set_text(label, "Shutting down...\n\nStopping recording...");
     lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(label, lv_color_black(), 0);  // Black text
     lvgl_unlock();
   }
   request_lvgl_refresh();
   vTaskDelay(pdMS_TO_TICKS(800));
 
-  // TODO: Stop recording when implemented
+  // Flush and close log storage (NAND flash)
+  if (log_storage_is_ready()) {
+    ESP_LOGI(TAG, "Flushing log storage...");
+    log_storage_flush();
+    ESP_LOGI(TAG, "Deinitializing log storage...");
+    log_storage_deinit();
+  }
+  ESP_LOGI(TAG, "Phase 2 complete");
 
   // Phase 3: Saving data
   ESP_LOGI(TAG, "Phase 3: Saving data...");
   if (lvgl_lock(1000) && g_display) {
-    lv_obj_t *label = lv_label_create(lv_screen_active());
+    lv_obj_t *screen = lv_screen_active();
+    lv_obj_clean(screen);  // Remove all UI elements
+    lv_obj_set_style_bg_color(screen, lv_color_white(), 0);  // White background
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);  // Opaque
+    
+    // Create rotated container (like ui_display.cpp)
+    lv_obj_t *root = lv_obj_create(screen);
+    lv_obj_remove_style_all(root);
+    lv_obj_set_size(root, 296, 144);  // Display dimensions
+    lv_obj_align(root, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_transform_pivot_x(root, 296 / 2, 0);
+    lv_obj_set_style_transform_pivot_y(root, 144 / 2, 0);
+    lv_obj_set_style_transform_rotation(root, 1800, 0);  // Rotate 180 degrees
+    
+    lv_obj_t *label = lv_label_create(root);
     lv_label_set_text(label, "Shutting down...\n\nSaving data...");
     lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(label, lv_color_black(), 0);  // Black text
     lvgl_unlock();
   }
   request_lvgl_refresh();
@@ -1508,10 +1591,25 @@ static void initiate_shutdown(void) {
   // Phase 4: Powering off
   ESP_LOGI(TAG, "Phase 4: Powering off...");
   if (lvgl_lock(1000) && g_display) {
-    lv_obj_t *label = lv_label_create(lv_screen_active());
+    lv_obj_t *screen = lv_screen_active();
+    lv_obj_clean(screen);  // Remove all UI elements
+    lv_obj_set_style_bg_color(screen, lv_color_white(), 0);  // White background
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);  // Opaque
+    
+    // Create rotated container (like ui_display.cpp)
+    lv_obj_t *root = lv_obj_create(screen);
+    lv_obj_remove_style_all(root);
+    lv_obj_set_size(root, 296, 144);  // Display dimensions
+    lv_obj_align(root, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_transform_pivot_x(root, 296 / 2, 0);
+    lv_obj_set_style_transform_pivot_y(root, 144 / 2, 0);
+    lv_obj_set_style_transform_rotation(root, 1800, 0);  // Rotate 180 degrees
+    
+    lv_obj_t *label = lv_label_create(root);
     lv_label_set_text(label, "Powering off...\n\nGoodbye!");
     lv_obj_align(label, LV_ALIGN_CENTER, 0, 0);
     lv_obj_set_style_text_align(label, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_color(label, lv_color_black(), 0);  // Black text
     lvgl_unlock();
   }
   request_lvgl_refresh();
@@ -1519,10 +1617,15 @@ static void initiate_shutdown(void) {
 
   // Phase 5: Clear display (prevent ghosting)
   ESP_LOGI(TAG, "Phase 5: Clearing display...");
-  if (g_epd) {
-    epd_clear(g_epd);
-    vTaskDelay(pdMS_TO_TICKS(100)); // Wait for clear to complete
+  if (lvgl_lock(1000) && g_display) {
+    lv_obj_t *screen = lv_screen_active();
+    lv_obj_clean(screen);  // Remove all UI elements (including "Goodbye")
+    lv_obj_set_style_bg_color(screen, lv_color_white(), 0);  // White background
+    lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);  // Opaque
+    lvgl_unlock();
   }
+  request_lvgl_refresh();
+  vTaskDelay(pdMS_TO_TICKS(500)); // Wait for white screen to complete
 
   // Phase 6: Enter ship mode
   ESP_LOGI(TAG, "Phase 6: Entering ship mode...");
@@ -1639,7 +1742,7 @@ static void display_task(void *arg) {
   int last_battery_percent = -1;
   bool last_battery_charging = false;
 
-  while (true) {
+  while (display_task_running) {
     uint64_t now_ms_u = (uint64_t)(esp_timer_get_time() / 1000);
     if (g_display_data_mux &&
         xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -1737,4 +1840,8 @@ static void display_task(void *arg) {
 
     vTaskDelay(pdMS_TO_TICKS(50));
   }
+  
+  // Task must delete itself before returning
+  ESP_LOGI("DisplayTask", "Display task exiting");
+  vTaskDelete(NULL);
 }

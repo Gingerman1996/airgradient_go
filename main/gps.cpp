@@ -190,6 +190,43 @@ GPS::AntennaType GPS::get_antenna_type() const {
     return antenna_type_;
 }
 
+esp_err_t GPS::stop() {
+    if (!initialized_) {
+        ESP_LOGW(TAG, "GPS not initialized, nothing to stop");
+        return ESP_OK;
+    }
+
+    ESP_LOGI(TAG, "Stopping GPS...");
+
+    // Disable ANT_BIAS if using active antenna
+    if (antenna_type_ == AntennaType::Active && 
+        kAntBiasHasHardwareControl && 
+        kAntBiasPin != GPIO_NUM_NC) {
+        gpio_set_level(kAntBiasPin, 0);
+        ESP_LOGI(TAG, "ANT_BIAS disabled");
+    }
+
+    // Flush UART buffer
+    uart_flush_input((uart_port_t)uart_num_);
+
+    // Delete UART driver
+    esp_err_t ret = uart_driver_delete((uart_port_t)uart_num_);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "UART driver delete failed: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "UART driver deleted");
+    }
+
+    // Reset state
+    initialized_ = false;
+    fix_valid_ = false;
+    time_valid_ = false;
+    line_len_ = 0;
+
+    ESP_LOGI(TAG, "GPS stopped successfully");
+    return ESP_OK;
+}
+
 void GPS::update(uint64_t now_ms) {
     if (!initialized_) {
         return;

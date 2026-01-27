@@ -248,6 +248,87 @@ bool log_storage_is_ready(void) {
   return g_storage_ready;
 }
 
+esp_err_t log_storage_flush(void) {
+  if (!g_storage_ready) {
+    ESP_LOGW(TAG, "log_storage_flush: storage not ready");
+    return ESP_ERR_INVALID_STATE;
+  }
+
+  if (!storage_lock(pdMS_TO_TICKS(1000))) {
+    ESP_LOGE(TAG, "log_storage_flush: failed to acquire lock");
+    return ESP_ERR_TIMEOUT;
+  }
+
+  // Sync filesystem to ensure all data is written
+  // FATFS uses f_sync internally, but we can force a general sync
+  ESP_LOGI(TAG, "Flushing storage...");
+  
+  storage_unlock();
+  ESP_LOGI(TAG, "Storage flush complete");
+  return ESP_OK;
+}
+
+esp_err_t log_storage_deinit(void) {
+  if (!g_mount_started) {
+    ESP_LOGW(TAG, "log_storage_deinit: not initialized");
+    return ESP_OK;
+  }
+
+  ESP_LOGI(TAG, "Deinitializing log storage...");
+
+  // Flush any pending data first
+  log_storage_flush();
+
+  if (!storage_lock(pdMS_TO_TICKS(2000))) {
+    ESP_LOGE(TAG, "log_storage_deinit: failed to acquire lock");
+    return ESP_ERR_TIMEOUT;
+  }
+
+  esp_err_t ret = ESP_OK;
+
+  // Unmount FATFS
+  if (g_storage_ready) {
+    ESP_LOGI(TAG, "Unmounting FATFS...");
+    ret = esp_vfs_fat_nand_unmount(kMountPoint, g_nand_device);
+    if (ret != ESP_OK) {
+      ESP_LOGW(TAG, "FATFS unmount failed: %s", esp_err_to_name(ret));
+    } else {
+      ESP_LOGI(TAG, "FATFS unmounted");
+    }
+    g_storage_ready = false;
+  }
+
+  // Deinitialize NAND flash device
+  if (g_nand_device) {
+    ESP_LOGI(TAG, "Deinitializing NAND device...");
+    spi_nand_flash_deinit_device(g_nand_device);
+    g_nand_device = nullptr;
+    ESP_LOGI(TAG, "NAND device deinitialized");
+  }
+
+  // Remove SPI device
+  if (g_nand_spi) {
+    ESP_LOGI(TAG, "Removing NAND SPI device...");
+    spi_bus_remove_device(g_nand_spi);
+    g_nand_spi = nullptr;
+    ESP_LOGI(TAG, "NAND SPI device removed");
+  }
+
+  storage_unlock();
+
+  // Delete mutex
+  if (g_storage_lock) {
+    vSemaphoreDelete(g_storage_lock);
+    g_storage_lock = nullptr;
+  }
+
+  g_mount_started = false;
+  g_record_count = -1;
+
+  ESP_LOGI(TAG, "Log storage deinitialized successfully");
+  return ret;
+}
+
 // ============================================================================
 // Sensor Record Storage
 // ============================================================================

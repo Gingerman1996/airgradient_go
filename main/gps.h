@@ -56,6 +56,13 @@ public:
      */
     AntennaType get_antenna_type() const;
 
+    /**
+     * @brief Stop GPS and release UART resources
+     * Call this before shutdown to cleanly release resources.
+     * @return ESP_OK on success
+     */
+    esp_err_t stop();
+
     // Read and parse NMEA data (non-blocking). Call periodically.
     void update(uint64_t now_ms);
 
