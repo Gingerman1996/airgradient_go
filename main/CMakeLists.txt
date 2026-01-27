@@ -1,6 +1,7 @@
 idf_component_register(
     SRCS
         airgradient-go.cpp
+        display_example.cpp
         gps.cpp
         i2c_scanner.cpp
         log_storage.cpp
