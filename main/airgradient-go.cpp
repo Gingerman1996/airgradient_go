@@ -25,18 +25,20 @@
 #include "lvgl.h"
 
 // Display resolution selector
-// setResolution = 0 -> 144x296 (default)
-// setResolution = 1 -> 122x250
+// setResolution = 0 -> 144x296 (GDEY0213B74H 2.13")
+// setResolution = 1 -> 122x250 (GDEY0213B74 2.13" standard)
 #define setResolution 1
 
 #if setResolution == 0
-// GDEY0213B74H (2.13" 144x296)
+// GDEY0213B74H (2.13" 144x296) - uses 2.9" panel config (closest match)
 #define DISPLAY_WIDTH 144
 #define DISPLAY_HEIGHT 296
+#define DISPLAY_PANEL_TYPE EPD_PANEL_SSD16XX_290
 #elif setResolution == 1
-// 122x250 panel
+// GDEY0213B74 (2.13" 122x250) - standard 2.13" panel config
 #define DISPLAY_WIDTH 122
 #define DISPLAY_HEIGHT 250
+#define DISPLAY_PANEL_TYPE EPD_PANEL_SSD16XX_213
 #else
 #error "setResolution must be 0 or 1"
 #endif
@@ -235,8 +237,7 @@ extern "C" void app_main(void) {
   epd_cfg.pins.miso = 24; // IO24 - shared with NAND flash
   epd_cfg.spi.host = SPI2_HOST;
   epd_cfg.spi.speed_hz = 4000000; // 4 MHz (same as working ESP32-C6 code)
-  epd_cfg.panel.type = EPD_PANEL_SSD16XX_290; // Try 2.9" config (128x296) -
-                                              // closer to our 144x296
+  epd_cfg.panel.type = DISPLAY_PANEL_TYPE; // Panel type based on resolution
   epd_cfg.panel.width = DISPLAY_WIDTH;
   epd_cfg.panel.height = DISPLAY_HEIGHT;
   epd_cfg.panel.mirror_x = false;
