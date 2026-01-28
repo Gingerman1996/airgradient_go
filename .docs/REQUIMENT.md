@@ -215,6 +215,38 @@ VOC Index: Warning > 200, Critical > 400
 Battery: Warning < 20%, Critical < 10%
 If any critical active -> show Critical pattern.
 
+LED level indicators (current firmware behavior)
+
+- PM2.5 uses LED1-LED4 (order 1 -> 4). CO2 uses LED12-LED9 (order 12 -> 9).
+- LEDs 5-8 are off.
+- Touch pad LED flash is disabled (no LED feedback on touch).
+- LED pattern by level:
+  - Green: 1 LED green
+  - Yellow: 1 LED yellow
+  - Orange: 2 LEDs orange
+  - Red: 2 LEDs red
+  - Purple: 3 LEDs purple
+  - Very high: 4 LEDs alternating purple/red
+- PM2.5 thresholds (ug/m3):
+  - 0-5 green
+  - 5-9 green
+  - 9-20 yellow
+  - 20-35.4 yellow
+  - 35.4-45 orange
+  - 45-55.4 orange
+  - 55.4-100 red
+  - 100-125.4 red
+  - 125.4-225.4 purple
+  - >225.4 alternating purple/red
+- CO2 thresholds (ppm):
+  - <801 green
+  - 801-1000 yellow
+  - 1001-1500 orange
+  - 1501-2000 red
+  - 2001-3000 purple
+  - >3000 alternating purple/red
+- Note: Power-mode gating for LEDs (BAT/PWR rules above) is still pending.
+
 7) Settings (on-device)
 
 Minimal settings set (MVP):

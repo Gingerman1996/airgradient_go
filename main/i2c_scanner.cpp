@@ -23,6 +23,12 @@ void i2c_scanner_scan(i2c_master_bus_handle_t bus_handle, uint32_t timeout_ms) {
     ESP_LOGI(TAG_I2C, "=== I2C Devices Found ===");
     
     int device_count = 0;
+
+    esp_err_t reset_ret = i2c_master_bus_reset(bus_handle);
+    if (reset_ret != ESP_OK) {
+        ESP_LOGE(TAG_I2C, "I2C bus reset failed: %s", esp_err_to_name(reset_ret));
+        return;
+    }
     
     // Scan all 128 possible I2C addresses (7-bit addressing)
     for (uint8_t addr = 0x00; addr < 0x80; addr++) {

@@ -40,7 +40,7 @@ inline float breathing_effect(uint32_t time_ms, uint32_t period_ms) {
  * @example
  *   for (uint8_t i = 0; i < 12; i++) {
  *     auto color = rainbow_wheel(i * 21); // Spread across 12 LEDs
- *     led.set_led_color(i, color.r, color.g, color.b);
+ *     led.set_led_color(i, color.b, color.g, color.r);
  *   }
  */
 inline color::RGB rainbow_wheel(uint8_t position) {

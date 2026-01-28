@@ -187,8 +187,8 @@ esp_err_t LP5036::set_out_color(uint8_t out_index, uint8_t value) {
   return write_register(reg, value);
 }
 
-esp_err_t LP5036::set_led_color(uint8_t led_index, uint8_t red, uint8_t green,
-                                uint8_t blue) {
+esp_err_t LP5036::set_led_color(uint8_t led_index, uint8_t blue, uint8_t green,
+                                uint8_t red) {
   if (led_index >= LP5036_LED_COUNT) {
     return ESP_ERR_INVALID_ARG;
   }
@@ -198,7 +198,7 @@ esp_err_t LP5036::set_led_color(uint8_t led_index, uint8_t red, uint8_t green,
     return ESP_ERR_INVALID_ARG;
   }
 
-  esp_err_t ret = set_out_color(out_base, red);
+  esp_err_t ret = set_out_color(out_base, blue);
   if (ret != ESP_OK) {
     return ret;
   }
@@ -208,7 +208,7 @@ esp_err_t LP5036::set_led_color(uint8_t led_index, uint8_t red, uint8_t green,
     return ret;
   }
 
-  return set_out_color(out_base + 2, blue);
+  return set_out_color(out_base + 2, red);
 }
 
 esp_err_t LP5036::read_register(uint8_t reg, uint8_t *value) {

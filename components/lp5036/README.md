@@ -16,6 +16,9 @@ The device exposes 36 outputs (OUT0..OUT35). RGB LED modules are mapped as:
 - ...
 - LED11 = OUT33 (R), OUT34 (G), OUT35 (B)
 
+Note: In this project the LED modules are wired BGR (OUT0=B, OUT1=G, OUT2=R),
+so `set_led_color()` expects BGR input order.
+
 ## Basic Usage
 
 ```cpp
@@ -28,7 +31,7 @@ drivers::LP5036 led(i2c_bus, drivers::LP5036_I2C::ADDR_BASE);
 if (led.init() == ESP_OK) {
   led.set_log_scale(false);
   led.set_led_brightness(0, 0xFF);
-  led.set_led_color(0, 0xFF, 0x00, 0x00); // LED0 = red
+  led.set_led_color(0, 0x00, 0x00, 0xFF); // LED0 = red (BGR)
 }
 ```
 

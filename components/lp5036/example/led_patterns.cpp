@@ -30,7 +30,7 @@ void example_hsv_rainbow(drivers::LP5036& led) {
     
     color::RGB rgb = color::hsv_to_rgb(hsv);
     led.set_led_brightness(i, 255);
-    led.set_led_color(i, rgb.r, rgb.g, rgb.b);
+    led.set_led_color(i, rgb.b, rgb.g, rgb.r);
     
     ESP_LOGI(TAG, "LED %d: H=%.0f -> R=%d G=%d B=%d", 
              i, hue, rgb.r, rgb.g, rgb.b);
@@ -48,7 +48,7 @@ void example_rainbow_wave(drivers::LP5036& led, uint32_t time_ms, uint32_t perio
     color::RGB rgb = color::hsv_to_rgb(hsv);
     
     led.set_led_brightness(i, 255);
-    led.set_led_color(i, rgb.r, rgb.g, rgb.b);
+    led.set_led_color(i, rgb.b, rgb.g, rgb.r);
   }
 }
 
@@ -60,7 +60,7 @@ void example_breathing(drivers::LP5036& led, uint32_t time_ms,
   
   for (int i = 0; i < 12; i++) {
     led.set_led_brightness(i, brightness_8bit);
-    led.set_led_color(i, base_color.r, base_color.g, base_color.b);
+    led.set_led_color(i, base_color.b, base_color.g, base_color.r);
   }
   
   ESP_LOGD(TAG, "Breathing: brightness=%.2f (%d)", brightness, brightness_8bit);
@@ -89,7 +89,7 @@ void example_aqi_ring(drivers::LP5036& led, uint16_t pm25_ugm3) {
   // Light up all LEDs with AQI color
   for (int i = 0; i < 12; i++) {
     led.set_led_brightness(i, 255);
-    led.set_led_color(i, aqi_color.r, aqi_color.g, aqi_color.b);
+    led.set_led_color(i, aqi_color.b, aqi_color.g, aqi_color.r);
   }
   
   ESP_LOGI(TAG, "PM2.5=%.1f -> AQI=%d -> RGB(%d,%d,%d)",
@@ -107,12 +107,12 @@ void example_progress_bar(drivers::LP5036& led, float progress,
   for (int i = 0; i < 12; i++) {
     if (i < lit_leds) {
       led.set_led_brightness(i, 255);
-      led.set_led_color(i, color.r, color.g, color.b);
+      led.set_led_color(i, color.b, color.g, color.r);
     } else if (i == lit_leds && progress * 12 - lit_leds > 0) {
       // Partial brightness for fractional progress
       uint8_t partial = static_cast<uint8_t>((progress * 12 - lit_leds) * 255);
       led.set_led_brightness(i, partial);
-      led.set_led_color(i, color.r, color.g, color.b);
+      led.set_led_color(i, color.b, color.g, color.r);
     } else {
       led.set_led_brightness(i, 0);
     }
@@ -129,7 +129,7 @@ void example_color_temperature(drivers::LP5036& led, uint32_t time_ms) {
   
   for (int i = 0; i < 12; i++) {
     led.set_led_brightness(i, 255);
-    led.set_led_color(i, temp_color.r, temp_color.g, temp_color.b);
+    led.set_led_color(i, temp_color.b, temp_color.g, temp_color.r);
   }
   
   ESP_LOGD(TAG, "Color temp: %dK -> RGB(%d,%d,%d)",
@@ -155,7 +155,7 @@ void example_gamma_correction(drivers::LP5036& led) {
       ESP_LOGI(TAG, "LED %d: Gamma = %d (from %d)", i, gamma_brightness, linear_brightness);
     }
     
-    led.set_led_color(i, 255, 255, 255); // White
+    led.set_led_color(i, 255, 255, 255); // White (BGR same as RGB)
   }
 }
 
@@ -174,7 +174,7 @@ void example_scanner(drivers::LP5036& led, uint32_t time_ms,
                          (distance == 2) ? 64 : 0;
     
     led.set_led_brightness(i, brightness);
-    led.set_led_color(i, color.r, color.g, color.b);
+    led.set_led_color(i, color.b, color.g, color.r);
   }
 }
 

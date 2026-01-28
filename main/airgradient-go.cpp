@@ -97,16 +97,27 @@ struct DisplaySnapshot {
 
 static DisplaySnapshot g_display_snapshot = {};
 
+enum class AirLevel : uint8_t {
+  Off = 0,
+  Green,
+  Yellow,
+  Orange,
+  Red,
+  Purple,
+  PurpleRed,
+};
+
 static const char *charge_status_to_string(drivers::ChargeStatus status);
 static int battery_percent_from_mv(uint16_t vbat_mv);
 static int battery_percent_from_soc(float soc_pct);
 static esp_err_t battery_soc_nvs_init(void);
 static esp_err_t battery_soc_nvs_load(float *soc_pct, uint16_t *last_vbat_mv);
 static esp_err_t battery_soc_nvs_save(float soc_pct, uint16_t vbat_mv);
-static void led_show_aqi(uint16_t pm25_ugm3);
+static AirLevel pm25_level_from_ugm3(float pm25_ugm3);
+static AirLevel co2_level_from_ppm(int co2_ppm);
+static void led_show_air_levels(AirLevel pm_level, AirLevel co2_level);
 static void led_show_battery(int battery_percent, bool charging);
 static void led_off();
-static void led_flash(const color::RGB& color, uint16_t duration_ms = 100);
 static void button_event_callback(ButtonState state, void *user_data);
 static esp_err_t init_cap1203(i2c_master_bus_handle_t i2c_bus);
 static void lv_tick_timer_cb(void *arg);
@@ -332,7 +343,7 @@ extern "C" void app_main(void) {
   }
 
   // Scan I2C bus for connected devices (enable/disable via #define)
-  i2c_scanner_scan(i2c_bus, 10);
+  i2c_scanner_scan(i2c_bus, 2);
 
   // ==================== CHARGER INITIALIZATION (BEFORE SENSORS!)
   // ====================
@@ -553,7 +564,7 @@ extern "C" void app_main(void) {
           color::RGB rgb = color::hsv_to_rgb(hsv);
           
           g_led_driver->set_led_brightness(i, 0xFF);
-          g_led_driver->set_led_color(i, rgb.r, rgb.g, rgb.b);
+          g_led_driver->set_led_color(i, rgb.b, rgb.g, rgb.r);
         }
         vTaskDelay(pdMS_TO_TICKS(delay_ms));
       }
@@ -564,7 +575,7 @@ extern "C" void app_main(void) {
         for (int brightness = 0; brightness <= 255; brightness += 15) {
           for (uint8_t i = 0; i < 12; i++) {
             g_led_driver->set_led_brightness(i, brightness);
-            g_led_driver->set_led_color(i, green.r, green.g, green.b);
+            g_led_driver->set_led_color(i, green.b, green.g, green.r);
           }
           vTaskDelay(pdMS_TO_TICKS(10));
         }
@@ -670,6 +681,9 @@ extern "C" void app_main(void) {
   bool battery_charging_valid = false;
   drivers::ChargeStatus last_charge_status = drivers::ChargeStatus::NOT_CHARGING;
   bool charge_status_valid = false;
+  AirLevel last_pm_level = AirLevel::Off;
+  AirLevel last_co2_level = AirLevel::Off;
+  bool led_levels_initialized = false;
 
   while (true) {
     int64_t now_ms = esp_timer_get_time() / 1000;
@@ -690,6 +704,18 @@ extern "C" void app_main(void) {
 
       sensor_values_t vals;
       sensors.getValues(now_ms, &vals);
+
+      AirLevel pm_level = pm25_level_from_ugm3(vals.pm25_mass);
+      AirLevel co2_level =
+          vals.have_co2_avg ? co2_level_from_ppm(vals.co2_ppm_avg)
+                            : AirLevel::Off;
+      if (!led_levels_initialized || pm_level != last_pm_level ||
+          co2_level != last_co2_level) {
+        led_show_air_levels(pm_level, co2_level);
+        last_pm_level = pm_level;
+        last_co2_level = co2_level;
+        led_levels_initialized = true;
+      }
 
       if (g_display_data_mux &&
           xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) == pdTRUE) {
@@ -1233,17 +1259,140 @@ static esp_err_t battery_soc_nvs_save(float soc_pct, uint16_t vbat_mv) {
 
 // ==================== LED HELPER FUNCTIONS ====================
 
-// Show AQI status on LED ring
-static void led_show_aqi(uint16_t pm25_ugm3) {
-  if (g_led_driver == nullptr) return;
-  
-  color::RGB aqi_color = led_effects::aqi_to_color(pm25_ugm3);
-  g_led_driver->set_global_off(false);
-  
-  for (uint8_t i = 0; i < 12; i++) {
-    g_led_driver->set_led_brightness(i, 0xFF);
-    g_led_driver->set_led_color(i, aqi_color.r, aqi_color.g, aqi_color.b);
+struct LedPattern {
+  uint8_t lit_count = 0;
+  color::RGB primary = color::Colors::BLACK;
+  color::RGB secondary = color::Colors::BLACK;
+  bool alternate = false;
+};
+
+static LedPattern pattern_for_level(AirLevel level) {
+  LedPattern pattern;
+  switch (level) {
+  case AirLevel::Green:
+    pattern.lit_count = 1;
+    pattern.primary = color::Colors::GREEN;
+    return pattern;
+  case AirLevel::Yellow:
+    pattern.lit_count = 1;
+    pattern.primary = color::Colors::YELLOW;
+    return pattern;
+  case AirLevel::Orange:
+    pattern.lit_count = 2;
+    pattern.primary = color::Colors::ORANGE;
+    pattern.alternate = false;
+    return pattern;
+  case AirLevel::Red:
+    pattern.lit_count = 2;
+    pattern.primary = color::Colors::RED;
+    pattern.alternate = false;
+    return pattern;
+  case AirLevel::Purple:
+    pattern.lit_count = 3;
+    pattern.primary = color::Colors::PURPLE;
+    return pattern;
+  case AirLevel::PurpleRed:
+    pattern.lit_count = 4;
+    pattern.primary = color::Colors::PURPLE;
+    pattern.secondary = color::Colors::RED;
+    pattern.alternate = true;
+    return pattern;
+  case AirLevel::Off:
+  default:
+    return pattern;
   }
+}
+
+static AirLevel pm25_level_from_ugm3(float pm25_ugm3) {
+  if (pm25_ugm3 <= 5.0f) {
+    return AirLevel::Green;
+  }
+  if (pm25_ugm3 <= 9.0f) {
+    return AirLevel::Green;
+  }
+  if (pm25_ugm3 <= 20.0f) {
+    return AirLevel::Yellow;
+  }
+  if (pm25_ugm3 <= 35.4f) {
+    return AirLevel::Yellow;
+  }
+  if (pm25_ugm3 <= 45.0f) {
+    return AirLevel::Orange;
+  }
+  if (pm25_ugm3 <= 55.4f) {
+    return AirLevel::Orange;
+  }
+  if (pm25_ugm3 <= 100.0f) {
+    return AirLevel::Red;
+  }
+  if (pm25_ugm3 <= 125.4f) {
+    return AirLevel::Red;
+  }
+  if (pm25_ugm3 <= 225.4f) {
+    return AirLevel::Purple;
+  }
+  return AirLevel::PurpleRed;
+}
+
+static AirLevel co2_level_from_ppm(int co2_ppm) {
+  if (co2_ppm <= 800) {
+    return AirLevel::Green;
+  }
+  if (co2_ppm <= 1000) {
+    return AirLevel::Yellow;
+  }
+  if (co2_ppm <= 1500) {
+    return AirLevel::Orange;
+  }
+  if (co2_ppm <= 2000) {
+    return AirLevel::Red;
+  }
+  if (co2_ppm <= 3000) {
+    return AirLevel::Purple;
+  }
+  return AirLevel::PurpleRed;
+}
+
+static void apply_led_pattern(uint8_t first_index, int8_t step,
+                              const LedPattern &pattern) {
+  int idx = first_index;
+  for (uint8_t i = 0; i < 4; i++, idx += step) {
+    if (i < pattern.lit_count) {
+      const bool use_secondary = pattern.alternate && (i % 2 == 1);
+      const color::RGB &level_color =
+          use_secondary ? pattern.secondary : pattern.primary;
+      g_led_driver->set_led_brightness(static_cast<uint8_t>(idx), 0xFF);
+      g_led_driver->set_led_color(static_cast<uint8_t>(idx), level_color.b,
+                                  level_color.g, level_color.r);
+    } else {
+      g_led_driver->set_led_brightness(static_cast<uint8_t>(idx), 0);
+    }
+  }
+}
+
+// Show PM2.5 (LED1-4) and CO2 (LED12-9) level bars.
+static void led_show_air_levels(AirLevel pm_level, AirLevel co2_level) {
+  if (g_led_driver == nullptr) return;
+  static const char *TAG = "LEDs";
+
+  g_led_driver->set_global_off(false);
+
+  for (uint8_t i = 0; i < drivers::LP5036_LED_COUNT; i++) {
+    g_led_driver->set_led_brightness(i, 0);
+  }
+
+  const LedPattern pm_pattern = pattern_for_level(pm_level);
+  const LedPattern co2_pattern = pattern_for_level(co2_level);
+
+  ESP_LOGI(TAG, "PM level: %d (R:%d G:%d B:%d lit:%d), CO2 level: %d (R:%d G:%d B:%d lit:%d)",
+           (int)pm_level, pm_pattern.primary.r, pm_pattern.primary.g, pm_pattern.primary.b, pm_pattern.lit_count,
+           (int)co2_level, co2_pattern.primary.r, co2_pattern.primary.g, co2_pattern.primary.b, co2_pattern.lit_count);
+
+  // PM2.5: LED1-4 (indices 0-3), low -> high.
+  apply_led_pattern(0, 1, pm_pattern);
+
+  // CO2: LED12-9 (indices 11-8), low -> high.
+  apply_led_pattern(11, -1, co2_pattern);
 }
 
 // Show battery status on LED ring (charging animation or battery level)
@@ -1261,7 +1410,7 @@ static void led_show_battery(int battery_percent, bool charging) {
     color::RGB blue = color::Colors::BLUE;
     for (uint8_t i = 0; i < 12; i++) {
       g_led_driver->set_led_brightness(i, brightness_8bit);
-      g_led_driver->set_led_color(i, blue.r, blue.g, blue.b);
+      g_led_driver->set_led_color(i, blue.b, blue.g, blue.r);
     }
   } else {
     // Battery level: progress bar (green/yellow/red based on level)
@@ -1279,7 +1428,7 @@ static void led_show_battery(int battery_percent, bool charging) {
     for (uint8_t i = 0; i < 12; i++) {
       if (i < lit_leds) {
         g_led_driver->set_led_brightness(i, 0xFF);
-        g_led_driver->set_led_color(i, color.r, color.g, color.b);
+        g_led_driver->set_led_color(i, color.b, color.g, color.r);
       } else {
         g_led_driver->set_led_brightness(i, 0);
       }
@@ -1290,19 +1439,6 @@ static void led_show_battery(int battery_percent, bool charging) {
 // Turn off all LEDs
 static void led_off() {
   if (g_led_driver == nullptr) return;
-  g_led_driver->set_global_off(true);
-}
-
-// Brief notification flash (for button press, etc.)
-static void led_flash(const color::RGB& color, uint16_t duration_ms) {
-  if (g_led_driver == nullptr) return;
-  
-  g_led_driver->set_global_off(false);
-  for (uint8_t i = 0; i < 12; i++) {
-    g_led_driver->set_led_brightness(i, 0xFF);
-    g_led_driver->set_led_color(i, color.r, color.g, color.b);
-  }
-  vTaskDelay(pdMS_TO_TICKS(duration_ms));
   g_led_driver->set_global_off(true);
 }
 
@@ -1329,8 +1465,6 @@ static void button_event_callback(ButtonState state, void *user_data) {
   switch (state.event) {
   case ButtonEvent::PRESS:
     ESP_LOGI(TAG_BTN, "[%s] PRESS", button_name);
-    // Visual feedback: quick white flash
-    led_flash(color::Colors::WHITE, 50);
     break;
   case ButtonEvent::RELEASE:
     ESP_LOGI(TAG_BTN, "[%s] RELEASE (duration: %lu ms)", button_name,
@@ -1369,13 +1503,6 @@ static void button_event_callback(ButtonState state, void *user_data) {
     if (focus_changed) {
       g_focus_dirty = true;
       ESP_LOGI(TAG_BTN, "Focus set to %s tile", focus_label);
-      
-      // Visual feedback: brief color flash based on focus
-      if (g_focus_tile == Display::FocusTile::CO2) {
-        led_flash(color::Colors::CYAN, 150);
-      } else if (g_focus_tile == Display::FocusTile::PM25) {
-        led_flash(color::Colors::ORANGE, 150);
-      }
     }
   }
 }

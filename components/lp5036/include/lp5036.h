@@ -50,6 +50,7 @@ public:
    * @brief Construct a new LP5036 driver instance
    * @param i2c_bus I2C master bus handle
    * @param i2c_addr I2C device address (default: 0x30)
+   * @note Color order is BGR on OUT0/1/2 (B,G,R).
    */
   LP5036(i2c_master_bus_handle_t i2c_bus,
          uint8_t i2c_addr = LP5036_I2C::ADDR_BASE);
@@ -166,15 +167,15 @@ public:
   esp_err_t set_out_color(uint8_t out_index, uint8_t value);
 
   /**
-   * @brief Set RGB color for an LED module
+   * @brief Set BGR color for an LED module (OUT0=B, OUT1=G, OUT2=R)
    * @param led_index LED module index (0-11)
-   * @param red Red channel mix
-   * @param green Green channel mix
    * @param blue Blue channel mix
+   * @param green Green channel mix
+   * @param red Red channel mix
    * @return ESP_OK on success, error code otherwise
    */
-  esp_err_t set_led_color(uint8_t led_index, uint8_t red, uint8_t green,
-                          uint8_t blue);
+  esp_err_t set_led_color(uint8_t led_index, uint8_t blue, uint8_t green,
+                          uint8_t red);
 
   /**
    * @brief Read a register (debug/validation)

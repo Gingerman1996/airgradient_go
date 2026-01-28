@@ -38,7 +38,7 @@ void lp5036_basic_example(void *arg) {
 
   for (uint8_t i = 0; i < drivers::LP5036_LED_COUNT; ++i) {
     led_driver.set_led_brightness(i, 0xFF);
-    led_driver.set_led_color(i, 0xFF, 0x00, 0x00); // Red
+    led_driver.set_led_color(i, 0x00, 0x00, 0xFF); // Red (BGR)
     ESP_LOGI(TAG, "LED%u -> red", i + 1);
     vTaskDelay(pdMS_TO_TICKS(120));
   }
@@ -47,7 +47,7 @@ void lp5036_basic_example(void *arg) {
 
   for (const auto &c : color_cycle) {
     for (uint8_t i = 0; i < drivers::LP5036_LED_COUNT; ++i) {
-      led_driver.set_led_color(i, c.r, c.g, c.b);
+      led_driver.set_led_color(i, c.b, c.g, c.r);
     }
     ESP_LOGI(TAG, "All LEDs -> %s", c.name);
     vTaskDelay(pdMS_TO_TICKS(350));
