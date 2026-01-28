@@ -24,9 +24,25 @@
 #include "epaper_panel.h"
 #include "lvgl.h"
 
-// Display dimensions for GDEY0213B74H (2.13" 144x296)
+// Display resolution selector
+// setResolution = 0 -> 144x296 (default)
+// setResolution = 1 -> 122x250
+#define setResolution 1
+
+#if setResolution == 0
+// GDEY0213B74H (2.13" 144x296)
 #define DISPLAY_WIDTH 144
 #define DISPLAY_HEIGHT 296
+#elif setResolution == 1
+// 122x250 panel
+#define DISPLAY_WIDTH 122
+#define DISPLAY_HEIGHT 250
+#else
+#error "setResolution must be 0 or 1"
+#endif
+
+#define DISPLAY_ROT_WIDTH DISPLAY_HEIGHT
+#define DISPLAY_ROT_HEIGHT DISPLAY_WIDTH
 
 // LVGL configuration
 #define LVGL_TICK_PERIOD_MS 5
@@ -207,7 +223,7 @@ extern "C" void app_main(void) {
   // Initialize LVGL
   lv_init();
 
-  // Configure e-paper display (144x296 SSD16xx-based, rotated 180°)
+  // Configure e-paper display (DISPLAY_WIDTH x DISPLAY_HEIGHT, rotated 180°)
   // MISO is set to GPIO24 to share SPI bus with W25N512 NAND flash
   epd_config_t epd_cfg = EPD_CONFIG_DEFAULT();
   epd_cfg.pins.busy = 10; // IO10
@@ -1601,10 +1617,10 @@ static void initiate_shutdown(void) {
     // Create rotated container (like ui_display.cpp)
     lv_obj_t *root = lv_obj_create(screen);
     lv_obj_remove_style_all(root);
-    lv_obj_set_size(root, 296, 144);  // Display dimensions
+    lv_obj_set_size(root, DISPLAY_ROT_WIDTH, DISPLAY_ROT_HEIGHT);
     lv_obj_align(root, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_transform_pivot_x(root, 296 / 2, 0);
-    lv_obj_set_style_transform_pivot_y(root, 144 / 2, 0);
+    lv_obj_set_style_transform_pivot_x(root, DISPLAY_ROT_WIDTH / 2, 0);
+    lv_obj_set_style_transform_pivot_y(root, DISPLAY_ROT_HEIGHT / 2, 0);
     lv_obj_set_style_transform_rotation(root, 1800, 0);  // Rotate 180 degrees
     
     lv_obj_t *label = lv_label_create(root);
@@ -1644,10 +1660,10 @@ static void initiate_shutdown(void) {
     // Create rotated container (like ui_display.cpp)
     lv_obj_t *root = lv_obj_create(screen);
     lv_obj_remove_style_all(root);
-    lv_obj_set_size(root, 296, 144);  // Display dimensions
+    lv_obj_set_size(root, DISPLAY_ROT_WIDTH, DISPLAY_ROT_HEIGHT);
     lv_obj_align(root, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_transform_pivot_x(root, 296 / 2, 0);
-    lv_obj_set_style_transform_pivot_y(root, 144 / 2, 0);
+    lv_obj_set_style_transform_pivot_x(root, DISPLAY_ROT_WIDTH / 2, 0);
+    lv_obj_set_style_transform_pivot_y(root, DISPLAY_ROT_HEIGHT / 2, 0);
     lv_obj_set_style_transform_rotation(root, 1800, 0);  // Rotate 180 degrees
     
     lv_obj_t *label = lv_label_create(root);
@@ -1680,10 +1696,10 @@ static void initiate_shutdown(void) {
     // Create rotated container (like ui_display.cpp)
     lv_obj_t *root = lv_obj_create(screen);
     lv_obj_remove_style_all(root);
-    lv_obj_set_size(root, 296, 144);  // Display dimensions
+    lv_obj_set_size(root, DISPLAY_ROT_WIDTH, DISPLAY_ROT_HEIGHT);
     lv_obj_align(root, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_transform_pivot_x(root, 296 / 2, 0);
-    lv_obj_set_style_transform_pivot_y(root, 144 / 2, 0);
+    lv_obj_set_style_transform_pivot_x(root, DISPLAY_ROT_WIDTH / 2, 0);
+    lv_obj_set_style_transform_pivot_y(root, DISPLAY_ROT_HEIGHT / 2, 0);
     lv_obj_set_style_transform_rotation(root, 1800, 0);  // Rotate 180 degrees
     
     lv_obj_t *label = lv_label_create(root);
@@ -1726,10 +1742,10 @@ static void initiate_shutdown(void) {
     // Create rotated container (like ui_display.cpp)
     lv_obj_t *root = lv_obj_create(screen);
     lv_obj_remove_style_all(root);
-    lv_obj_set_size(root, 296, 144);  // Display dimensions
+    lv_obj_set_size(root, DISPLAY_ROT_WIDTH, DISPLAY_ROT_HEIGHT);
     lv_obj_align(root, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_transform_pivot_x(root, 296 / 2, 0);
-    lv_obj_set_style_transform_pivot_y(root, 144 / 2, 0);
+    lv_obj_set_style_transform_pivot_x(root, DISPLAY_ROT_WIDTH / 2, 0);
+    lv_obj_set_style_transform_pivot_y(root, DISPLAY_ROT_HEIGHT / 2, 0);
     lv_obj_set_style_transform_rotation(root, 1800, 0);  // Rotate 180 degrees
     
     lv_obj_t *label = lv_label_create(root);
