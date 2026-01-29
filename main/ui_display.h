@@ -2,6 +2,9 @@
 
 #include <stdint.h>
 
+// Blink cadence for UI icons; keep aligned with LVGL refresh limits.
+#define UI_BLINK_INTERVAL_MS 1500
+
 class Display {
 public:
     enum class BLEStatus { Disconnected, Connected };

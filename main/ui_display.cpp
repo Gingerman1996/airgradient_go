@@ -386,8 +386,8 @@ bool Display::init(uint16_t w, uint16_t h) {
 }
 
 void Display::update(uint64_t millis_now) {
-  // BLE blink every 500ms
-  if (millis_now - state->last_bt_blink_ms >= 500) {
+  // BLE blink
+  if (millis_now - state->last_bt_blink_ms >= UI_BLINK_INTERVAL_MS) {
     state->bt_blink_state = !state->bt_blink_state;
     state->last_bt_blink_ms = millis_now;
   }
@@ -396,9 +396,9 @@ void Display::update(uint64_t millis_now) {
   lv_obj_set_style_opa(state->bt_logo,
                        state->bt_blink_state ? ble_base_opa : LV_OPA_TRANSP, 0);
 
-  // REC blink at 500ms when recording
+  // REC blink when recording
   if (state->recording) {
-    if (millis_now - state->last_rec_blink_ms >= 500) {
+    if (millis_now - state->last_rec_blink_ms >= UI_BLINK_INTERVAL_MS) {
       state->rec_blink_state = !state->rec_blink_state;
       state->last_rec_blink_ms = millis_now;
     }
@@ -408,11 +408,11 @@ void Display::update(uint64_t millis_now) {
 
   // Battery blink and charge animation when charging
   if (state->batt_charging) {
-    if (millis_now - state->last_batt_blink_ms >= 500) {
+    if (millis_now - state->last_batt_blink_ms >= UI_BLINK_INTERVAL_MS) {
       state->batt_blink_state = !state->batt_blink_state;
       state->last_batt_blink_ms = millis_now;
     }
-    if (millis_now - state->last_batt_anim_ms >= 500) {
+    if (millis_now - state->last_batt_anim_ms >= UI_BLINK_INTERVAL_MS) {
       state->batt_anim_index =
           (state->batt_anim_index + 1) % (sizeof(kBatteryChargeAnimSymbols) /
                                           sizeof(kBatteryChargeAnimSymbols[0]));

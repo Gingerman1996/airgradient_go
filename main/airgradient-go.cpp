@@ -43,6 +43,9 @@
 #error "setResolution must be 0 or 1"
 #endif
 
+// Hardware panel width must be byte-aligned for the SSD16xx driver (multiple of 8)
+#define DISPLAY_HW_WIDTH (((DISPLAY_WIDTH + 7) / 8) * 8)
+
 #define DISPLAY_ROT_WIDTH DISPLAY_HEIGHT
 #define DISPLAY_ROT_HEIGHT DISPLAY_WIDTH
 
@@ -81,7 +84,7 @@ static SemaphoreHandle_t g_display_data_mux = nullptr;
 
 static const uint64_t kRecordingIntervalMs =
     10000; // 10s default, matches UI interval
-static const uint64_t kUiBlinkIntervalMs = 500;
+static const uint64_t kUiBlinkIntervalMs = UI_BLINK_INTERVAL_MS;
 static const float kBatteryCapacityMah = 2000.0f;
 static const uint16_t kBatteryEmptyMv = 3300;
 static const uint16_t kBatteryFullMv = 4200;
@@ -225,7 +228,7 @@ extern "C" void app_main(void) {
   // Initialize LVGL
   lv_init();
 
-  // Configure e-paper display (DISPLAY_WIDTH x DISPLAY_HEIGHT, rotated 180°)
+  // Configure e-paper display (hardware width is byte-aligned for driver)
   // MISO is set to GPIO24 to share SPI bus with W25N512 NAND flash
   epd_config_t epd_cfg = EPD_CONFIG_DEFAULT();
   epd_cfg.pins.busy = 10; // IO10
@@ -238,7 +241,7 @@ extern "C" void app_main(void) {
   epd_cfg.spi.host = SPI2_HOST;
   epd_cfg.spi.speed_hz = 4000000; // 4 MHz (same as working ESP32-C6 code)
   epd_cfg.panel.type = DISPLAY_PANEL_TYPE; // Panel type based on resolution
-  epd_cfg.panel.width = DISPLAY_WIDTH;
+  epd_cfg.panel.width = DISPLAY_HW_WIDTH;
   epd_cfg.panel.height = DISPLAY_HEIGHT;
   epd_cfg.panel.mirror_x = false;
   epd_cfg.panel.mirror_y = false;
@@ -360,7 +363,7 @@ extern "C" void app_main(void) {
   }
 
   // Scan I2C bus for connected devices (enable/disable via #define)
-  i2c_scanner_scan(i2c_bus, 2);
+  // i2c_scanner_scan(i2c_bus, 2);
 
   // ==================== CHARGER INITIALIZATION (BEFORE SENSORS!)
   // ====================
