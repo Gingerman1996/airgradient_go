@@ -10,6 +10,7 @@
 #include "i2c_scanner.h"
 
 #include "driver/gpio.h"
+#include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_random.h"
 #include "esp_timer.h"
@@ -24,6 +25,8 @@
 #include "epaper_lvgl.h"
 #include "epaper_panel.h"
 #include "lvgl.h"
+
+#include <string.h>
 
 // Display resolution selector
 // setResolution = 0 -> 144x296 (GDEY0213B74H 2.13")
@@ -122,6 +125,7 @@ struct DisplaySnapshot {
 
 static DisplaySnapshot g_display_snapshot = {};
 
+#if DISPLAY_STATIC_TEST
 static int rand_range_int(int min_val, int max_val) {
   if (max_val <= min_val) return min_val;
   uint32_t span = static_cast<uint32_t>(max_val - min_val + 1);
@@ -132,6 +136,32 @@ static float rand_range_1dp(int min_tenths, int max_tenths) {
   int v = rand_range_int(min_tenths, max_tenths);
   return static_cast<float>(v) / 10.0f;
 }
+
+static void apply_random_display(Display *display) {
+  if (!display) return;
+  display->setWiFiStatus(Display::WiFiStatus::Connected);
+  display->setGPSStatus(Display::GPSStatus::Fix);
+  display->setBLEStatus(Display::BLEStatus::Connected);
+  display->setRecording(false);
+  display->setBattery(rand_range_int(20, 100), false);
+  display->setFocusTile(Display::FocusTile::CO2);
+
+  for (int i = 0; i < 30; i += 1) {
+    display->setCO2(rand_range_int(400, 2000));
+  }
+
+  display->setPM25f(rand_range_1dp(0, 2500));
+  display->setTempCf(rand_range_1dp(180, 320));
+  display->setRHf(rand_range_1dp(300, 800));
+  display->setVOC(rand_range_int(0, 500));
+  display->setNOx(rand_range_int(0, 300));
+  display->setPressure(rand_range_int(980, 1030));
+  display->setTimeHM(rand_range_int(0, 23), rand_range_int(0, 59), true);
+}
+
+// Flag set by T1 button in static test mode to trigger random display refresh
+static volatile bool g_static_test_refresh_requested = false;
+#endif
 
 enum class AirLevel : uint8_t {
   Off = 0,
@@ -340,36 +370,103 @@ extern "C" void app_main(void) {
   ESP_LOGI(TAG, "INITIAL screen visible, waiting 1.5 seconds...");
   vTaskDelay(pdMS_TO_TICKS(1500));
 
-  if (lvgl_lock(-1)) {
-    ESP_LOGI(TAG, "Displaying random values...");
-    display.setWiFiStatus(Display::WiFiStatus::Connected);
-    display.setGPSStatus(Display::GPSStatus::Fix);
-    display.setBLEStatus(Display::BLEStatus::Connected);
-    display.setRecording(false);
-    display.setBattery(rand_range_int(20, 100), false);
-    display.setFocusTile(Display::FocusTile::CO2);
-
-    for (int i = 0; i < 30; i += 1) {
-      display.setCO2(rand_range_int(400, 2000));
-    }
-
-    display.setPM25f(rand_range_1dp(0, 2500));
-    display.setTempCf(rand_range_1dp(180, 320));
-    display.setRHf(rand_range_1dp(300, 800));
-    display.setVOC(rand_range_int(0, 500));
-    display.setNOx(rand_range_int(0, 300));
-    display.setPressure(rand_range_int(980, 1030));
-    display.setTimeHM(rand_range_int(0, 23), rand_range_int(0, 59), true);
-    lvgl_unlock();
+#if DISPLAY_STATIC_TEST
+  // Initialize I2C for sensors and buttons
+  ESP_LOGI(TAG, "Initializing I2C bus and sensors for static test...");
+  Sensors sensors_static;
+  g_sensors = &sensors_static;
+  
+  ret = sensors_static.init();
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "Sensors init failed: %s", esp_err_to_name(ret));
+  } else {
+    ESP_LOGI(TAG, "Sensors initialized successfully");
   }
 
-  ESP_LOGI(TAG, "Random values displayed, performing full refresh...");
+  i2c_master_bus_handle_t i2c_bus_static = sensors_static.getI2CBusHandle();
+  if (i2c_bus_static != NULL) {
+    ESP_LOGI(TAG, "Initializing CAP1203 capacitive buttons...");
+    ret = init_cap1203(i2c_bus_static);
+    if (ret != ESP_OK) {
+      ESP_LOGW(TAG, "CAP1203 init failed: %s", esp_err_to_name(ret));
+    } else {
+      ESP_LOGI(TAG, "CAP1203 ready - Press T1 button to refresh sensor values!");
+    }
+  }
+
+  // Display initial sensor values
+  if (lvgl_lock(-1)) {
+    ESP_LOGI(TAG, "Displaying initial sensor values...");
+    display.setWiFiStatus(Display::WiFiStatus::Off);
+    display.setGPSStatus(Display::GPSStatus::Off);
+    display.setBLEStatus(Display::BLEStatus::Disconnected);
+    display.setRecording(false);
+    display.setBattery(100, false);
+    display.setFocusTile(Display::FocusTile::CO2);
+    display.setTimeText("TEST");
+    lvgl_unlock();
+  }
   request_lvgl_refresh();
 
-#if DISPLAY_STATIC_TEST
-  ESP_LOGI(TAG, "Static display test mode active; skipping sensors and display task.");
+  ESP_LOGI(TAG, "Static sensor test mode active; press T1 to read & refresh.");
+  uint64_t last_sensor_update_ms = 0;
+  
   while (true) {
-    vTaskDelay(pdMS_TO_TICKS(60000));
+    int64_t now_ms = esp_timer_get_time() / 1000;
+    
+    // Update sensors periodically (every 100ms)
+    if (now_ms - last_sensor_update_ms >= 100) {
+      sensors_static.update(now_ms);
+      last_sensor_update_ms = now_ms;
+    }
+    
+    if (g_static_test_refresh_requested) {
+      g_static_test_refresh_requested = false;
+      ESP_LOGI(TAG, "T1 pressed - reading sensor values...");
+      
+      sensor_values_t values = {};
+      sensors_static.getValues(now_ms, &values);
+      
+      if (lvgl_lock(-1)) {
+        // Display real sensor values
+        if (values.have_co2_avg) {
+          display.setCO2(values.co2_ppm_avg);
+          ESP_LOGI(TAG, "CO2: %d ppm", values.co2_ppm_avg);
+        }
+        
+        if (values.have_co2_avg) {
+          display.setTempCf(values.temp_c_avg);
+          display.setRHf(values.rh_avg);
+          ESP_LOGI(TAG, "Temp: %.1f°C, RH: %.1f%%", values.temp_c_avg, values.rh_avg);
+        }
+        
+        if (values.pm25_mass > 0) {
+          display.setPM25f(values.pm25_mass);
+          ESP_LOGI(TAG, "PM2.5: %.1f µg/m³", values.pm25_mass);
+        }
+        
+        if (values.voc_index > 0) {
+          display.setVOC(values.voc_index);
+          ESP_LOGI(TAG, "VOC: %d", values.voc_index);
+        }
+        
+        if (values.nox_index > 0) {
+          display.setNOx(values.nox_index);
+          ESP_LOGI(TAG, "NOx: %d", values.nox_index);
+        }
+        
+        if (values.pressure_pa > 0) {
+          int pressure_hpa = (int)(values.pressure_pa / 100.0f);
+          display.setPressure(pressure_hpa);
+          ESP_LOGI(TAG, "Pressure: %d hPa", pressure_hpa);
+        }
+        
+        lvgl_unlock();
+      }
+      request_lvgl_refresh();
+      ESP_LOGI(TAG, "Sensor values updated on display");
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
   }
 #endif
 
@@ -1538,6 +1635,16 @@ static void button_event_callback(ButtonState state, void *user_data) {
   if (focus_event) {
     bool focus_changed = false;
     const char *focus_label = nullptr;
+    
+#if DISPLAY_STATIC_TEST
+    // In static test mode, T1 triggers random display refresh
+    if (state.id == ButtonID::BUTTON_LEFT) {
+      g_static_test_refresh_requested = true;
+      ESP_LOGI(TAG_BTN, "T1 pressed - requesting display refresh");
+      return;
+    }
+#endif
+
     if (state.id == ButtonID::BUTTON_LEFT) {
       if (g_focus_tile != Display::FocusTile::CO2) {
         g_focus_tile = Display::FocusTile::CO2;
