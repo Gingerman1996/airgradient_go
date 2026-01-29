@@ -53,7 +53,8 @@
 #define DISPLAY_ROT_WIDTH DISPLAY_HEIGHT
 #define DISPLAY_ROT_HEIGHT DISPLAY_WIDTH
 
-// Static UI test mode: show INITIAL then random values and halt.
+// Static UI test mode: now used as main display flow (full system path disabled).
+// Set to 0 to re-enable full system operation when display is fixed.
 #define DISPLAY_STATIC_TEST 1
 
 // LVGL configuration
@@ -90,7 +91,7 @@ static TaskHandle_t g_lvgl_task_handle = nullptr;
 static SemaphoreHandle_t g_display_data_mux = nullptr;
 
 static const uint64_t kRecordingIntervalMs =
-    10000; // 10s default, matches UI interval
+    1000; // 1s - update display every 1 second
 static const uint64_t kUiBlinkIntervalMs = UI_BLINK_INTERVAL_MS;
 static const float kBatteryCapacityMah = 2000.0f;
 static const uint16_t kBatteryEmptyMv = 3300;
@@ -174,6 +175,7 @@ enum class AirLevel : uint8_t {
 };
 
 static const char *charge_status_to_string(drivers::ChargeStatus status);
+static const char *antenna_status_to_string(GPS::AntennaStatus status);
 static int battery_percent_from_mv(uint16_t vbat_mv);
 static int battery_percent_from_soc(float soc_pct);
 static esp_err_t battery_soc_nvs_init(void);
@@ -374,13 +376,23 @@ extern "C" void app_main(void) {
   // Initialize I2C for sensors and buttons
   ESP_LOGI(TAG, "Initializing I2C bus and sensors for static test...");
   Sensors sensors_static;
+  GPS gps_static;
   g_sensors = &sensors_static;
+  g_gps = &gps_static;
   
   ret = sensors_static.init();
   if (ret != ESP_OK) {
     ESP_LOGW(TAG, "Sensors init failed: %s", esp_err_to_name(ret));
   } else {
     ESP_LOGI(TAG, "Sensors initialized successfully");
+  }
+
+  // Initialize GPS for static test
+  ret = gps_static.init();
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "GPS init failed: %s", esp_err_to_name(ret));
+  } else {
+    ESP_LOGI(TAG, "GPS initialized successfully");
   }
 
   i2c_master_bus_handle_t i2c_bus_static = sensors_static.getI2CBusHandle();
@@ -392,18 +404,39 @@ extern "C" void app_main(void) {
     } else {
       ESP_LOGI(TAG, "CAP1203 ready - Press T1 button to refresh sensor values!");
     }
+
+    // Initialize LP5036 LED driver for static test
+    ESP_LOGI(TAG, "Initializing LP5036 LED driver for static test...");
+    g_led_driver = new drivers::LP5036(i2c_bus_static, drivers::LP5036_I2C::ADDR_33);
+    if (g_led_driver == nullptr) {
+      ESP_LOGE(TAG, "Failed to allocate LP5036 driver");
+    } else {
+      ret = g_led_driver->init();
+      if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "LP5036 init failed: %s", esp_err_to_name(ret));
+        delete g_led_driver;
+        g_led_driver = nullptr;
+      } else {
+        g_led_driver->enable(true);
+        g_led_driver->set_log_scale(false);
+        g_led_driver->set_global_off(false);
+        g_led_driver->set_bank_brightness(0xFF);
+        g_led_driver->set_power_save(false);
+        ESP_LOGI(TAG, "LP5036 initialized successfully");
+      }
+    }
   }
 
   // Display initial sensor values
   if (lvgl_lock(-1)) {
     ESP_LOGI(TAG, "Displaying initial sensor values...");
     display.setWiFiStatus(Display::WiFiStatus::Off);
-    display.setGPSStatus(Display::GPSStatus::Off);
+    display.setGPSStatus(Display::GPSStatus::Searching);
     display.setBLEStatus(Display::BLEStatus::Disconnected);
     display.setRecording(false);
     display.setBattery(100, false);
     display.setFocusTile(Display::FocusTile::CO2);
-    display.setTimeText("TEST");
+    display.setTimeHM(0, 0, false);  // Initialize with invalid time
     lvgl_unlock();
   }
   request_lvgl_refresh();
@@ -412,12 +445,17 @@ extern "C" void app_main(void) {
   uint64_t static_last_sensor_update_ms = 0;
   uint64_t static_last_display_update_ms = 0;
   const uint64_t STATIC_DISPLAY_UPDATE_INTERVAL_MS = 1000;  // Update display every 1 second
+  uint64_t static_last_summary_ms = 0;
+  const uint64_t STATIC_SUMMARY_INTERVAL_MS = 5000;  // Log summary every 5 seconds
+  AirLevel prev_pm_level = AirLevel::Green;  // Track previous PM2.5 level
+  AirLevel prev_co2_level = AirLevel::Green;  // Track previous CO2 level
   
   while (true) {
     int64_t now_ms = esp_timer_get_time() / 1000;
     
-    // Update sensors periodically (every 100ms)
+    // Update GPS and sensors periodically (every 100ms)
     if (now_ms - static_last_sensor_update_ms >= 100) {
+      gps_static.update(now_ms);
       sensors_static.update(now_ms);
       static_last_sensor_update_ms = now_ms;
     }
@@ -462,10 +500,92 @@ extern "C" void app_main(void) {
           display.setPressure(pressure_hpa);
           ESP_LOGI(TAG, "Pressure: %d hPa", pressure_hpa);
         }
+
+        // Update status icons and indicators
+        display.setWiFiStatus(Display::WiFiStatus::Off);
+        display.setBLEStatus(Display::BLEStatus::Disconnected);
+        display.setRecording(false);
+        display.setAlert(false);
+        display.setBattery(100, false);
+        display.setIntervalSeconds(1);
+        
+        // Update time from GPS if available
+        bool gps_time_valid = gps_static.has_time();
+        if (gps_time_valid) {
+          display.setTimeHM(gps_static.utc_hour(), gps_static.utc_min(), true);
+          ESP_LOGI(TAG, "GPS Time: %02d:%02d", gps_static.utc_hour(), gps_static.utc_min());
+        } else {
+          display.setTimeHM(0, 0, false);
+        }
+        
+        // Update GPS status
+        if (gps_static.has_fix()) {
+          display.setGPSStatus(Display::GPSStatus::Fix);
+        } else if (gps_static.has_recent_sentence(now_ms, 5000)) {
+          display.setGPSStatus(Display::GPSStatus::Searching);
+        } else {
+          display.setGPSStatus(Display::GPSStatus::Off);
+        }
+
+        // Update GPS coordinates when available
+        bool gps_fix_valid = gps_static.has_fix();
+        display.setLatLon(gps_static.latitude_deg(), gps_static.longitude_deg(),
+                          gps_fix_valid);
         
         lvgl_unlock();
       }
       request_lvgl_refresh();
+
+      if (now_ms - static_last_summary_ms >= STATIC_SUMMARY_INTERVAL_MS) {
+        static_last_summary_ms = now_ms;
+
+        int battery_percent = -1;
+        bool battery_valid = false;
+        if (g_battery_soc.mutex &&
+            xSemaphoreTake(g_battery_soc.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+          battery_valid = g_battery_soc.initialized;
+          if (battery_valid) {
+            battery_percent = battery_percent_from_soc(g_battery_soc.soc_pct);
+          }
+          xSemaphoreGive(g_battery_soc.mutex);
+        }
+
+        bool gps_fix_valid = gps_static.has_fix();
+        bool gps_has_sentence = gps_static.has_recent_sentence(now_ms, 5000);
+        const char *gps_state = gps_fix_valid ? "FIX" : (gps_has_sentence ? "SEARCH" : "OFF");
+        GPS::AntennaStatus ant_status = gps_static.antenna_status();
+
+        ESP_LOGI(TAG, "━━━━━━━━━━━━━ SENSOR SUMMARY ━━━━━━━━━━━━━");
+        ESP_LOGI(TAG, "  CO2: %d ppm | T: %.1f°C | RH: %.1f%%",
+                 values.co2_ppm_avg, values.temp_c_avg, values.rh_avg);
+        ESP_LOGI(TAG, "  PM2.5: %.1f µg/m³ | VOC: %d | NOx: %d",
+                 values.pm25_mass, values.voc_index, values.nox_index);
+        ESP_LOGI(TAG, "  Pressure: %.1f hPa", values.pressure_pa / 100.0f);
+        ESP_LOGI(TAG, "  GPS: %s | Lat: %.6f | Lon: %.6f | ANT: %s",
+                 gps_state, gps_static.latitude_deg(), gps_static.longitude_deg(),
+                 antenna_status_to_string(ant_status));
+        if (battery_valid) {
+          ESP_LOGI(TAG, "  Battery: %d%% | Charging: N/A", battery_percent);
+        } else {
+          ESP_LOGI(TAG, "  Battery: N/A | Charging: N/A");
+        }
+        ESP_LOGI(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+      }
+
+      // Update LED bar only if air quality levels changed
+      if (g_led_driver != nullptr) {
+        AirLevel pm_level = pm25_level_from_ugm3(values.pm25_mass);
+        AirLevel co2_level = co2_level_from_ppm(values.co2_ppm_avg);
+        
+        // Check if either PM2.5 or CO2 level has changed
+        if (pm_level != prev_pm_level || co2_level != prev_co2_level) {
+          led_show_air_levels(pm_level, co2_level);
+          ESP_LOGI(TAG, "LED updated (stage changed) - PM2.5 level: %d, CO2 level: %d", 
+                   static_cast<int>(pm_level), static_cast<int>(co2_level));
+          prev_pm_level = pm_level;
+          prev_co2_level = co2_level;
+        }
+      }
     }
     vTaskDelay(pdMS_TO_TICKS(50));
   }
@@ -880,14 +1000,43 @@ extern "C" void app_main(void) {
       last_sensor_summary_ms = now_ms_u;
       sensor_values_t vals;
       sensors.getValues(now_ms, &vals);
+
+      int battery_percent = -1;
+      bool battery_valid = false;
+      if (g_battery_soc.mutex &&
+          xSemaphoreTake(g_battery_soc.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
+        battery_valid = g_battery_soc.initialized;
+        if (battery_valid) {
+          battery_percent = battery_percent_from_soc(g_battery_soc.soc_pct);
+        }
+        xSemaphoreGive(g_battery_soc.mutex);
+      }
+
+      bool gps_fix_valid = gps_ready && gps.has_fix();
+      bool gps_has_sentence = gps_ready &&
+                             gps.has_recent_sentence(now_ms_u, GPS_SENTENCE_TIMEOUT_MS);
+      const char *gps_state = gps_fix_valid ? "FIX" : (gps_has_sentence ? "SEARCH" : "OFF");
+      GPS::AntennaStatus ant_status = gps_ready ? gps.antenna_status()
+                                                : GPS::AntennaStatus::Unknown;
       
       ESP_LOGI(TAG, "━━━━━━━━━━━━━ SENSOR SUMMARY ━━━━━━━━━━━━━");
       ESP_LOGI(TAG, "  CO2: %d ppm | T: %.1f°C | RH: %.1f%%",
                vals.co2_ppm_avg, vals.temp_c_avg, vals.rh_avg);
       ESP_LOGI(TAG, "  PM2.5: %.1f µg/m³ | VOC: %d | NOx: %d",
                vals.pm25_mass, vals.voc_index, vals.nox_index);
-      ESP_LOGI(TAG, "  Pressure: %.1f hPa",
-               vals.pressure_pa / 100.0f);
+      ESP_LOGI(TAG, "  Pressure: %.1f hPa", vals.pressure_pa / 100.0f);
+      ESP_LOGI(TAG, "  GPS: %s | Lat: %.6f | Lon: %.6f | ANT: %s",
+               gps_state, gps_ready ? gps.latitude_deg() : 0.0f,
+               gps_ready ? gps.longitude_deg() : 0.0f,
+               antenna_status_to_string(ant_status));
+      if (battery_valid) {
+        const char *chg_str = battery_charging_valid
+                                  ? (battery_charging ? "YES" : "NO")
+                                  : "UNKNOWN";
+        ESP_LOGI(TAG, "  Battery: %d%% | Charging: %s", battery_percent, chg_str);
+      } else {
+        ESP_LOGI(TAG, "  Battery: N/A | Charging: UNKNOWN");
+      }
       ESP_LOGI(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     }
 
@@ -1296,6 +1445,20 @@ static const char *charge_status_to_string(drivers::ChargeStatus status) {
     return "TAPER";
   case drivers::ChargeStatus::TOPOFF_TIMER_ACTIVE:
     return "TOPOFF";
+  default:
+    return "UNKNOWN";
+  }
+}
+
+static const char *antenna_status_to_string(GPS::AntennaStatus status) {
+  switch (status) {
+  case GPS::AntennaStatus::Ok:
+    return "OK";
+  case GPS::AntennaStatus::Open:
+    return "OPEN";
+  case GPS::AntennaStatus::Short:
+    return "SHORT";
+  case GPS::AntennaStatus::Unknown:
   default:
     return "UNKNOWN";
   }

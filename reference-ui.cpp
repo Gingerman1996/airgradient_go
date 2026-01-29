@@ -213,7 +213,7 @@ static lv_obj_t *create_outline_box(lv_obj_t *parent, int x, int y, int w, int h
   return r;
 }
 
-static lv_obj_t *create_line(lv_obj_t *parent, const lv_point_precise_t *pts, uint16_t count, int width) {
+static lv_obj_t *create_line(lv_obj_t *parent, const lv_point_t *pts, uint16_t count, int width) {
   lv_obj_t *line = lv_line_create(parent);
   lv_obj_remove_style_all(line);
   lv_obj_clear_flag(line, LV_OBJ_FLAG_SCROLLABLE);
@@ -343,7 +343,7 @@ struct Display::DisplayState {
   lv_obj_t *chart_axis_y = nullptr;
   lv_obj_t *chart_axis_x = nullptr;
   lv_obj_t *chart_polyline = nullptr;
-  lv_point_precise_t chart_points[30] = {};
+  lv_point_t chart_points[30] = {};
   uint16_t chart_point_count = 0;
 
   lv_obj_t *logo_group = nullptr;
@@ -359,7 +359,6 @@ struct Display::DisplayState {
   bool recording = false;
   Display::WiFiStatus wifi_status = Display::WiFiStatus::Off;
   Display::GPSStatus gps_status = Display::GPSStatus::Off;
-  Display::BLEStatus ble_status = Display::BLEStatus::Disconnected;
 
   int battery_percent = 0;
 
@@ -426,14 +425,6 @@ static void apply_status(Display::DisplayState *S) {
   if (!S) return;
   set_visible(S->rec_outer, S->recording);
   set_visible(S->rec_inner, S->recording);
-
-  if (S->ble_label) {
-    const char *ble_text =
-        (S->ble_status == Display::BLEStatus::Connected) ? "BLE+" : "BLE-";
-    lv_label_set_text(S->ble_label, ble_text);
-    place_left_baseline(S->ble_label, sx(GoSimBase::kBleX, S->width),
-                        sy(GoSimBase::kBleBaselineY, S->height), S->cell_label_font);
-  }
 
   // WiFi: dot only when connected (simulator dims otherwise; 1-bit uses presence/absence).
   set_visible(S->wifi_dot, S->wifi_status == Display::WiFiStatus::Connected);
@@ -598,8 +589,7 @@ static void update_chart(Display::DisplayState *S, bool pm25) {
 
     const int px = chart_x + pad_x + static_cast<int>(t * inner_w + 0.5f);
     const int py = chart_y + pad_y + static_cast<int>((1.0f - clamped) * inner_h + 0.5f);
-    S->chart_points[i] = {static_cast<lv_value_precise_t>(px),
-                          static_cast<lv_value_precise_t>(py)};
+    S->chart_points[i] = {static_cast<lv_coord_t>(px), static_cast<lv_coord_t>(py)};
   }
 
   lv_line_set_points(S->chart_polyline, S->chart_points, S->chart_point_count);
@@ -722,23 +712,23 @@ bool Display::init(uint16_t w, uint16_t h) {
 
   // WiFi icon (poly-lines + dot), base coords approximate the SVG.
   {
-    const lv_point_precise_t outer_pts[3] = {
-        {static_cast<lv_value_precise_t>(sx(GoSimBase::kWifiOuterX1, w)),
-         static_cast<lv_value_precise_t>(sy(GoSimBase::kWifiOuterY1, h))},
-        {static_cast<lv_value_precise_t>(sx(GoSimBase::kWifiOuterX2, w)),
-         static_cast<lv_value_precise_t>(sy(GoSimBase::kWifiOuterY2, h))},
-        {static_cast<lv_value_precise_t>(sx(GoSimBase::kWifiOuterX3, w)),
-         static_cast<lv_value_precise_t>(sy(GoSimBase::kWifiOuterY3, h))},
+    const lv_point_t outer_pts[3] = {
+        {static_cast<lv_coord_t>(sx(GoSimBase::kWifiOuterX1, w)),
+         static_cast<lv_coord_t>(sy(GoSimBase::kWifiOuterY1, h))},
+        {static_cast<lv_coord_t>(sx(GoSimBase::kWifiOuterX2, w)),
+         static_cast<lv_coord_t>(sy(GoSimBase::kWifiOuterY2, h))},
+        {static_cast<lv_coord_t>(sx(GoSimBase::kWifiOuterX3, w)),
+         static_cast<lv_coord_t>(sy(GoSimBase::kWifiOuterY3, h))},
     };
     state->wifi_outer = create_line(state->root, outer_pts, 3, 2);
 
-    const lv_point_precise_t inner_pts[3] = {
-        {static_cast<lv_value_precise_t>(sx(GoSimBase::kWifiInnerX1, w)),
-         static_cast<lv_value_precise_t>(sy(GoSimBase::kWifiInnerY1, h))},
-        {static_cast<lv_value_precise_t>(sx(GoSimBase::kWifiInnerX2, w)),
-         static_cast<lv_value_precise_t>(sy(GoSimBase::kWifiInnerY2, h))},
-        {static_cast<lv_value_precise_t>(sx(GoSimBase::kWifiInnerX3, w)),
-         static_cast<lv_value_precise_t>(sy(GoSimBase::kWifiInnerY3, h))},
+    const lv_point_t inner_pts[3] = {
+        {static_cast<lv_coord_t>(sx(GoSimBase::kWifiInnerX1, w)),
+         static_cast<lv_coord_t>(sy(GoSimBase::kWifiInnerY1, h))},
+        {static_cast<lv_coord_t>(sx(GoSimBase::kWifiInnerX2, w)),
+         static_cast<lv_coord_t>(sy(GoSimBase::kWifiInnerY2, h))},
+        {static_cast<lv_coord_t>(sx(GoSimBase::kWifiInnerX3, w)),
+         static_cast<lv_coord_t>(sy(GoSimBase::kWifiInnerY3, h))},
     };
     state->wifi_inner = create_line(state->root, inner_pts, 3, 2);
 
@@ -751,15 +741,15 @@ bool Display::init(uint16_t w, uint16_t h) {
 
   // GPS icon (triangle outline)
   {
-    const lv_point_precise_t tri_pts[4] = {
-        {static_cast<lv_value_precise_t>(sx(GoSimBase::kGpsX1, w)),
-         static_cast<lv_value_precise_t>(sy(GoSimBase::kGpsY1, h))},
-        {static_cast<lv_value_precise_t>(sx(GoSimBase::kGpsX2, w)),
-         static_cast<lv_value_precise_t>(sy(GoSimBase::kGpsY2, h))},
-        {static_cast<lv_value_precise_t>(sx(GoSimBase::kGpsX3, w)),
-         static_cast<lv_value_precise_t>(sy(GoSimBase::kGpsY3, h))},
-        {static_cast<lv_value_precise_t>(sx(GoSimBase::kGpsX1, w)),
-         static_cast<lv_value_precise_t>(sy(GoSimBase::kGpsY1, h))},
+    const lv_point_t tri_pts[4] = {
+        {static_cast<lv_coord_t>(sx(GoSimBase::kGpsX1, w)),
+         static_cast<lv_coord_t>(sy(GoSimBase::kGpsY1, h))},
+        {static_cast<lv_coord_t>(sx(GoSimBase::kGpsX2, w)),
+         static_cast<lv_coord_t>(sy(GoSimBase::kGpsY2, h))},
+        {static_cast<lv_coord_t>(sx(GoSimBase::kGpsX3, w)),
+         static_cast<lv_coord_t>(sy(GoSimBase::kGpsY3, h))},
+        {static_cast<lv_coord_t>(sx(GoSimBase::kGpsX1, w)),
+         static_cast<lv_coord_t>(sy(GoSimBase::kGpsY1, h))},
     };
     state->gps_tri = create_line(state->root, tri_pts, 4, 1);
   }
@@ -904,19 +894,15 @@ bool Display::init(uint16_t w, uint16_t h) {
   const int pad_x = sx(GoSimBase::kChartPadX, w);
   const int pad_y = sy(GoSimBase::kChartPadY, h);
 
-  const lv_point_precise_t axis_y[2] = {
-      {static_cast<lv_value_precise_t>(chart_x + pad_x),
-       static_cast<lv_value_precise_t>(chart_y + pad_y)},
-      {static_cast<lv_value_precise_t>(chart_x + pad_x),
-       static_cast<lv_value_precise_t>(chart_y + chart_h - pad_y)},
+  const lv_point_t axis_y[2] = {
+      {static_cast<lv_coord_t>(chart_x + pad_x), static_cast<lv_coord_t>(chart_y + pad_y)},
+      {static_cast<lv_coord_t>(chart_x + pad_x), static_cast<lv_coord_t>(chart_y + chart_h - pad_y)},
   };
   state->chart_axis_y = create_line(state->root, axis_y, 2, 1);
 
-  const lv_point_precise_t axis_x[2] = {
-      {static_cast<lv_value_precise_t>(chart_x + pad_x),
-       static_cast<lv_value_precise_t>(chart_y + chart_h - pad_y)},
-      {static_cast<lv_value_precise_t>(chart_x + chart_w - pad_x),
-       static_cast<lv_value_precise_t>(chart_y + chart_h - pad_y)},
+  const lv_point_t axis_x[2] = {
+      {static_cast<lv_coord_t>(chart_x + pad_x), static_cast<lv_coord_t>(chart_y + chart_h - pad_y)},
+      {static_cast<lv_coord_t>(chart_x + chart_w - pad_x), static_cast<lv_coord_t>(chart_y + chart_h - pad_y)},
   };
   state->chart_axis_x = create_line(state->root, axis_x, 2, 1);
 
@@ -941,9 +927,8 @@ void Display::update(uint64_t /*millis_now*/) {
   // No periodic animations in this simulator-matching 1-bit implementation.
 }
 
-void Display::setBLEStatus(BLEStatus s) {
-  state->ble_status = s;
-  apply_status(state);
+void Display::setBLEStatus(BLEStatus /*s*/) {
+  // Simulator always shows "BLE" text; no visual state in 1-bit.
 }
 
 void Display::setWiFiStatus(WiFiStatus s) {
@@ -974,13 +959,6 @@ void Display::setAlert(bool /*on*/) {
 
 void Display::setIntervalSeconds(int /*seconds*/) {
   // Main screen (simulator) has no interval label.
-}
-
-void Display::setTimeText(const char *text) {
-  if (!state->time_label) return;
-  lv_label_set_text(state->time_label, text ? text : "--:--");
-  place_left_baseline(state->time_label, sx(GoSimBase::kTimeX, state->width),
-                      sy(GoSimBase::kTimeBaselineY, state->height), state->time_font);
 }
 
 void Display::setTimeHM(int hours, int minutes, bool valid) {
