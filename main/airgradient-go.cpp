@@ -11,6 +11,7 @@
 
 #include "driver/gpio.h"
 #include "esp_log.h"
+#include "esp_random.h"
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
 #include "nvs_flash.h"
@@ -48,6 +49,9 @@
 
 #define DISPLAY_ROT_WIDTH DISPLAY_HEIGHT
 #define DISPLAY_ROT_HEIGHT DISPLAY_WIDTH
+
+// Static UI test mode: show INITIAL then random values and halt.
+#define DISPLAY_STATIC_TEST 1
 
 // LVGL configuration
 #define LVGL_TICK_PERIOD_MS 5
@@ -118,6 +122,17 @@ struct DisplaySnapshot {
 
 static DisplaySnapshot g_display_snapshot = {};
 
+static int rand_range_int(int min_val, int max_val) {
+  if (max_val <= min_val) return min_val;
+  uint32_t span = static_cast<uint32_t>(max_val - min_val + 1);
+  return min_val + static_cast<int>(esp_random() % span);
+}
+
+static float rand_range_1dp(int min_tenths, int max_tenths) {
+  int v = rand_range_int(min_tenths, max_tenths);
+  return static_cast<float>(v) / 10.0f;
+}
+
 enum class AirLevel : uint8_t {
   Off = 0,
   Green,
@@ -178,6 +193,7 @@ extern "C" void app_main(void) {
     return;
   }
 
+#if !DISPLAY_STATIC_TEST
   xTaskCreatePinnedToCore(
       [](void *param) {
         (void)param;
@@ -197,6 +213,7 @@ extern "C" void app_main(void) {
         vTaskDelete(NULL);
       },
       "LogInit", 8192, nullptr, 2, nullptr, tskNO_AFFINITY);
+#endif
 
   // ==================== GPIO INITIALIZATION ====================
 
@@ -310,37 +327,51 @@ extern "C" void app_main(void) {
       return;
     }
 
-    // TEST SCREEN: Show all status icons and max values to verify display
-    ESP_LOGI(TAG, "Displaying TEST SCREEN with maximum values...");
-
-    // Status bar: Show all icons active
-    display.setWiFiStatus(Display::WiFiStatus::Connected); // WiFi icon visible
-    display.setGPSStatus(Display::GPSStatus::Fix);         // GPS icon visible
-    display.setBLEStatus(Display::BLEStatus::Connected);   // BLE icon visible
-    display.setBattery(100, true); // Battery 100% + charging
-    display.setRecording(true);    // REC icon visible
-    display.setIntervalSeconds(kRecordingIntervalMs / 1000); // Interval shown
-    display.setTimeHM(23, 59, true); // Time 23:59 (4 digits)
-    display.setAlert(true);          // Alert icon visible
-
-    // Sensor values: Maximum values for display segment testing
-    display.setPM25f(999.9f);    // PM2.5: 999.9 µg/m³ (max 4 digits)
-    display.setCO2(9999);        // CO2: 9999 ppm (max 4 digits)
-    display.setVOC(999);         // VOC: 999 (max 3 digits)
-    display.setNOx(999);         // NOx: 999 (max 3 digits)
-    display.setTempCf(100.0f);   // Temp: 100.0°C (test max display)
-    display.setRHf(99.9f);       // RH: 99.9% (reasonable max value)
-    display.setPressure(1013.0); // Pressure: 1013 hPa (standard pressure)
-
+    // INITIAL SCREEN: show a clear init state before random values.
+    ESP_LOGI(TAG, "Displaying INITIAL screen...");
+    display.setTimeText("INITIAL");
     lvgl_unlock();
   }
 
-  ESP_LOGI(TAG, "TEST SCREEN displayed, performing initial full refresh...");
+  ESP_LOGI(TAG, "INITIAL screen displayed, performing full refresh...");
   request_lvgl_refresh();
 
-  // Wait 3 seconds to let user see test screen
-  ESP_LOGI(TAG, "TEST SCREEN visible, waiting 3 seconds...");
-  vTaskDelay(pdMS_TO_TICKS(3000));
+  // Wait a moment to let user see INITIAL screen
+  ESP_LOGI(TAG, "INITIAL screen visible, waiting 1.5 seconds...");
+  vTaskDelay(pdMS_TO_TICKS(1500));
+
+  if (lvgl_lock(-1)) {
+    ESP_LOGI(TAG, "Displaying random values...");
+    display.setWiFiStatus(Display::WiFiStatus::Connected);
+    display.setGPSStatus(Display::GPSStatus::Fix);
+    display.setBLEStatus(Display::BLEStatus::Connected);
+    display.setRecording(false);
+    display.setBattery(rand_range_int(20, 100), false);
+    display.setFocusTile(Display::FocusTile::CO2);
+
+    for (int i = 0; i < 30; i += 1) {
+      display.setCO2(rand_range_int(400, 2000));
+    }
+
+    display.setPM25f(rand_range_1dp(0, 2500));
+    display.setTempCf(rand_range_1dp(180, 320));
+    display.setRHf(rand_range_1dp(300, 800));
+    display.setVOC(rand_range_int(0, 500));
+    display.setNOx(rand_range_int(0, 300));
+    display.setPressure(rand_range_int(980, 1030));
+    display.setTimeHM(rand_range_int(0, 23), rand_range_int(0, 59), true);
+    lvgl_unlock();
+  }
+
+  ESP_LOGI(TAG, "Random values displayed, performing full refresh...");
+  request_lvgl_refresh();
+
+#if DISPLAY_STATIC_TEST
+  ESP_LOGI(TAG, "Static display test mode active; skipping sensors and display task.");
+  while (true) {
+    vTaskDelay(pdMS_TO_TICKS(60000));
+  }
+#endif
 
   // ==================== DISPLAY UPDATE TASK ====================
   xTaskCreatePinnedToCore(display_task, "DisplayTask", 6 * 1024, &display, 4,

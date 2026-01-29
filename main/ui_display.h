@@ -36,6 +36,7 @@ public:
 
     // Time and interval controls
     void setIntervalSeconds(int seconds);
+    void setTimeText(const char *text);
     void setTimeHM(int hours, int minutes, bool valid);
 
     // Tile focus
@@ -58,6 +59,9 @@ public:
     // GPS coordinates (latitude and longitude)
     void setLatLon(float lat, float lon, bool valid);
 
-private:
+public:
     struct DisplayState;
-    DisplayState* state;};
+
+private:
+    DisplayState* state;
+};
