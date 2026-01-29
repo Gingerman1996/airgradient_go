@@ -408,21 +408,23 @@ extern "C" void app_main(void) {
   }
   request_lvgl_refresh();
 
-  ESP_LOGI(TAG, "Static sensor test mode active; press T1 to read & refresh.");
-  uint64_t last_sensor_update_ms = 0;
+  ESP_LOGI(TAG, "Static sensor test mode active; auto-updating every 1s.");
+  uint64_t static_last_sensor_update_ms = 0;
+  uint64_t static_last_display_update_ms = 0;
+  const uint64_t STATIC_DISPLAY_UPDATE_INTERVAL_MS = 1000;  // Update display every 1 second
   
   while (true) {
     int64_t now_ms = esp_timer_get_time() / 1000;
     
     // Update sensors periodically (every 100ms)
-    if (now_ms - last_sensor_update_ms >= 100) {
+    if (now_ms - static_last_sensor_update_ms >= 100) {
       sensors_static.update(now_ms);
-      last_sensor_update_ms = now_ms;
+      static_last_sensor_update_ms = now_ms;
     }
     
-    if (g_static_test_refresh_requested) {
-      g_static_test_refresh_requested = false;
-      ESP_LOGI(TAG, "T1 pressed - reading sensor values...");
+    // Update display every 1 second
+    if (now_ms - static_last_display_update_ms >= STATIC_DISPLAY_UPDATE_INTERVAL_MS) {
+      static_last_display_update_ms = now_ms;
       
       sensor_values_t values = {};
       sensors_static.getValues(now_ms, &values);
@@ -464,7 +466,6 @@ extern "C" void app_main(void) {
         lvgl_unlock();
       }
       request_lvgl_refresh();
-      ESP_LOGI(TAG, "Sensor values updated on display");
     }
     vTaskDelay(pdMS_TO_TICKS(50));
   }
