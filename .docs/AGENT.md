@@ -4,6 +4,13 @@
 
 ---
 
+## ⚙ Recent Updates (Jan 30, 2026)
+
+**Latest Commit**: `fix: static loop charger handover + SOC logging`
+- ✅ Static loop now includes **power-path handover** (VBUS↔OTG) to prevent reboot on plug-in
+- ✅ Static loop adds **BQ25629 status/fault/ADC logging** plus SOC update/save (NVS)
+- ✅ BQ25629 watchdog timeout now configurable (50/100/200s/disable), kicked before expiry
+
 ## ⚙ Recent Updates (Jan 13, 2026)
 
 **Latest Commit**: `feat: continuous sensor reading and timing updates`
