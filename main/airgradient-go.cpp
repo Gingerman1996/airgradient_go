@@ -53,10 +53,6 @@
 #define DISPLAY_ROT_WIDTH DISPLAY_HEIGHT
 #define DISPLAY_ROT_HEIGHT DISPLAY_WIDTH
 
-// Static UI test mode: now used as main display flow (full system path disabled).
-// Set to 0 to re-enable full system operation when display is fixed.
-#define DISPLAY_STATIC_TEST 1
-
 // LVGL configuration
 #define LVGL_TICK_PERIOD_MS 5
 #define LVGL_TASK_MAX_DELAY_MS 500
@@ -126,7 +122,6 @@ struct DisplaySnapshot {
 
 static DisplaySnapshot g_display_snapshot = {};
 
-#if DISPLAY_STATIC_TEST
 static int rand_range_int(int min_val, int max_val) {
   if (max_val <= min_val) return min_val;
   uint32_t span = static_cast<uint32_t>(max_val - min_val + 1);
@@ -160,9 +155,8 @@ static void apply_random_display(Display *display) {
   display->setTimeHM(rand_range_int(0, 23), rand_range_int(0, 59), true);
 }
 
-// Flag set by T1 button in static test mode to trigger random display refresh
+// Flag set by T1 button to trigger random display refresh
 static volatile bool g_static_test_refresh_requested = false;
-#endif
 
 enum class AirLevel : uint8_t {
   Off = 0,
@@ -225,29 +219,7 @@ extern "C" void app_main(void) {
     return;
   }
 
-#if !DISPLAY_STATIC_TEST
-  xTaskCreatePinnedToCore(
-      [](void *param) {
-        (void)param;
-        vTaskDelay(pdMS_TO_TICKS(2000));
-        esp_err_t log_ret = log_storage_init();
-        if (log_ret != ESP_OK) {
-          ESP_LOGW(TAG, "Log storage init failed: %s",
-                   esp_err_to_name(log_ret));
-        }
-
-        // Wait for SPIFFS mount and e-paper initialization to complete
-        // E-paper takes time to init, and they share SPI2_HOST bus
-        ESP_LOGI(TAG, "Waiting for SPIFFS mount before sensor record test...");
-        vTaskDelay(pdMS_TO_TICKS(15000));  // Wait 15s for everything to settle
-        sensor_record_test();
-
-        vTaskDelete(NULL);
-      },
-      "LogInit", 8192, nullptr, 2, nullptr, tskNO_AFFINITY);
-#endif
-
-  // ==================== GPIO INITIALIZATION ====================
+  // ==================== GPIO INITIALIZATION ======================================
 
   // Configure QON button (GPIO5) as input with pull-up
   gpio_config_t qon_cfg = {
@@ -372,7 +344,6 @@ extern "C" void app_main(void) {
   ESP_LOGI(TAG, "INITIAL screen visible, waiting 1.5 seconds...");
   vTaskDelay(pdMS_TO_TICKS(1500));
 
-#if DISPLAY_STATIC_TEST
   // Initialize I2C for sensors and buttons
   ESP_LOGI(TAG, "Initializing I2C bus and sensors for static test...");
   Sensors sensors_static;
@@ -562,7 +533,7 @@ extern "C" void app_main(void) {
     
     vTaskDelay(pdMS_TO_TICKS(50));
   }
-#endif
+  // Note: Code below is unreachable - main loop runs forever
 
   // ==================== DISPLAY UPDATE TASK ====================
   xTaskCreatePinnedToCore(display_task, "DisplayTask", 6 * 1024, &display, 4,
