@@ -160,7 +160,7 @@ struct GoSimBase {
 static int scale_axis(int v, int actual, int base) {
   return (v * actual + base / 2) / base;
 }
-static int sx(int v, int w) { return scale_axis(v, w, GoSimBase::kW); }
+static int sx(int v, int w) { return scale_axis(v, w, GoSimBase::kW) + 2; }
 static int sy(int v, int h) { return scale_axis(v, h, GoSimBase::kH); }
 
 static int baseline_top_y(int baseline_y, const lv_font_t *font) {
@@ -611,8 +611,8 @@ static void update_chart(Display::DisplayState *S, bool pm25) {
     char max_val[16];
     format_1dp(min_val, sizeof(min_val), mn);
     format_1dp(max_val, sizeof(max_val), mx);
-    lv_snprintf(min_buf, sizeof(min_buf), "%s µg/m³", min_val);
-    lv_snprintf(max_buf, sizeof(max_buf), "%s µg/m³", max_val);
+    lv_snprintf(min_buf, sizeof(min_buf), "%s ug/m3", min_val);
+    lv_snprintf(max_buf, sizeof(max_buf), "%s ug/m3", max_val);
   } else {
     lv_snprintf(min_buf, sizeof(min_buf), "%d ppm", static_cast<int>(mn + 0.5f));
     lv_snprintf(max_buf, sizeof(max_buf), "%d ppm", static_cast<int>(mx + 0.5f));
@@ -664,7 +664,7 @@ bool Display::init(uint16_t w, uint16_t h) {
   state->width = w;
   state->height = h;
 
-  if (h <= 250) {
+  if (h <= 256) {
     state->time_font = &lv_font_montserrat_12;
     state->main_label_font = &lv_font_montserrat_12;
     state->main_value_font = &lv_font_montserrat_24;
@@ -783,7 +783,7 @@ bool Display::init(uint16_t w, uint16_t h) {
   // PM block
   state->pm_block = create_rect(state->root, 0, sy(GoSimBase::kPmBlockY, h), w, sy(GoSimBase::kPmBlockH, h), false);
   state->pm_label = lv_label_create(state->root);
-  lv_label_set_text(state->pm_label, "PM2.5 (µg/m³)");
+  lv_label_set_text(state->pm_label, "PM2.5 (ug/m3)");
   set_label_style(state->pm_label, state->main_label_font, lv_color_black());
   place_center_baseline(state->pm_label, center_x, sy(GoSimBase::kPmLabelBaselineY, h), state->main_label_font);
 

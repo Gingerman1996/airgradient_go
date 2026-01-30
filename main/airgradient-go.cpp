@@ -40,15 +40,15 @@
 #define DISPLAY_PANEL_TYPE EPD_PANEL_SSD16XX_290
 #elif setResolution == 1
 // GDEY0213B74 (2.13" 122x250) - standard 2.13" panel config
-#define DISPLAY_WIDTH 122
-#define DISPLAY_HEIGHT 250
+#define DISPLAY_WIDTH 128
+#define DISPLAY_HEIGHT 254
 #define DISPLAY_PANEL_TYPE EPD_PANEL_SSD16XX_213
 #else
 #error "setResolution must be 0 or 1"
 #endif
 
-// Hardware panel width must be byte-aligned for the SSD16xx driver (multiple of 8)
-#define DISPLAY_HW_WIDTH (((DISPLAY_WIDTH + 7) / 8) * 8)
+// Hardware panel width (144 is already byte-aligned, multiple of 8)
+#define DISPLAY_HW_WIDTH DISPLAY_WIDTH
 
 #define DISPLAY_ROT_WIDTH DISPLAY_HEIGHT
 #define DISPLAY_ROT_HEIGHT DISPLAY_WIDTH
@@ -427,166 +427,139 @@ extern "C" void app_main(void) {
     }
   }
 
-  // Display initial sensor values
+  // Initialize display status icons
   if (lvgl_lock(-1)) {
-    ESP_LOGI(TAG, "Displaying initial sensor values...");
+    ESP_LOGI(TAG, "Initializing display status icons...");
     display.setWiFiStatus(Display::WiFiStatus::Off);
     display.setGPSStatus(Display::GPSStatus::Searching);
     display.setBLEStatus(Display::BLEStatus::Disconnected);
     display.setRecording(false);
-    display.setBattery(100, false);
     display.setFocusTile(Display::FocusTile::CO2);
-    display.setTimeHM(0, 0, false);  // Initialize with invalid time
+    display.setIntervalSeconds(1);
+    display.setAlert(false);
     lvgl_unlock();
   }
   request_lvgl_refresh();
 
+  // ==================== DISPLAY UPDATE TASK (STATIC TEST) ====================
+  ESP_LOGI(TAG, "Starting display update task for static test...");
+  xTaskCreatePinnedToCore(display_task, "DisplayTask", 6 * 1024, &display, 4,
+                          &g_display_task_handle, tskNO_AFFINITY);
+
   ESP_LOGI(TAG, "Static sensor test mode active; auto-updating every 1s.");
   uint64_t static_last_sensor_update_ms = 0;
   uint64_t static_last_display_update_ms = 0;
-  const uint64_t STATIC_DISPLAY_UPDATE_INTERVAL_MS = 1000;  // Update display every 1 second
+  const uint64_t STATIC_DISPLAY_UPDATE_INTERVAL_MS = 100;  // Update display snapshot every 100ms
   uint64_t static_last_summary_ms = 0;
   const uint64_t STATIC_SUMMARY_INTERVAL_MS = 5000;  // Log summary every 5 seconds
+  const uint64_t STATIC_GPS_UI_UPDATE_INTERVAL_MS = 1000;  // Update GPS UI every 1 second
+  uint64_t static_last_gps_ui_ms = 0;
   AirLevel prev_pm_level = AirLevel::Green;  // Track previous PM2.5 level
   AirLevel prev_co2_level = AirLevel::Green;  // Track previous CO2 level
   
   while (true) {
     int64_t now_ms = esp_timer_get_time() / 1000;
+    uint64_t now_ms_u = (uint64_t)now_ms;
     
     // Update GPS and sensors periodically (every 100ms)
-    if (now_ms - static_last_sensor_update_ms >= 100) {
-      gps_static.update(now_ms);
+    if (now_ms_u - static_last_sensor_update_ms >= 100) {
+      gps_static.update(now_ms_u);
       sensors_static.update(now_ms);
-      static_last_sensor_update_ms = now_ms;
+      static_last_sensor_update_ms = now_ms_u;
     }
     
-    // Update display every 1 second
-    if (now_ms - static_last_display_update_ms >= STATIC_DISPLAY_UPDATE_INTERVAL_MS) {
-      static_last_display_update_ms = now_ms;
+    // Update display snapshot every 100ms (like DISPLAY_STATIC_TEST 0)
+    if (now_ms_u - static_last_display_update_ms >= STATIC_DISPLAY_UPDATE_INTERVAL_MS) {
+      static_last_display_update_ms = now_ms_u;
       
       sensor_values_t values = {};
       sensors_static.getValues(now_ms, &values);
       
-      if (lvgl_lock(-1)) {
-        // Display real sensor values
-        if (values.have_co2_avg) {
-          display.setCO2(values.co2_ppm_avg);
-          ESP_LOGI(TAG, "CO2: %d ppm", values.co2_ppm_avg);
-        }
+      // Update display snapshot for display_task to consume
+      if (g_display_data_mux &&
+          xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) == pdTRUE) {
+        g_display_snapshot.sensor = values;
+        g_display_snapshot.sensor_valid = true;
+        g_display_snapshot.sensor_update_ms = now_ms_u;
         
-        if (values.have_co2_avg) {
-          display.setTempCf(values.temp_c_avg);
-          display.setRHf(values.rh_avg);
-          ESP_LOGI(TAG, "Temp: %.1f°C, RH: %.1f%%", values.temp_c_avg, values.rh_avg);
-        }
+        // Update battery status (simplified for static test - always 100%)
+        g_display_snapshot.battery_percent = 100;
+        g_display_snapshot.battery_valid = true;
+        g_display_snapshot.battery_charging = false;
         
-        if (values.pm25_mass > 0) {
-          display.setPM25f(values.pm25_mass);
-          ESP_LOGI(TAG, "PM2.5: %.1f µg/m³", values.pm25_mass);
-        }
-        
-        if (values.voc_index > 0) {
-          display.setVOC(values.voc_index);
-          ESP_LOGI(TAG, "VOC: %d", values.voc_index);
-        }
-        
-        if (values.nox_index > 0) {
-          display.setNOx(values.nox_index);
-          ESP_LOGI(TAG, "NOx: %d", values.nox_index);
-        }
-        
-        if (values.pressure_pa > 0) {
-          int pressure_hpa = (int)(values.pressure_pa / 100.0f);
-          display.setPressure(pressure_hpa);
-          ESP_LOGI(TAG, "Pressure: %d hPa", pressure_hpa);
-        }
-
-        // Update status icons and indicators
-        display.setWiFiStatus(Display::WiFiStatus::Off);
-        display.setBLEStatus(Display::BLEStatus::Disconnected);
-        display.setRecording(false);
-        display.setAlert(false);
-        display.setBattery(100, false);
-        display.setIntervalSeconds(1);
-        
-        // Update time from GPS if available
-        bool gps_time_valid = gps_static.has_time();
-        if (gps_time_valid) {
-          display.setTimeHM(gps_static.utc_hour(), gps_static.utc_min(), true);
-          ESP_LOGI(TAG, "GPS Time: %02d:%02d", gps_static.utc_hour(), gps_static.utc_min());
-        } else {
-          display.setTimeHM(0, 0, false);
-        }
-        
-        // Update GPS status
-        if (gps_static.has_fix()) {
-          display.setGPSStatus(Display::GPSStatus::Fix);
-        } else if (gps_static.has_recent_sentence(now_ms, 5000)) {
-          display.setGPSStatus(Display::GPSStatus::Searching);
-        } else {
-          display.setGPSStatus(Display::GPSStatus::Off);
-        }
-
-        // Update GPS coordinates when available
-        bool gps_fix_valid = gps_static.has_fix();
-        display.setLatLon(gps_static.latitude_deg(), gps_static.longitude_deg(),
-                          gps_fix_valid);
-        
-        lvgl_unlock();
+        xSemaphoreGive(g_display_data_mux);
       }
-      request_lvgl_refresh();
-
-      if (now_ms - static_last_summary_ms >= STATIC_SUMMARY_INTERVAL_MS) {
-        static_last_summary_ms = now_ms;
-
-        int battery_percent = -1;
-        bool battery_valid = false;
-        if (g_battery_soc.mutex &&
-            xSemaphoreTake(g_battery_soc.mutex, pdMS_TO_TICKS(10)) == pdTRUE) {
-          battery_valid = g_battery_soc.initialized;
-          if (battery_valid) {
-            battery_percent = battery_percent_from_soc(g_battery_soc.soc_pct);
-          }
-          xSemaphoreGive(g_battery_soc.mutex);
-        }
-
-        bool gps_fix_valid = gps_static.has_fix();
-        bool gps_has_sentence = gps_static.has_recent_sentence(now_ms, 5000);
-        const char *gps_state = gps_fix_valid ? "FIX" : (gps_has_sentence ? "SEARCH" : "OFF");
-        GPS::AntennaStatus ant_status = gps_static.antenna_status();
-
-        ESP_LOGI(TAG, "━━━━━━━━━━━━━ SENSOR SUMMARY ━━━━━━━━━━━━━");
-        ESP_LOGI(TAG, "  CO2: %d ppm | T: %.1f°C | RH: %.1f%%",
-                 values.co2_ppm_avg, values.temp_c_avg, values.rh_avg);
-        ESP_LOGI(TAG, "  PM2.5: %.1f µg/m³ | VOC: %d | NOx: %d",
-                 values.pm25_mass, values.voc_index, values.nox_index);
-        ESP_LOGI(TAG, "  Pressure: %.1f hPa", values.pressure_pa / 100.0f);
-        ESP_LOGI(TAG, "  GPS: %s | Lat: %.6f | Lon: %.6f | ANT: %s",
-                 gps_state, gps_static.latitude_deg(), gps_static.longitude_deg(),
-                 antenna_status_to_string(ant_status));
-        if (battery_valid) {
-          ESP_LOGI(TAG, "  Battery: %d%% | Charging: N/A", battery_percent);
-        } else {
-          ESP_LOGI(TAG, "  Battery: N/A | Charging: N/A");
-        }
-        ESP_LOGI(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
-      }
-
+      
       // Update LED bar only if air quality levels changed
-      if (g_led_driver != nullptr) {
-        AirLevel pm_level = pm25_level_from_ugm3(values.pm25_mass);
-        AirLevel co2_level = co2_level_from_ppm(values.co2_ppm_avg);
-        
-        // Check if either PM2.5 or CO2 level has changed
-        if (pm_level != prev_pm_level || co2_level != prev_co2_level) {
-          led_show_air_levels(pm_level, co2_level);
-          ESP_LOGI(TAG, "LED updated (stage changed) - PM2.5 level: %d, CO2 level: %d", 
-                   static_cast<int>(pm_level), static_cast<int>(co2_level));
-          prev_pm_level = pm_level;
-          prev_co2_level = co2_level;
-        }
+      AirLevel pm_level = pm25_level_from_ugm3(values.pm25_mass);
+      AirLevel co2_level = values.have_co2_avg ? 
+                          co2_level_from_ppm(values.co2_ppm_avg) : AirLevel::Off;
+      
+      if (g_led_driver != nullptr && 
+          (pm_level != prev_pm_level || co2_level != prev_co2_level)) {
+        led_show_air_levels(pm_level, co2_level);
+        prev_pm_level = pm_level;
+        prev_co2_level = co2_level;
       }
     }
+    
+    // Update GPS status in snapshot every 1 second (like DISPLAY_STATIC_TEST 0)
+    if (now_ms_u - static_last_gps_ui_ms >= STATIC_GPS_UI_UPDATE_INTERVAL_MS) {
+      static_last_gps_ui_ms = now_ms_u;
+      
+      Display::GPSStatus gps_status = Display::GPSStatus::Off;
+      bool has_sentence = gps_static.has_recent_sentence(now_ms_u, 5000);
+      
+      if (has_sentence) {
+        gps_status = gps_static.has_fix() ? Display::GPSStatus::Fix 
+                                          : Display::GPSStatus::Searching;
+      }
+      
+      bool time_valid = has_sentence && gps_static.has_time();
+      int hour = gps_static.utc_hour();
+      int min = gps_static.utc_min();
+      bool fix_valid = gps_static.has_fix();
+      float lat = gps_static.latitude_deg();
+      float lon = gps_static.longitude_deg();
+      
+      if (g_display_data_mux &&
+          xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) == pdTRUE) {
+        g_display_snapshot.gps_status = gps_status;
+        g_display_snapshot.gps_time_valid = time_valid;
+        g_display_snapshot.gps_hour = hour;
+        g_display_snapshot.gps_min = min;
+        g_display_snapshot.gps_lat = lat;
+        g_display_snapshot.gps_lon = lon;
+        g_display_snapshot.gps_fix_valid = fix_valid;
+        xSemaphoreGive(g_display_data_mux);
+      }
+    }
+    
+    // Periodic sensor summary log every 5 seconds
+    if (now_ms_u - static_last_summary_ms >= STATIC_SUMMARY_INTERVAL_MS) {
+      static_last_summary_ms = now_ms_u;
+      
+      sensor_values_t values = {};
+      sensors_static.getValues(now_ms, &values);
+
+      bool gps_fix_valid = gps_static.has_fix();
+      bool gps_has_sentence = gps_static.has_recent_sentence(now_ms_u, 5000);
+      const char *gps_state = gps_fix_valid ? "FIX" : (gps_has_sentence ? "SEARCH" : "OFF");
+      GPS::AntennaStatus ant_status = gps_static.antenna_status();
+
+      ESP_LOGI(TAG, "━━━━━━━━━━━━━ SENSOR SUMMARY ━━━━━━━━━━━━━");
+      ESP_LOGI(TAG, "  CO2: %d ppm | T: %.1f°C | RH: %.1f%%",
+               values.co2_ppm_avg, values.temp_c_avg, values.rh_avg);
+      ESP_LOGI(TAG, "  PM2.5: %.1f µg/m³ | VOC: %d | NOx: %d",
+               values.pm25_mass, values.voc_index, values.nox_index);
+      ESP_LOGI(TAG, "  Pressure: %.1f hPa", values.pressure_pa / 100.0f);
+      ESP_LOGI(TAG, "  GPS: %s | Lat: %.6f | Lon: %.6f | ANT: %s",
+               gps_state, gps_static.latitude_deg(), gps_static.longitude_deg(),
+               antenna_status_to_string(ant_status));
+      ESP_LOGI(TAG, "  Battery: 100%% (Static) | Charging: NO");
+      ESP_LOGI(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
+    }
+    
     vTaskDelay(pdMS_TO_TICKS(50));
   }
 #endif
@@ -1800,15 +1773,7 @@ static void button_event_callback(ButtonState state, void *user_data) {
     bool focus_changed = false;
     const char *focus_label = nullptr;
     
-#if DISPLAY_STATIC_TEST
-    // In static test mode, T1 triggers random display refresh
-    if (state.id == ButtonID::BUTTON_LEFT) {
-      g_static_test_refresh_requested = true;
-      ESP_LOGI(TAG_BTN, "T1 pressed - requesting display refresh");
-      return;
-    }
-#endif
-
+    // T1 (left) -> CO2 tile, T3 (right) -> PM2.5 tile
     if (state.id == ButtonID::BUTTON_LEFT) {
       if (g_focus_tile != Display::FocusTile::CO2) {
         g_focus_tile = Display::FocusTile::CO2;
@@ -1821,9 +1786,16 @@ static void button_event_callback(ButtonState state, void *user_data) {
         focus_changed = true;
         focus_label = "PM2.5";
       }
+    } else if (state.id == ButtonID::BUTTON_RIGHT) {
+      if (g_focus_tile != Display::FocusTile::PM25) {
+        g_focus_tile = Display::FocusTile::PM25;
+        focus_changed = true;
+        focus_label = "PM2.5";
+      }
     }
     if (focus_changed) {
       g_focus_dirty = true;
+      request_lvgl_refresh_urgent();  // Refresh display immediately
       ESP_LOGI(TAG_BTN, "Focus set to %s tile", focus_label);
     }
   }
