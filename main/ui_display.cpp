@@ -16,6 +16,7 @@ constexpr int kPercentRoundHalfUp = 50;
 constexpr float kChartPadFactor = 0.08f;
 constexpr float kMinChartRange = 1e-3f;
 constexpr float kFallbackChartRange = 1.0f;
+constexpr uint64_t kGpsBlinkIntervalMs = 1000; // Set to 500 for faster blink
 
 // Generated from apps/website/content/images/logos/logo.svg at height=28, threshold=210.
 struct LogoRun {
@@ -300,7 +301,7 @@ struct Display::DisplayState {
   lv_obj_t *wifi_outer = nullptr;
   lv_obj_t *wifi_inner = nullptr;
   lv_obj_t *wifi_dot = nullptr;
-  lv_obj_t *gps_tri = nullptr;
+  lv_obj_t *gps_label = nullptr;
   lv_obj_t *battery_outline = nullptr;
   lv_obj_t *battery_nub = nullptr;
   lv_obj_t *battery_fill = nullptr;
@@ -360,6 +361,8 @@ struct Display::DisplayState {
   Display::WiFiStatus wifi_status = Display::WiFiStatus::Off;
   Display::GPSStatus gps_status = Display::GPSStatus::Off;
   Display::BLEStatus ble_status = Display::BLEStatus::Disconnected;
+  bool gps_blink_on = true;
+  uint64_t gps_blink_last_ms = 0;
 
   int battery_percent = 0;
 
@@ -438,9 +441,16 @@ static void apply_status(Display::DisplayState *S) {
   // WiFi: dot only when connected (simulator dims otherwise; 1-bit uses presence/absence).
   set_visible(S->wifi_dot, S->wifi_status == Display::WiFiStatus::Connected);
 
-  // GPS: thicker stroke only when fix (simulator dims otherwise).
-  if (S->gps_tri) {
-    lv_obj_set_style_line_width(S->gps_tri, S->gps_status == Display::GPSStatus::Fix ? 2 : 1, 0);
+  // GPS: blink only when searching, steady when fix, hidden when off.
+  if (S->gps_label) {
+    bool show = false;
+    if (S->gps_status == Display::GPSStatus::Fix) {
+      show = true;
+      S->gps_blink_on = true;
+    } else if (S->gps_status == Display::GPSStatus::Searching) {
+      show = S->gps_blink_on;
+    }
+    set_visible(S->gps_label, show);
   }
 
   update_battery(S);
@@ -749,19 +759,13 @@ bool Display::init(uint16_t w, uint16_t h) {
     lv_obj_set_style_radius(state->wifi_dot, dot_r, 0);
   }
 
-  // GPS icon (triangle outline)
+  // GPS icon (LVGL symbol)
   {
-    const lv_point_precise_t tri_pts[4] = {
-        {static_cast<lv_value_precise_t>(sx(GoSimBase::kGpsX1, w)),
-         static_cast<lv_value_precise_t>(sy(GoSimBase::kGpsY1, h))},
-        {static_cast<lv_value_precise_t>(sx(GoSimBase::kGpsX2, w)),
-         static_cast<lv_value_precise_t>(sy(GoSimBase::kGpsY2, h))},
-        {static_cast<lv_value_precise_t>(sx(GoSimBase::kGpsX3, w)),
-         static_cast<lv_value_precise_t>(sy(GoSimBase::kGpsY3, h))},
-        {static_cast<lv_value_precise_t>(sx(GoSimBase::kGpsX1, w)),
-         static_cast<lv_value_precise_t>(sy(GoSimBase::kGpsY1, h))},
-    };
-    state->gps_tri = create_line(state->root, tri_pts, 4, 1);
+    state->gps_label = lv_label_create(state->root);
+    lv_label_set_text(state->gps_label, LV_SYMBOL_GPS);
+    set_label_style(state->gps_label, state->time_font, lv_color_black());
+    place_left_baseline(state->gps_label, sx(GoSimBase::kGpsX1, w),
+                        sy(GoSimBase::kGpsY3, h), state->time_font);
   }
 
   // Battery outline + nub + fill.
@@ -937,8 +941,18 @@ bool Display::init(uint16_t w, uint16_t h) {
   return true;
 }
 
-void Display::update(uint64_t /*millis_now*/) {
-  // No periodic animations in this simulator-matching 1-bit implementation.
+void Display::update(uint64_t millis_now) {
+  if (!state) return;
+  if (state->gps_status == Display::GPSStatus::Searching && state->gps_label) {
+    if (state->gps_blink_last_ms == 0) {
+      state->gps_blink_last_ms = millis_now;
+    }
+    if (millis_now - state->gps_blink_last_ms >= kGpsBlinkIntervalMs) {
+      state->gps_blink_last_ms = millis_now;
+      state->gps_blink_on = !state->gps_blink_on;
+      set_visible(state->gps_label, state->gps_blink_on);
+    }
+  }
 }
 
 void Display::setBLEStatus(BLEStatus s) {
@@ -953,6 +967,14 @@ void Display::setWiFiStatus(WiFiStatus s) {
 
 void Display::setGPSStatus(GPSStatus s) {
   state->gps_status = s;
+  if (s == Display::GPSStatus::Searching) {
+    state->gps_blink_on = true;
+  } else if (s == Display::GPSStatus::Fix) {
+    state->gps_blink_on = true;
+  } else {
+    state->gps_blink_on = false;
+  }
+  state->gps_blink_last_ms = 0;
   apply_status(state);
 }
 

@@ -13,6 +13,7 @@
 #include "driver/uart.h"
 #include "esp_log.h"
 #include "esp_random.h"
+#include "esp_sleep.h"
 #include "esp_timer.h"
 #include "esp_task_wdt.h"
 #include "nvs_flash.h"
@@ -638,16 +639,17 @@ extern "C" void app_main(void) {
       
       Display::GPSStatus gps_status = Display::GPSStatus::Off;
       bool has_sentence = gps_static.has_recent_sentence(now_ms_u, 5000);
+      bool fix_valid = gps_static.has_fix();
       
-      if (has_sentence) {
-        gps_status = gps_static.has_fix() ? Display::GPSStatus::Fix 
-                                          : Display::GPSStatus::Searching;
+      if (fix_valid) {
+        gps_status = Display::GPSStatus::Fix;
+      } else if (has_sentence) {
+        gps_status = Display::GPSStatus::Searching;
       }
       
       bool time_valid = has_sentence && gps_static.has_time();
       int hour = gps_static.utc_hour();
       int min = gps_static.utc_min();
-      bool fix_valid = gps_static.has_fix();
       float lat = gps_static.latitude_deg();
       float lon = gps_static.longitude_deg();
       
@@ -1556,16 +1558,16 @@ extern "C" void app_main(void) {
       Display::GPSStatus gps_status = Display::GPSStatus::Off;
       bool has_sentence =
           gps.has_recent_sentence(now_ms_u, GPS_SENTENCE_TIMEOUT_MS);
-      if (has_sentence) {
-        gps_status = gps.has_recent_fix(now_ms_u, GPS_FIX_TIMEOUT_MS)
-                         ? Display::GPSStatus::Fix
-                         : Display::GPSStatus::Searching;
+      bool fix_valid = gps.has_fix();
+      if (fix_valid) {
+        gps_status = Display::GPSStatus::Fix;
+      } else if (has_sentence) {
+        gps_status = Display::GPSStatus::Searching;
       }
 
       bool time_valid = has_sentence && gps.has_time();
       int hour = gps.utc_hour();
       int min = gps.utc_min();
-      bool fix_valid = gps.has_fix();
       float lat = gps.latitude_deg();
       float lon = gps.longitude_deg();
 
@@ -2604,21 +2606,20 @@ static void initiate_shutdown(void) {
   // Phase 6: Enter ship mode
   ESP_LOGI(TAG, "Phase 6: Entering ship mode...");
   if (g_charger) {
-    g_charger->enter_ship_mode();
-    ESP_LOGI(TAG, "Ship mode command sent. System will power off shortly.");
+    esp_err_t ship_ret = g_charger->enter_ship_mode();
+    if (ship_ret == ESP_OK) {
+      ESP_LOGI(TAG, "Ship mode command sent. Entering deep sleep now.");
+    } else {
+      ESP_LOGW(TAG, "Ship mode command failed: %s",
+               esp_err_to_name(ship_ret));
+      ESP_LOGI(TAG, "Entering deep sleep anyway.");
+    }
   } else {
     ESP_LOGW(TAG, "Charger not initialized, cannot enter ship mode!");
+    ESP_LOGI(TAG, "Entering deep sleep anyway.");
   }
 
-  // Wait for ship mode to take effect (system should power off)
-  // If we reach here, ship mode failed
-  ESP_LOGI(TAG, "Waiting for power off...");
-  vTaskDelay(pdMS_TO_TICKS(2000));
-
-  ESP_LOGE(TAG, "System did not power off! Ship mode may have failed.");
-  while (1) {
-    vTaskDelay(pdMS_TO_TICKS(1000));
-  }
+  esp_deep_sleep_start();
 }
 
 // QON button monitor task
