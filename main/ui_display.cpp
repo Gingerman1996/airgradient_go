@@ -17,6 +17,8 @@ constexpr float kChartPadFactor = 0.08f;
 constexpr float kMinChartRange = 1e-3f;
 constexpr float kFallbackChartRange = 1.0f;
 constexpr uint64_t kGpsBlinkIntervalMs = 1000; // Set to 500 for faster blink
+constexpr uint64_t kChartSampleWindowMs = 2 * 60 * 1000ULL;
+constexpr uint64_t kChartSampleIntervalMs = kChartSampleWindowMs / 30;
 
 // Generated from apps/website/content/images/logos/logo.svg at height=28, threshold=210.
 struct LogoRun {
@@ -67,6 +69,8 @@ struct GoSimBase {
   // Icons (positions already include SVG transforms)
   static constexpr int kBleX = 55;
   static constexpr int kBleBaselineY = 15;
+  static constexpr int kBleXMarkSize = 6;
+  static constexpr int kBleXMarkGap = 3;
 
   // WiFi icon (approximate polyline points in simulator coordinates)
   static constexpr int kWifiOuterX1 = 81;
@@ -298,6 +302,8 @@ struct Display::DisplayState {
   lv_obj_t *rec_inner = nullptr;
 
   lv_obj_t *ble_label = nullptr;
+  lv_obj_t *ble_x1 = nullptr;
+  lv_obj_t *ble_x2 = nullptr;
   lv_obj_t *wifi_outer = nullptr;
   lv_obj_t *wifi_inner = nullptr;
   lv_obj_t *wifi_dot = nullptr;
@@ -360,9 +366,10 @@ struct Display::DisplayState {
   bool recording = false;
   Display::WiFiStatus wifi_status = Display::WiFiStatus::Off;
   Display::GPSStatus gps_status = Display::GPSStatus::Off;
-  Display::BLEStatus ble_status = Display::BLEStatus::Disconnected;
+  Display::BLEStatus ble_status = Display::BLEStatus::Off;
   bool gps_blink_on = true;
   uint64_t gps_blink_last_ms = 0;
+  uint64_t chart_sample_last_ms = 0;
 
   int battery_percent = 0;
 
@@ -434,7 +441,12 @@ static void apply_status(Display::DisplayState *S) {
     lv_label_set_text(S->ble_label, "BLE");
     place_left_baseline(S->ble_label, sx(GoSimBase::kBleX, S->width),
                         sy(GoSimBase::kBleBaselineY, S->height), S->cell_label_font);
+    set_visible(S->ble_label, S->ble_status != Display::BLEStatus::Off);
   }
+  const bool ble_connected = (S->ble_status == Display::BLEStatus::Connected);
+  const bool ble_visible = (S->ble_status != Display::BLEStatus::Off);
+  set_visible(S->ble_x1, ble_visible && !ble_connected);
+  set_visible(S->ble_x2, ble_visible && !ble_connected);
 
   // WiFi: dot only when connected (simulator dims otherwise; 1-bit uses presence/absence).
   set_visible(S->wifi_dot, S->wifi_status == Display::WiFiStatus::Connected);
@@ -727,6 +739,36 @@ bool Display::init(uint16_t w, uint16_t h) {
   lv_label_set_text(state->ble_label, "BLE");
   set_label_style(state->ble_label, state->cell_label_font, lv_color_black());
   place_left_baseline(state->ble_label, sx(GoSimBase::kBleX, w), sy(GoSimBase::kBleBaselineY, h), state->cell_label_font);
+  {
+    int mark_w = sx(GoSimBase::kBleXMarkSize, w);
+    int mark_h = sy(GoSimBase::kBleXMarkSize, h);
+    int mark_gap = sx(GoSimBase::kBleXMarkGap, w);
+    if (mark_w < 2) mark_w = 2;
+    if (mark_h < 2) mark_h = 2;
+    if (mark_gap < 1) mark_gap = 1;
+
+    const int ble_x = sx(GoSimBase::kBleX, w);
+    const int ble_base_y = sy(GoSimBase::kBleBaselineY, h);
+    const int ble_top = baseline_top_y(ble_base_y, state->cell_label_font);
+    const int text_h = state->cell_label_font ? state->cell_label_font->line_height : mark_h;
+    const int mark_x = ble_x - mark_gap - mark_w;
+    const int mark_y = ble_top + (text_h - mark_h) / 2;
+
+    const lv_point_precise_t x1_pts[2] = {
+        {static_cast<lv_value_precise_t>(mark_x),
+         static_cast<lv_value_precise_t>(mark_y)},
+        {static_cast<lv_value_precise_t>(mark_x + mark_w),
+         static_cast<lv_value_precise_t>(mark_y + mark_h)},
+    };
+    const lv_point_precise_t x2_pts[2] = {
+        {static_cast<lv_value_precise_t>(mark_x),
+         static_cast<lv_value_precise_t>(mark_y + mark_h)},
+        {static_cast<lv_value_precise_t>(mark_x + mark_w),
+         static_cast<lv_value_precise_t>(mark_y)},
+    };
+    state->ble_x1 = create_line(state->root, x1_pts, 2, 1);
+    state->ble_x2 = create_line(state->root, x2_pts, 2, 1);
+  }
 
   // WiFi icon (poly-lines + dot), base coords approximate the SVG.
   {
@@ -951,6 +993,18 @@ void Display::update(uint64_t millis_now) {
       set_visible(state->gps_label, state->gps_blink_on);
     }
   }
+
+  if (state->chart_sample_last_ms == 0 ||
+      (millis_now - state->chart_sample_last_ms) >= kChartSampleIntervalMs) {
+    state->chart_sample_last_ms = millis_now;
+    state->pm25_hist.push(state->latest_pm25);
+    state->co2_hist.push(state->latest_co2);
+    if (state->focus_tile == FocusTile::PM25) {
+      update_chart(state, true);
+    } else if (state->focus_tile == FocusTile::CO2) {
+      update_chart(state, false);
+    }
+  }
 }
 
 void Display::setBLEStatus(BLEStatus s) {
@@ -1035,16 +1089,12 @@ void Display::setFocusTile(FocusTile tile) {
 void Display::setPM25(int v) {
   state->latest_pm25 = static_cast<float>(v);
   state->latest_pm25_is_float = false;
-  state->pm25_hist.push(state->latest_pm25);
   update_pm_value(state);
-  if (state->focus_tile == FocusTile::PM25) update_chart(state, true);
 }
 
 void Display::setCO2(int v) {
   state->latest_co2 = static_cast<float>(v);
-  state->co2_hist.push(state->latest_co2);
   update_co2_value(state);
-  if (state->focus_tile == FocusTile::CO2) update_chart(state, false);
 }
 
 void Display::setVOC(int v) {
@@ -1077,9 +1127,7 @@ void Display::setPressure(int v) {
 void Display::setPM25f(float v) {
   state->latest_pm25 = v;
   state->latest_pm25_is_float = true;
-  state->pm25_hist.push(v);
   update_pm_value(state);
-  if (state->focus_tile == FocusTile::PM25) update_chart(state, true);
 }
 
 void Display::setTempCf(float v) {

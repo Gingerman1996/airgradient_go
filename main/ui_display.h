@@ -7,7 +7,7 @@
 
 class Display {
 public:
-    enum class BLEStatus { Disconnected, Connected };
+    enum class BLEStatus { Off, Disconnected, Connected };
     enum class WiFiStatus { Off, Connecting, Connected };
     enum class GPSStatus { Off, Searching, Fix };
     enum class FocusTile { CO2, PM25 };
