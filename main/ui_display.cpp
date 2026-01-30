@@ -642,9 +642,9 @@ static void update_chart(Display::DisplayState *S, bool pm25) {
   lv_label_set_text(S->max_value, max_buf);
 
   place_left_baseline(S->min_value, sx(GoSimBase::kCellLeftTextX, w), sy(GoSimBase::kRow3ValueBaselineY, h),
-                      S->cell_value_font);
+                      S->cell_label_font);
   place_left_baseline(S->max_value, sx(GoSimBase::kCellRightTextX, w), sy(GoSimBase::kRow3ValueBaselineY, h),
-                      S->cell_value_font);
+                      S->cell_label_font);
 }
 
 static lv_obj_t *create_logo_group(lv_obj_t *parent, int display_w, int display_h) {
@@ -927,8 +927,8 @@ bool Display::init(uint16_t w, uint16_t h) {
 
   state->min_value = lv_label_create(state->root);
   lv_label_set_text(state->min_value, "--");
-  set_label_style(state->min_value, state->cell_value_font, lv_color_black());
-  place_left_baseline(state->min_value, left_x, sy(GoSimBase::kRow3ValueBaselineY, h), state->cell_value_font);
+  set_label_style(state->min_value, state->cell_label_font, lv_color_black());
+  place_left_baseline(state->min_value, left_x, sy(GoSimBase::kRow3ValueBaselineY, h), state->cell_label_font);
 
   state->max_label = lv_label_create(state->root);
   lv_label_set_text(state->max_label, "Max");
@@ -937,8 +937,8 @@ bool Display::init(uint16_t w, uint16_t h) {
 
   state->max_value = lv_label_create(state->root);
   lv_label_set_text(state->max_value, "--");
-  set_label_style(state->max_value, state->cell_value_font, lv_color_black());
-  place_left_baseline(state->max_value, right_x, sy(GoSimBase::kRow3ValueBaselineY, h), state->cell_value_font);
+  set_label_style(state->max_value, state->cell_label_font, lv_color_black());
+  place_left_baseline(state->max_value, right_x, sy(GoSimBase::kRow3ValueBaselineY, h), state->cell_label_font);
 
   // Chart axes (hidden in none mode)
   const int chart_x = sx(GoSimBase::kChartX, w);
