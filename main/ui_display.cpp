@@ -431,9 +431,7 @@ static void apply_status(Display::DisplayState *S) {
   set_visible(S->rec_inner, S->recording);
 
   if (S->ble_label) {
-    const char *ble_text =
-        (S->ble_status == Display::BLEStatus::Connected) ? "BLE+" : "BLE-";
-    lv_label_set_text(S->ble_label, ble_text);
+    lv_label_set_text(S->ble_label, "BLE");
     place_left_baseline(S->ble_label, sx(GoSimBase::kBleX, S->width),
                         sy(GoSimBase::kBleBaselineY, S->height), S->cell_label_font);
   }
