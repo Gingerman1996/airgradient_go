@@ -53,6 +53,11 @@
 #define DISPLAY_ROT_WIDTH DISPLAY_HEIGHT
 #define DISPLAY_ROT_HEIGHT DISPLAY_WIDTH
 
+// LED configuration
+// LED_ENABLED = 0 -> LED bar disabled (saves power)
+// LED_ENABLED = 1 -> LED bar enabled (shows air quality)
+#define LED_ENABLED 0
+
 // LVGL configuration
 #define LVGL_TICK_PERIOD_MS 5
 #define LVGL_TASK_MAX_DELAY_MS 500
@@ -376,8 +381,9 @@ extern "C" void app_main(void) {
       ESP_LOGI(TAG, "CAP1203 ready - Press T1 button to refresh sensor values!");
     }
 
-    // Initialize LP5036 LED driver for static test
-    ESP_LOGI(TAG, "Initializing LP5036 LED driver for static test...");
+#if LED_ENABLED
+    // Initialize LP5036 LED driver
+    ESP_LOGI(TAG, "Initializing LP5036 LED driver...");
     g_led_driver = new drivers::LP5036(i2c_bus_static, drivers::LP5036_I2C::ADDR_33);
     if (g_led_driver == nullptr) {
       ESP_LOGE(TAG, "Failed to allocate LP5036 driver");
@@ -394,6 +400,104 @@ extern "C" void app_main(void) {
         g_led_driver->set_bank_brightness(0xFF);
         g_led_driver->set_power_save(false);
         ESP_LOGI(TAG, "LP5036 initialized successfully");
+      }
+    }
+#else
+    ESP_LOGI(TAG, "LED bar disabled by configuration");
+#endif
+
+    // ==================== BQ25629 CHARGER INITIALIZATION ====================
+    ESP_LOGI(TAG, "Initializing BQ25629 battery charger...");
+    g_charger = new drivers::BQ25629(i2c_bus_static);
+
+    drivers::BQ25629_Config charger_cfg = {
+        .charge_voltage_mv = 4200,      // 4.2V (full charge for Li-ion)
+        .charge_current_ma = 500,       // 500mA charging
+        .input_current_limit_ma = 1500, // 1500mA input limit
+        .input_voltage_limit_mv = 4600, // 4.6V VINDPM (works with 5V input)
+        .min_system_voltage_mv = 3520,  // 3.52V minimum
+        .precharge_current_ma = 30,     // 30mA pre-charge
+        .term_current_ma = 20,          // 20mA termination
+        .enable_charging = true,        // Enable charging
+        .enable_otg = false,            // Disable OTG mode
+        .enable_adc = true,             // Enable ADC for monitoring
+    };
+
+    ret = g_charger->init(charger_cfg);
+    if (ret != ESP_OK) {
+      ESP_LOGE(TAG, "BQ25629 init failed: %s", esp_err_to_name(ret));
+      delete g_charger;
+      g_charger = nullptr;
+    } else {
+      ESP_LOGI(TAG, "BQ25629 initialized successfully");
+
+      // Log charger limit registers for verification
+      g_charger->log_charger_limits();
+
+      // Configure JEITA temperature profile
+      ret = g_charger->configure_jeita_profile();
+      if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to configure JEITA profile: %s", esp_err_to_name(ret));
+      }
+
+      // Verify by reading ADC
+      drivers::BQ25629_ADC_Data adc_data;
+      ret = g_charger->read_adc(adc_data);
+      if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "ADC: VPMID=%umV VSYS=%umV VBAT=%umV VBUS=%umV",
+                 adc_data.vpmid_mv, adc_data.vsys_mv, adc_data.vbat_mv, adc_data.vbus_mv);
+        ESP_LOGI(TAG, "     IBUS=%dmA IBAT=%dmA TS=%.1f%% TDIE=%d°C",
+                 adc_data.ibus_ma, adc_data.ibat_ma, adc_data.ts_percent, adc_data.tdie_c);
+      } else {
+        ESP_LOGW(TAG, "Failed to read BQ25629 ADC: %s", esp_err_to_name(ret));
+      }
+
+      // Read NTC temperature
+      drivers::BQ25629_NTC_Data ntc_data;
+      ret = g_charger->read_ntc_temperature(ntc_data);
+      if (ret == ESP_OK) {
+        const char* zone_names[] = {"COLD", "COOL", "NORM", "WARM", "HOT", "UNKN"};
+        ESP_LOGI(TAG, "NTC: %.1f°C (%.0fΩ) Zone=%s",
+                 ntc_data.temperature_c, ntc_data.resistance_ohm, 
+                 zone_names[static_cast<int>(ntc_data.zone)]);
+      }
+
+      // ==================== ENABLE PMID 5V BOOST FOR SPS30 ====================
+      // SPS30 PM sensor requires 5V supply from PMID output
+      ESP_LOGI(TAG, "Enabling PMID 5V boost for SPS30 PM sensor...");
+      ret = g_charger->enable_pmid_5v_boost();
+      if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "PMID 5V boost enabled successfully!");
+        
+        // Wait for boost to stabilize and read ADC again
+        vTaskDelay(pdMS_TO_TICKS(100));
+        
+        // Read ADC after enabling boost to verify VPMID
+        ret = g_charger->read_adc(adc_data);
+        if (ret == ESP_OK) {
+          ESP_LOGI(TAG, "=== BQ25629 ADC AFTER PMID BOOST ===");
+          ESP_LOGI(TAG, "  VPMID = %u mV (should be ~5000mV)", adc_data.vpmid_mv);
+          ESP_LOGI(TAG, "  VSYS  = %u mV", adc_data.vsys_mv);
+          ESP_LOGI(TAG, "  VBAT  = %u mV", adc_data.vbat_mv);
+          ESP_LOGI(TAG, "  VBUS  = %u mV", adc_data.vbus_mv);
+          ESP_LOGI(TAG, "  IBUS  = %d mA", adc_data.ibus_ma);
+          ESP_LOGI(TAG, "  IBAT  = %d mA (+=charging, -=discharging)", adc_data.ibat_ma);
+          ESP_LOGI(TAG, "  TS    = %.1f %%", adc_data.ts_percent);
+          ESP_LOGI(TAG, "  TDIE  = %d °C", adc_data.tdie_c);
+          ESP_LOGI(TAG, "=================================");
+          
+          // Calculate and explain battery percentage
+          int bat_pct = battery_percent_from_mv(adc_data.vbat_mv);
+          ESP_LOGI(TAG, "Battery SOC Calculation (Voltage-based, NOT Coulomb Counting):");
+          ESP_LOGI(TAG, "  VBAT=%umV, Empty=%umV, Full=%umV",
+                   adc_data.vbat_mv, kBatteryEmptyMv, kBatteryFullMv);
+          ESP_LOGI(TAG, "  Formula: (VBAT - Empty) * 100 / (Full - Empty)");
+          ESP_LOGI(TAG, "  Result: (%u - %u) * 100 / (%u - %u) = %d%%",
+                   adc_data.vbat_mv, kBatteryEmptyMv, kBatteryFullMv, kBatteryEmptyMv, bat_pct);
+        }
+      } else {
+        ESP_LOGE(TAG, "Failed to enable PMID 5V boost: %s", esp_err_to_name(ret));
+        ESP_LOGW(TAG, "SPS30 PM sensor may not work without 5V supply!");
       }
     }
   }
@@ -417,7 +521,13 @@ extern "C" void app_main(void) {
   xTaskCreatePinnedToCore(display_task, "DisplayTask", 6 * 1024, &display, 4,
                           &g_display_task_handle, tskNO_AFFINITY);
 
-  ESP_LOGI(TAG, "Static sensor test mode active; auto-updating every 1s.");
+  // ==================== QON BUTTON TASK ====================
+  ESP_LOGI(TAG, "Starting QON button monitor task...");
+  xTaskCreatePinnedToCore(qon_button_task, "QON_Task", 4096, NULL,
+                          6, // High priority for shutdown detection
+                          NULL, tskNO_AFFINITY);
+
+  ESP_LOGI(TAG, "Sensor mode active; auto-updating every 1s.");
   uint64_t static_last_sensor_update_ms = 0;
   uint64_t static_last_display_update_ms = 0;
   const uint64_t STATIC_DISPLAY_UPDATE_INTERVAL_MS = 100;  // Update display snapshot every 100ms
@@ -425,8 +535,18 @@ extern "C" void app_main(void) {
   const uint64_t STATIC_SUMMARY_INTERVAL_MS = 5000;  // Log summary every 5 seconds
   const uint64_t STATIC_GPS_UI_UPDATE_INTERVAL_MS = 1000;  // Update GPS UI every 1 second
   uint64_t static_last_gps_ui_ms = 0;
+  
+  // Battery monitoring variables
+  uint64_t static_last_battery_ms = 0;
+  const uint64_t STATIC_BATTERY_UPDATE_INTERVAL_MS = 1000;  // Read battery every 1 second
+  int static_battery_percent = 0;
+  bool static_battery_charging = false;
+  bool static_battery_valid = false;
+  
+#if LED_ENABLED
   AirLevel prev_pm_level = AirLevel::Green;  // Track previous PM2.5 level
   AirLevel prev_co2_level = AirLevel::Green;  // Track previous CO2 level
+#endif
   
   while (true) {
     int64_t now_ms = esp_timer_get_time() / 1000;
@@ -453,14 +573,13 @@ extern "C" void app_main(void) {
         g_display_snapshot.sensor_valid = true;
         g_display_snapshot.sensor_update_ms = now_ms_u;
         
-        // Update battery status (simplified for static test - always 100%)
-        g_display_snapshot.battery_percent = 100;
-        g_display_snapshot.battery_valid = true;
-        g_display_snapshot.battery_charging = false;
+        // Battery status is updated separately in the battery reading section
+        // Don't overwrite here with hardcoded values
         
         xSemaphoreGive(g_display_data_mux);
       }
       
+#if LED_ENABLED
       // Update LED bar only if air quality levels changed
       AirLevel pm_level = pm25_level_from_ugm3(values.pm25_mass);
       AirLevel co2_level = values.have_co2_avg ? 
@@ -472,6 +591,7 @@ extern "C" void app_main(void) {
         prev_pm_level = pm_level;
         prev_co2_level = co2_level;
       }
+#endif
     }
     
     // Update GPS status in snapshot every 1 second (like DISPLAY_STATIC_TEST 0)
@@ -506,6 +626,54 @@ extern "C" void app_main(void) {
       }
     }
     
+    // Read battery status from BQ25629 every 1 second
+    if (g_charger && (now_ms_u - static_last_battery_ms >= STATIC_BATTERY_UPDATE_INTERVAL_MS)) {
+      static_last_battery_ms = now_ms_u;
+      
+      drivers::BQ25629_ADC_Data adc_data = {};
+      drivers::ChargeStatus charge_status = drivers::ChargeStatus::NOT_CHARGING;
+      drivers::VBusStatus vbus_status = drivers::VBusStatus::NO_ADAPTER;
+      
+      esp_err_t adc_ret = g_charger->read_adc(adc_data);
+      esp_err_t chg_ret = g_charger->get_charge_status(charge_status);
+      esp_err_t vbus_ret = g_charger->get_vbus_status(vbus_status);
+      
+      if (adc_ret == ESP_OK) {
+        // Calculate battery percent from voltage (linear interpolation, NOT coulomb counting)
+        static_battery_percent = battery_percent_from_mv(adc_data.vbat_mv);
+        static_battery_valid = true;
+        
+        // Log all ADC readings including VPMID for debugging
+        // Note: VBUS=0mV is expected when OTG mode is active (boost mode outputs, not inputs)
+        ESP_LOGI(TAG, "BQ ADC: VPMID=%umV VBAT=%umV VSYS=%umV VBUS=%umV IBAT=%dmA → %d%%",
+                 adc_data.vpmid_mv, adc_data.vbat_mv, adc_data.vsys_mv, 
+                 adc_data.vbus_mv, adc_data.ibat_ma, static_battery_percent);
+      } else {
+        ESP_LOGW(TAG, "BQ25629 ADC read failed: %s", esp_err_to_name(adc_ret));
+      }
+      
+      if (chg_ret == ESP_OK && vbus_ret == ESP_OK) {
+        // In OTG mode (boost), the device is outputting power, not charging
+        // VBUS ADC reads 0mV in OTG mode because VBUS is output, not input
+        if (vbus_status == drivers::VBusStatus::OTG_MODE) {
+          static_battery_charging = false;  // Cannot charge while in OTG/boost mode
+        } else {
+          static_battery_charging = (charge_status != drivers::ChargeStatus::NOT_CHARGING);
+        }
+      } else if (chg_ret == ESP_OK) {
+        static_battery_charging = (charge_status != drivers::ChargeStatus::NOT_CHARGING);
+      }
+      
+      // Update display snapshot with battery info
+      if (g_display_data_mux &&
+          xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) == pdTRUE) {
+        g_display_snapshot.battery_percent = static_battery_percent;
+        g_display_snapshot.battery_charging = static_battery_charging;
+        g_display_snapshot.battery_valid = static_battery_valid;
+        xSemaphoreGive(g_display_data_mux);
+      }
+    }
+    
     // Periodic sensor summary log every 5 seconds
     if (now_ms_u - static_last_summary_ms >= STATIC_SUMMARY_INTERVAL_MS) {
       static_last_summary_ms = now_ms_u;
@@ -527,7 +695,13 @@ extern "C" void app_main(void) {
       ESP_LOGI(TAG, "  GPS: %s | Lat: %.6f | Lon: %.6f | ANT: %s",
                gps_state, gps_static.latitude_deg(), gps_static.longitude_deg(),
                antenna_status_to_string(ant_status));
-      ESP_LOGI(TAG, "  Battery: 100%% (Static) | Charging: NO");
+      if (static_battery_valid) {
+        ESP_LOGI(TAG, "  Battery: %d%% | Charging: %s", 
+                 static_battery_percent,
+                 static_battery_charging ? "YES" : "NO");
+      } else {
+        ESP_LOGI(TAG, "  Battery: N/A (BQ not ready)");
+      }
       ESP_LOGI(TAG, "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━");
     }
     
