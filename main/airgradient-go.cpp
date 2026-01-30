@@ -355,6 +355,7 @@ extern "C" void app_main(void) {
   GPS gps_static;
   g_sensors = &sensors_static;
   g_gps = &gps_static;
+  bool static_boost_requested = false;
   
   ret = sensors_static.init();
   if (ret != ESP_OK) {
@@ -434,6 +435,14 @@ extern "C" void app_main(void) {
       // Log charger limit registers for verification
       g_charger->log_charger_limits();
 
+      // Set watchdog timeout to maximum supported (200s)
+      esp_err_t wd_cfg_ret =
+          g_charger->set_watchdog_timeout(drivers::WatchdogTimeout::Sec200);
+      if (wd_cfg_ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set BQ25629 watchdog timeout: %s",
+                 esp_err_to_name(wd_cfg_ret));
+      }
+
       // Configure JEITA temperature profile
       ret = g_charger->configure_jeita_profile();
       if (ret != ESP_OK) {
@@ -468,6 +477,7 @@ extern "C" void app_main(void) {
       ret = g_charger->enable_pmid_5v_boost();
       if (ret == ESP_OK) {
         ESP_LOGI(TAG, "PMID 5V boost enabled successfully!");
+        static_boost_requested = true;
         
         // Wait for boost to stabilize and read ADC again
         vTaskDelay(pdMS_TO_TICKS(100));
@@ -536,12 +546,40 @@ extern "C" void app_main(void) {
   const uint64_t STATIC_GPS_UI_UPDATE_INTERVAL_MS = 1000;  // Update GPS UI every 1 second
   uint64_t static_last_gps_ui_ms = 0;
   
-  // Battery monitoring variables
-  uint64_t static_last_battery_ms = 0;
-  const uint64_t STATIC_BATTERY_UPDATE_INTERVAL_MS = 1000;  // Read battery every 1 second
+  // Charger/power-path monitoring variables
+  uint64_t static_last_charger_log_ms = 0;
+  const uint64_t STATIC_CHARGER_LOG_INTERVAL_MS = 2000;
+  uint64_t static_last_power_path_check_ms = 0;
+  const uint64_t STATIC_POWER_PATH_CHECK_INTERVAL_MS = 250;
+  const uint64_t STATIC_VBUS_PRESENT_STABLE_MS = 1000;
+  const uint64_t STATIC_VBUS_ABSENT_STABLE_MS = 1000;
+  const uint64_t STATIC_VBUS_HANDOVER_DELAY_MS = 1000;
+  const uint64_t STATIC_VBUS_HANDOVER_STABLE_MS = 2000;
+  const uint64_t STATIC_VBUS_HANDOVER_LOG_INTERVAL_MS = 2000;
+  const uint16_t STATIC_VBUS_OK_MV = 4300;
+  const uint16_t STATIC_VSYS_OK_MV = 3500;
+  uint64_t static_vbus_present_since_ms = 0;
+  uint64_t static_vbus_absent_since_ms = 0;
+  bool static_vbus_present_last = false;
+  bool static_vbus_handover_active = false;
+  uint64_t static_vbus_handover_start_ms = 0;
+  uint64_t static_vbus_handover_last_log_ms = 0;
+  uint64_t static_vbus_handover_ok_since_ms = 0;
+  bool static_vbus_stable_known = false;
+  bool static_vbus_stable_last = false;
+  const int64_t STATIC_SPS30_READ_STALE_MS = 3000;
+  const uint16_t STATIC_PMID_LOW_MV = 4000;
+  uint64_t static_last_battery_soc_ms = 0;
+  uint64_t static_last_battery_soc_save_ms = 0;
+  const uint64_t STATIC_BATTERY_SOC_SAVE_INTERVAL_MS = 60000;
+  uint64_t static_last_wd_kick_ms = 0;
+  const uint64_t STATIC_WD_KICK_INTERVAL_MS = 150000; // Kick before 200s timeout
   int static_battery_percent = 0;
   bool static_battery_charging = false;
+  bool static_battery_charging_valid = false;
   bool static_battery_valid = false;
+  drivers::ChargeStatus static_last_charge_status = drivers::ChargeStatus::NOT_CHARGING;
+  bool static_charge_status_valid = false;
   
 #if LED_ENABLED
   AirLevel prev_pm_level = AirLevel::Green;  // Track previous PM2.5 level
@@ -573,7 +611,7 @@ extern "C" void app_main(void) {
         g_display_snapshot.sensor_valid = true;
         g_display_snapshot.sensor_update_ms = now_ms_u;
         
-        // Battery status is updated separately in the battery reading section
+        // Battery status is updated separately in the charger logging section
         // Don't overwrite here with hardcoded values
         
         xSemaphoreGive(g_display_data_mux);
@@ -625,52 +663,395 @@ extern "C" void app_main(void) {
         xSemaphoreGive(g_display_data_mux);
       }
     }
-    
-    // Read battery status from BQ25629 every 1 second
-    if (g_charger && (now_ms_u - static_last_battery_ms >= STATIC_BATTERY_UPDATE_INTERVAL_MS)) {
-      static_last_battery_ms = now_ms_u;
-      
-      drivers::BQ25629_ADC_Data adc_data = {};
-      drivers::ChargeStatus charge_status = drivers::ChargeStatus::NOT_CHARGING;
+
+    // Power-path / OTG handover handling (match main loop)
+    if (g_charger &&
+        (now_ms_u - static_last_power_path_check_ms >=
+         STATIC_POWER_PATH_CHECK_INTERVAL_MS)) {
+      static_last_power_path_check_ms = now_ms_u;
       drivers::VBusStatus vbus_status = drivers::VBusStatus::NO_ADAPTER;
-      
-      esp_err_t adc_ret = g_charger->read_adc(adc_data);
-      esp_err_t chg_ret = g_charger->get_charge_status(charge_status);
       esp_err_t vbus_ret = g_charger->get_vbus_status(vbus_status);
-      
-      if (adc_ret == ESP_OK) {
-        // Calculate battery percent from voltage (linear interpolation, NOT coulomb counting)
-        static_battery_percent = battery_percent_from_mv(adc_data.vbat_mv);
-        static_battery_valid = true;
-        
-        // Log all ADC readings including VPMID for debugging
-        // Note: VBUS=0mV is expected when OTG mode is active (boost mode outputs, not inputs)
-        ESP_LOGI(TAG, "BQ ADC: VPMID=%umV VBAT=%umV VSYS=%umV VBUS=%umV IBAT=%dmA → %d%%",
-                 adc_data.vpmid_mv, adc_data.vbat_mv, adc_data.vsys_mv, 
-                 adc_data.vbus_mv, adc_data.ibat_ma, static_battery_percent);
-      } else {
-        ESP_LOGW(TAG, "BQ25629 ADC read failed: %s", esp_err_to_name(adc_ret));
-      }
-      
-      if (chg_ret == ESP_OK && vbus_ret == ESP_OK) {
-        // In OTG mode (boost), the device is outputting power, not charging
-        // VBUS ADC reads 0mV in OTG mode because VBUS is output, not input
-        if (vbus_status == drivers::VBusStatus::OTG_MODE) {
-          static_battery_charging = false;  // Cannot charge while in OTG/boost mode
-        } else {
-          static_battery_charging = (charge_status != drivers::ChargeStatus::NOT_CHARGING);
+      if (vbus_ret == ESP_OK) {
+        bool otg_active = (vbus_status == drivers::VBusStatus::OTG_MODE);
+        bool vbus_present =
+            (vbus_status != drivers::VBusStatus::NO_ADAPTER) && !otg_active;
+        if (otg_active) {
+          drivers::BQ25629_ADC_Data adc_data = {};
+          esp_err_t adc_ret = g_charger->read_adc(adc_data);
+          if (adc_ret == ESP_OK) {
+            vbus_present = adc_data.vbus_mv >= 4000;
+          }
         }
-      } else if (chg_ret == ESP_OK) {
-        static_battery_charging = (charge_status != drivers::ChargeStatus::NOT_CHARGING);
+
+        if (vbus_present != static_vbus_present_last) {
+          if (vbus_present) {
+            static_vbus_present_since_ms = now_ms_u;
+            static_vbus_absent_since_ms = 0;
+          } else {
+            static_vbus_absent_since_ms = now_ms_u;
+            static_vbus_present_since_ms = 0;
+          }
+          static_vbus_present_last = vbus_present;
+        } else if (vbus_present) {
+          if (static_vbus_present_since_ms == 0)
+            static_vbus_present_since_ms = now_ms_u;
+        } else {
+          if (static_vbus_absent_since_ms == 0)
+            static_vbus_absent_since_ms = now_ms_u;
+        }
+
+        bool vbus_present_stable =
+            vbus_present &&
+            (now_ms_u - static_vbus_present_since_ms >=
+             STATIC_VBUS_PRESENT_STABLE_MS);
+        bool vbus_absent_stable =
+            !vbus_present &&
+            (now_ms_u - static_vbus_absent_since_ms >=
+             STATIC_VBUS_ABSENT_STABLE_MS);
+
+        bool vbus_stable_event = false;
+        bool vbus_stable_present = false;
+        if (vbus_present_stable || vbus_absent_stable) {
+          vbus_stable_present = vbus_present_stable;
+          if (!static_vbus_stable_known ||
+              vbus_stable_present != static_vbus_stable_last) {
+            vbus_stable_event = true;
+            static_vbus_stable_last = vbus_stable_present;
+            static_vbus_stable_known = true;
+          }
+        }
+
+        if (vbus_stable_event) {
+          bool sps30_reading =
+              sensors_static.isSps30Reading(now_ms, STATIC_SPS30_READ_STALE_MS);
+          if (!sps30_reading) {
+            ESP_LOGW(TAG, "VBUS changed (%s), SPS30 not reading",
+                     vbus_stable_present ? "present" : "absent");
+            drivers::BQ25629_ADC_Data adc_data = {};
+            esp_err_t adc_ret = g_charger->read_adc(adc_data);
+            if (adc_ret == ESP_OK) {
+              if (adc_data.vpmid_mv < STATIC_PMID_LOW_MV) {
+                ESP_LOGW(TAG, "PMID low (%u mV), attempting recovery",
+                         adc_data.vpmid_mv);
+                if (!vbus_stable_present) {
+                  esp_err_t boost_ret = g_charger->enable_pmid_5v_boost();
+                  if (boost_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to enable PMID 5V boost: %s",
+                             esp_err_to_name(boost_ret));
+                  } else {
+                    static_boost_requested = true;
+                  }
+                } else {
+                  esp_err_t chg_ret = g_charger->enable_charging(true);
+                  if (chg_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to enable charging: %s",
+                             esp_err_to_name(chg_ret));
+                  }
+                }
+              }
+            } else {
+              ESP_LOGW(TAG, "PMID check failed: %s", esp_err_to_name(adc_ret));
+            }
+          }
+        }
+
+        if (vbus_absent_stable && !otg_active) {
+          static_vbus_handover_active = false;
+          ESP_LOGI(TAG, "VBUS removed, enabling PMID 5V boost");
+          esp_err_t boost_ret = g_charger->enable_pmid_5v_boost();
+          if (boost_ret != ESP_OK) {
+            ESP_LOGW(TAG, "Failed to enable PMID 5V boost: %s",
+                     esp_err_to_name(boost_ret));
+          } else {
+            static_boost_requested = true;
+          }
+        } else if (vbus_present_stable &&
+                   (otg_active || static_boost_requested)) {
+          if (!static_vbus_handover_active) {
+            static_vbus_handover_active = true;
+            static_vbus_handover_start_ms = now_ms_u;
+            static_vbus_handover_last_log_ms = 0;
+            static_vbus_handover_ok_since_ms = 0;
+            ESP_LOGI(TAG, "VBUS stable, starting OTG->charge handover");
+            esp_err_t chg_ret = g_charger->enable_charging(true);
+            if (chg_ret != ESP_OK) {
+              ESP_LOGW(TAG, "Failed to enable charging: %s",
+                       esp_err_to_name(chg_ret));
+            }
+          }
+
+          if (now_ms_u - static_vbus_handover_start_ms >=
+              STATIC_VBUS_HANDOVER_DELAY_MS) {
+            drivers::BQ25629_ADC_Data adc_data = {};
+            esp_err_t adc_ret = g_charger->read_adc(adc_data);
+            if (adc_ret == ESP_OK) {
+              bool vbus_ok = adc_data.vbus_mv >= STATIC_VBUS_OK_MV;
+              bool vsys_ok = adc_data.vsys_mv >= STATIC_VSYS_OK_MV;
+              if (vbus_ok && vsys_ok) {
+                if (static_vbus_handover_ok_since_ms == 0) {
+                  static_vbus_handover_ok_since_ms = now_ms_u;
+                }
+                if (now_ms_u - static_vbus_handover_ok_since_ms >=
+                    STATIC_VBUS_HANDOVER_STABLE_MS) {
+                  ESP_LOGI(TAG, "VBUS/VSYS stable, disabling OTG boost");
+                  esp_err_t otg_ret = g_charger->enable_otg(false);
+                  if (otg_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to disable OTG: %s",
+                             esp_err_to_name(otg_ret));
+                  } else {
+                    static_boost_requested = false;
+                    static_vbus_handover_active = false;
+                    static_vbus_handover_ok_since_ms = 0;
+                    esp_err_t chg_ret = g_charger->enable_charging(true);
+                    if (chg_ret != ESP_OK) {
+                      ESP_LOGW(TAG, "Failed to enable charging: %s",
+                               esp_err_to_name(chg_ret));
+                    }
+                  }
+                }
+              } else if (now_ms_u - static_vbus_handover_last_log_ms >=
+                         STATIC_VBUS_HANDOVER_LOG_INTERVAL_MS) {
+                static_vbus_handover_last_log_ms = now_ms_u;
+                static_vbus_handover_ok_since_ms = 0;
+                ESP_LOGW(TAG,
+                         "VBUS handover waiting: VBUS=%u mV VSYS=%u mV "
+                         "(keeping boost)",
+                         adc_data.vbus_mv, adc_data.vsys_mv);
+              }
+            } else if (now_ms_u - static_vbus_handover_last_log_ms >=
+                       STATIC_VBUS_HANDOVER_LOG_INTERVAL_MS) {
+              static_vbus_handover_last_log_ms = now_ms_u;
+              ESP_LOGW(TAG, "VBUS handover ADC read failed: %s",
+                       esp_err_to_name(adc_ret));
+            }
+          }
+        } else {
+          static_vbus_handover_active = false;
+        }
       }
-      
-      // Update display snapshot with battery info
-      if (g_display_data_mux &&
-          xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) == pdTRUE) {
-        g_display_snapshot.battery_percent = static_battery_percent;
-        g_display_snapshot.battery_charging = static_battery_charging;
-        g_display_snapshot.battery_valid = static_battery_valid;
-        xSemaphoreGive(g_display_data_mux);
+    }
+
+    // Periodic charger watchdog reset to avoid OTG drop
+    if (g_charger &&
+        (now_ms_u - static_last_wd_kick_ms >= STATIC_WD_KICK_INTERVAL_MS)) {
+      static_last_wd_kick_ms = now_ms_u;
+      esp_err_t wd_ret = g_charger->reset_watchdog();
+      if (wd_ret != ESP_OK) {
+        ESP_LOGW(TAG, "BQ25629 watchdog reset failed: %s",
+                 esp_err_to_name(wd_ret));
+      }
+    }
+
+    // Periodic charger debug logging + SOC update (match main loop)
+    if (g_charger &&
+        (now_ms_u - static_last_charger_log_ms >=
+         STATIC_CHARGER_LOG_INTERVAL_MS)) {
+      static_last_charger_log_ms = now_ms_u;
+
+      drivers::BQ25629_Status charger_status = {};
+      drivers::BQ25629_Fault charger_fault = {};
+      drivers::BQ25629_ADC_Data adc_data = {};
+
+      esp_err_t status_ret = g_charger->read_status(charger_status);
+      esp_err_t fault_ret = g_charger->read_fault(charger_fault);
+      esp_err_t adc_ret = g_charger->read_adc(adc_data);
+
+      if (status_ret == ESP_OK) {
+        const char *charge_status =
+            charge_status_to_string(charger_status.charge_status);
+        static_last_charge_status = charger_status.charge_status;
+        static_charge_status_valid = true;
+        ESP_LOGI(TAG,
+                 "BQ25629 dbg - VBUS: %d, CHG: %d (%s), IOTG_REG: %d, "
+                 "VOTG_REG: %d, WD: %d",
+                 (int)charger_status.vbus_status,
+                 (int)charger_status.charge_status, charge_status,
+                 charger_status.iindpm_stat, charger_status.vindpm_stat,
+                 charger_status.wd_stat);
+        static_battery_charging = (charger_status.charge_status !=
+                                   drivers::ChargeStatus::NOT_CHARGING);
+        static_battery_charging_valid = true;
+        if (g_display_data_mux &&
+            xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) == pdTRUE) {
+          g_display_snapshot.battery_charging = static_battery_charging;
+          xSemaphoreGive(g_display_data_mux);
+        }
+
+      } else {
+        ESP_LOGW(TAG, "BQ25629 status read failed: %s",
+                 esp_err_to_name(status_ret));
+        static_charge_status_valid = false;
+        static_battery_charging_valid = false;
+      }
+
+      if (fault_ret == ESP_OK) {
+        ESP_LOGI(TAG,
+                 "BQ25629 fault - OTG: %d, TSHUT: %d, TS_STAT: %u, VBUS: %d, "
+                 "BAT: %d, SYS: %d",
+                 charger_fault.otg_fault, charger_fault.tshut_fault,
+                 charger_fault.ts_stat, charger_fault.vbus_fault,
+                 charger_fault.bat_fault, charger_fault.sys_fault);
+        if (charger_fault.otg_fault || charger_fault.tshut_fault ||
+            charger_fault.ts_stat != 0) {
+          ESP_LOGW(TAG,
+                   "BQ25629 fault/TS active - OTG: %d, TSHUT: %d, TS_STAT: %u",
+                   charger_fault.otg_fault, charger_fault.tshut_fault,
+                   charger_fault.ts_stat);
+        }
+      } else {
+        ESP_LOGW(TAG, "BQ25629 fault read failed: %s",
+                 esp_err_to_name(fault_ret));
+      }
+
+      if (adc_ret == ESP_OK) {
+        ESP_LOGI(
+            TAG,
+            "BQ25629 adc - VPMID: %u mV, VBAT: %u mV, VSYS: %u mV, VBUS: %u mV, IBAT: %d mA, IBUS: %d mA",
+            adc_data.vpmid_mv, adc_data.vbat_mv, adc_data.vsys_mv,
+            adc_data.vbus_mv, adc_data.ibat_ma, adc_data.ibus_ma);
+        if (!g_battery_soc.initialized && g_battery_soc.mutex &&
+            xSemaphoreTake(g_battery_soc.mutex, pdMS_TO_TICKS(10)) ==
+                pdTRUE) {
+          // Try to load SOC from NVS first
+          float nvs_soc_pct = 0.0f;
+          uint16_t nvs_vbat_mv = 0;
+          esp_err_t nvs_err = battery_soc_nvs_load(&nvs_soc_pct, &nvs_vbat_mv);
+
+          if (nvs_err == ESP_OK && nvs_vbat_mv > 0) {
+            // Calculate voltage difference
+            int16_t vbat_diff_mv =
+                (int16_t)adc_data.vbat_mv - (int16_t)nvs_vbat_mv;
+            ESP_LOGI(TAG,
+                     "Battery SOC loaded from NVS: %.1f%% (saved at %u mV, current %u mV, diff %d mV)",
+                     nvs_soc_pct, nvs_vbat_mv, adc_data.vbat_mv, vbat_diff_mv);
+
+            // If voltage difference is small (<100mV), trust the saved SOC
+            if (vbat_diff_mv >= -100 && vbat_diff_mv <= 100) {
+              g_battery_soc.soc_pct = nvs_soc_pct;
+              ESP_LOGI(TAG, "Using saved SOC (voltage stable)");
+            } else if (vbat_diff_mv > 100) {
+              // Voltage increased significantly - battery was charged
+              // Estimate SOC increase based on voltage change
+              float soc_from_voltage =
+                  (float)battery_percent_from_mv(adc_data.vbat_mv);
+              g_battery_soc.soc_pct =
+                  (nvs_soc_pct + soc_from_voltage) / 2.0f;
+              ESP_LOGI(TAG,
+                       "Voltage increased - estimating SOC: %.1f%% (blend of saved and voltage-based)",
+                       g_battery_soc.soc_pct);
+            } else {
+              // Voltage decreased significantly - battery self-discharged or measurement error
+              g_battery_soc.soc_pct = nvs_soc_pct - 2.0f; // Conservative 2% penalty
+              if (g_battery_soc.soc_pct < 0.0f)
+                g_battery_soc.soc_pct = 0.0f;
+              ESP_LOGI(TAG, "Voltage decreased - applying 2%% penalty: %.1f%%",
+                       g_battery_soc.soc_pct);
+            }
+          } else {
+            // No saved SOC, calculate from voltage
+            g_battery_soc.soc_pct =
+                (float)battery_percent_from_mv(adc_data.vbat_mv);
+            ESP_LOGI(TAG,
+                     "No saved SOC in NVS - initializing from voltage: %.1f%%",
+                     g_battery_soc.soc_pct);
+          }
+
+          g_battery_soc.last_vbat_mv = adc_data.vbat_mv;
+          g_battery_soc.initialized = true;
+          static_last_battery_soc_ms = now_ms_u;
+          static_last_battery_soc_save_ms = now_ms_u;
+          xSemaphoreGive(g_battery_soc.mutex);
+        } else if (static_last_battery_soc_ms > 0 && g_battery_soc.mutex &&
+                   xSemaphoreTake(g_battery_soc.mutex, pdMS_TO_TICKS(10)) ==
+                       pdTRUE) {
+          uint64_t dt_ms = now_ms_u - static_last_battery_soc_ms;
+          static_last_battery_soc_ms = now_ms_u;
+          float delta_pct =
+              ((float)adc_data.ibat_ma * (float)dt_ms * 100.0f) /
+              (kBatteryCapacityMah * 3600000.0f);
+          g_battery_soc.soc_pct += delta_pct;
+          g_battery_soc.last_vbat_mv = adc_data.vbat_mv;
+          xSemaphoreGive(g_battery_soc.mutex);
+        } else {
+          static_last_battery_soc_ms = now_ms_u;
+        }
+
+        if (g_battery_soc.initialized && g_battery_soc.mutex &&
+            xSemaphoreTake(g_battery_soc.mutex, pdMS_TO_TICKS(10)) ==
+                pdTRUE) {
+          int16_t ibat_abs = adc_data.ibat_ma < 0
+                                 ? (int16_t)-adc_data.ibat_ma
+                                 : adc_data.ibat_ma;
+          if (static_charge_status_valid &&
+              static_last_charge_status ==
+                  drivers::ChargeStatus::TOPOFF_TIMER_ACTIVE) {
+            g_battery_soc.soc_pct = 100.0f;
+          } else if (static_charge_status_valid &&
+                     static_last_charge_status ==
+                         drivers::ChargeStatus::TAPER_CHARGE &&
+                     adc_data.vbat_mv >= (kBatteryFullMv - 10) &&
+                     ibat_abs <= kBatteryRelaxedCurrentMa) {
+            g_battery_soc.soc_pct = 100.0f;
+          } else if (static_battery_charging_valid &&
+                     !static_battery_charging &&
+                     adc_data.vbat_mv <= kBatteryEmptyMv) {
+            g_battery_soc.soc_pct = 0.0f;
+          }
+          if (g_battery_soc.soc_pct < 0.0f)
+            g_battery_soc.soc_pct = 0.0f;
+          if (g_battery_soc.soc_pct > 100.0f)
+            g_battery_soc.soc_pct = 100.0f;
+          g_battery_soc.last_vbat_mv = adc_data.vbat_mv;
+          xSemaphoreGive(g_battery_soc.mutex);
+        }
+
+        // Update display snapshot
+        int battery_percent = 0;
+        if (g_battery_soc.mutex &&
+            xSemaphoreTake(g_battery_soc.mutex, pdMS_TO_TICKS(10)) ==
+                pdTRUE) {
+          battery_percent = battery_percent_from_soc(g_battery_soc.soc_pct);
+          xSemaphoreGive(g_battery_soc.mutex);
+        }
+
+        static_battery_percent = battery_percent;
+        static_battery_valid = g_battery_soc.initialized;
+
+        if (g_display_data_mux &&
+            xSemaphoreTake(g_display_data_mux, pdMS_TO_TICKS(10)) ==
+                pdTRUE) {
+          g_display_snapshot.battery_percent = battery_percent;
+          g_display_snapshot.battery_valid = g_battery_soc.initialized;
+          xSemaphoreGive(g_display_data_mux);
+        }
+
+        // Periodically save SOC to NVS
+        if (g_battery_soc.initialized &&
+            (now_ms_u - static_last_battery_soc_save_ms) >=
+                STATIC_BATTERY_SOC_SAVE_INTERVAL_MS &&
+            g_battery_soc.mutex &&
+            xSemaphoreTake(g_battery_soc.mutex, pdMS_TO_TICKS(10)) ==
+                pdTRUE) {
+          float soc_to_save = g_battery_soc.soc_pct;
+          uint16_t vbat_to_save = g_battery_soc.last_vbat_mv;
+          xSemaphoreGive(g_battery_soc.mutex);
+
+          static_last_battery_soc_save_ms = now_ms_u;
+          esp_err_t save_err = battery_soc_nvs_save(soc_to_save, vbat_to_save);
+          if (save_err == ESP_OK) {
+            ESP_LOGD(TAG, "Battery SOC saved to NVS: %.1f%% at %u mV",
+                     soc_to_save, vbat_to_save);
+          } else {
+            ESP_LOGW(TAG, "Failed to save battery SOC to NVS: %s",
+                     esp_err_to_name(save_err));
+          }
+        }
+        if (adc_data.vpmid_mv < STATIC_PMID_LOW_MV) {
+          ESP_LOGW(TAG, "PMID low: %u mV (VBAT: %u mV)", adc_data.vpmid_mv,
+                   adc_data.vbat_mv);
+        }
+      } else {
+        ESP_LOGW(TAG, "BQ25629 adc read failed: %s", esp_err_to_name(adc_ret));
       }
     }
     
@@ -696,9 +1077,11 @@ extern "C" void app_main(void) {
                gps_state, gps_static.latitude_deg(), gps_static.longitude_deg(),
                antenna_status_to_string(ant_status));
       if (static_battery_valid) {
+        const char *chg_str = static_battery_charging_valid
+                                  ? (static_battery_charging ? "YES" : "NO")
+                                  : "UNKNOWN";
         ESP_LOGI(TAG, "  Battery: %d%% | Charging: %s", 
-                 static_battery_percent,
-                 static_battery_charging ? "YES" : "NO");
+                 static_battery_percent, chg_str);
       } else {
         ESP_LOGI(TAG, "  Battery: N/A (BQ not ready)");
       }
@@ -763,6 +1146,14 @@ extern "C" void app_main(void) {
 
     // Log charger limit registers for verification
     g_charger->log_charger_limits();
+
+    // Set watchdog timeout to maximum supported (200s)
+    esp_err_t wd_cfg_ret =
+        g_charger->set_watchdog_timeout(drivers::WatchdogTimeout::Sec200);
+    if (wd_cfg_ret != ESP_OK) {
+      ESP_LOGW(TAG, "Failed to set BQ25629 watchdog timeout: %s",
+               esp_err_to_name(wd_cfg_ret));
+    }
 
     // Configure JEITA temperature profile
     ret = g_charger->configure_jeita_profile();
@@ -1041,6 +1432,7 @@ extern "C" void app_main(void) {
   const uint64_t VBUS_PRESENT_STABLE_MS = 1000;
   const uint64_t VBUS_ABSENT_STABLE_MS = 1000;
   const uint64_t VBUS_HANDOVER_DELAY_MS = 1000;
+  const uint64_t VBUS_HANDOVER_STABLE_MS = 2000;
   const uint64_t VBUS_HANDOVER_LOG_INTERVAL_MS = 2000;
   const uint16_t VBUS_OK_MV = 4300;
   const uint16_t VSYS_OK_MV = 3500;
@@ -1050,8 +1442,9 @@ extern "C" void app_main(void) {
   bool vbus_handover_active = false;
   uint64_t vbus_handover_start_ms = 0;
   uint64_t vbus_handover_last_log_ms = 0;
+  uint64_t vbus_handover_ok_since_ms = 0;
   uint64_t last_wd_kick_ms = 0;
-  const uint64_t WD_KICK_INTERVAL_MS = 10000; // Reset charger watchdog
+  const uint64_t WD_KICK_INTERVAL_MS = 150000; // Kick before 200s watchdog timeout
   uint64_t last_hw_wd_kick_ms = 0;
   uint64_t last_gps_ui_ms = 0;
   uint64_t last_sensor_summary_ms = 0;
@@ -1291,6 +1684,7 @@ extern "C" void app_main(void) {
           vbus_handover_active = true;
           vbus_handover_start_ms = now_ms_u;
           vbus_handover_last_log_ms = 0;
+          vbus_handover_ok_since_ms = 0;
           ESP_LOGI(TAG, "VBUS stable, starting OTG->charge handover");
           esp_err_t chg_ret = g_charger->enable_charging(true);
           if (chg_ret != ESP_OK) {
@@ -1306,23 +1700,31 @@ extern "C" void app_main(void) {
             bool vbus_ok = adc_data.vbus_mv >= VBUS_OK_MV;
             bool vsys_ok = adc_data.vsys_mv >= VSYS_OK_MV;
             if (vbus_ok && vsys_ok) {
-              ESP_LOGI(TAG, "VBUS/VSYS stable, disabling OTG boost");
-              esp_err_t otg_ret = g_charger->enable_otg(false);
-              if (otg_ret != ESP_OK) {
-                ESP_LOGW(TAG, "Failed to disable OTG: %s",
-                         esp_err_to_name(otg_ret));
-              } else {
-                boost_requested = false;
-                vbus_handover_active = false;
-                esp_err_t chg_ret = g_charger->enable_charging(true);
-                if (chg_ret != ESP_OK) {
-                  ESP_LOGW(TAG, "Failed to enable charging: %s",
-                           esp_err_to_name(chg_ret));
+              if (vbus_handover_ok_since_ms == 0) {
+                vbus_handover_ok_since_ms = now_ms_u;
+              }
+              if (now_ms_u - vbus_handover_ok_since_ms >=
+                  VBUS_HANDOVER_STABLE_MS) {
+                ESP_LOGI(TAG, "VBUS/VSYS stable, disabling OTG boost");
+                esp_err_t otg_ret = g_charger->enable_otg(false);
+                if (otg_ret != ESP_OK) {
+                  ESP_LOGW(TAG, "Failed to disable OTG: %s",
+                           esp_err_to_name(otg_ret));
+                } else {
+                  boost_requested = false;
+                  vbus_handover_active = false;
+                  vbus_handover_ok_since_ms = 0;
+                  esp_err_t chg_ret = g_charger->enable_charging(true);
+                  if (chg_ret != ESP_OK) {
+                    ESP_LOGW(TAG, "Failed to enable charging: %s",
+                             esp_err_to_name(chg_ret));
+                  }
                 }
               }
             } else if (now_ms_u - vbus_handover_last_log_ms >=
                        VBUS_HANDOVER_LOG_INTERVAL_MS) {
               vbus_handover_last_log_ms = now_ms_u;
+              vbus_handover_ok_since_ms = 0;
               ESP_LOGW(TAG,
                        "VBUS handover waiting: VBUS=%u mV VSYS=%u mV "
                        "(keeping boost)",
@@ -1341,12 +1743,15 @@ extern "C" void app_main(void) {
     }
 
     // Periodic charger watchdog reset to avoid OTG drop
+    // Must reset before configured timeout or EN_OTG will be reset to 0
     if (g_charger && (now_ms_u - last_wd_kick_ms >= WD_KICK_INTERVAL_MS)) {
       last_wd_kick_ms = now_ms_u;
       esp_err_t wd_ret = g_charger->reset_watchdog();
       if (wd_ret != ESP_OK) {
         ESP_LOGW(TAG, "BQ25629 watchdog reset failed: %s",
                  esp_err_to_name(wd_ret));
+      } else {
+        ESP_LOGD(TAG, "BQ25629 watchdog reset OK");
       }
     }
 
@@ -1940,7 +2345,10 @@ static void button_event_callback(ButtonState state, void *user_data) {
     }
     if (focus_changed) {
       g_focus_dirty = true;
-      request_lvgl_refresh_urgent();  // Refresh display immediately
+      // Wake up display task to process focus change immediately
+      if (g_display_task_handle) {
+        xTaskNotifyGive(g_display_task_handle);
+      }
       ESP_LOGI(TAG_BTN, "Focus set to %s tile", focus_label);
     }
   }
@@ -2404,7 +2812,8 @@ static void display_task(void *arg) {
       request_lvgl_refresh();
     }
 
-    vTaskDelay(pdMS_TO_TICKS(50));
+    // Wait for notification or timeout (allows immediate wake-up on button press)
+    ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(50));
   }
   
   // Task must delete itself before returning

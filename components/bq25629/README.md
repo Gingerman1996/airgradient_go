@@ -167,7 +167,10 @@ charger.enable_otg(false);  // ปิด
 ### 7. Watchdog Timer
 
 ```cpp
-// Reset watchdog timer (ควรทำทุก 50 วินาที)
+// ตั้งค่า watchdog timeout (รองรับ 50s/100s/200s/disable เท่านั้น)
+charger.set_watchdog_timeout(drivers::WatchdogTimeout::Sec200);
+
+// Reset watchdog timer (ควรทำก่อน timeout จะหมด)
 charger.reset_watchdog();
 ```
 

@@ -24,6 +24,11 @@ constexpr uint8_t EN_CHG = (1 << 5);
 constexpr uint8_t EN_HIZ = (1 << 4);
 constexpr uint8_t FORCE_PMID_DIS = (1 << 3);
 constexpr uint8_t WD_RST = (1 << 2);
+constexpr uint8_t WATCHDOG_MASK = 0x03;  // bits [1:0]
+constexpr uint8_t WATCHDOG_DISABLE = 0x00;
+constexpr uint8_t WATCHDOG_50S = 0x01;
+constexpr uint8_t WATCHDOG_100S = 0x02;
+constexpr uint8_t WATCHDOG_200S = 0x03;
 
 // CHARGER_CONTROL_2 (0x18)
 constexpr uint8_t EN_BYPASS_OTG = (1 << 7);
@@ -331,6 +336,21 @@ esp_err_t BQ25629::read_adc(BQ25629_ADC_Data &data) {
   esp_err_t ret;
   uint16_t raw_value;
 
+  // Ensure ADC is enabled in continuous mode before reading
+  // ADC_EN may be disabled after watchdog timeout or one-shot completion
+  uint8_t adc_ctrl = 0;
+  ret = read_register(BQ25629_REG::ADC_CONTROL, adc_ctrl);
+  if (ret == ESP_OK && !(adc_ctrl & BIT_MASK::ADC_EN)) {
+    // ADC is disabled, re-enable in continuous mode
+    ret = enable_adc(true, true);
+    if (ret != ESP_OK) {
+      ESP_LOGW(TAG, "Failed to re-enable ADC: %s", esp_err_to_name(ret));
+    } else {
+      // Wait for first conversion to complete (~30ms for 12-bit)
+      vTaskDelay(pdMS_TO_TICKS(50));
+    }
+  }
+
   // Read IBUS (2mA per LSB, 2's complement)
   // Bits [15:1] contain the data, bit [0] is reserved
   ret = read_register_16(BQ25629_REG::IBUS_ADC, raw_value);
@@ -352,27 +372,31 @@ esp_err_t BQ25629::read_adc(BQ25629_ADC_Data &data) {
   }
 
   // Read VBUS (3.97mV per LSB)
+  // Bits [14:2] contain the data, bits [15] and [1:0] are reserved
   ret = read_register_16(BQ25629_REG::VBUS_ADC, raw_value);
   if (ret == ESP_OK) {
-    data.vbus_mv = ((raw_value >> 2) * 397) / 100;
+    data.vbus_mv = (((raw_value >> 2) & 0x1FFF) * 397) / 100;
   }
 
   // Read VPMID (3.97mV per LSB)
+  // Bits [14:2] contain the data, bits [15] and [1:0] are reserved
   ret = read_register_16(BQ25629_REG::VPMID_ADC, raw_value);
   if (ret == ESP_OK) {
-    data.vpmid_mv = ((raw_value >> 2) * 397) / 100;
+    data.vpmid_mv = (((raw_value >> 2) & 0x1FFF) * 397) / 100;
   }
 
   // Read VBAT (1.99mV per LSB)
+  // Bits [12:1] contain the data, bits [15:13] and [0] are reserved
   ret = read_register_16(BQ25629_REG::VBAT_ADC, raw_value);
   if (ret == ESP_OK) {
-    data.vbat_mv = ((raw_value >> 1) * 199) / 100;
+    data.vbat_mv = (((raw_value >> 1) & 0x0FFF) * 199) / 100;
   }
 
   // Read VSYS (1.99mV per LSB)
+  // Bits [12:1] contain the data, bits [15:13] and [0] are reserved
   ret = read_register_16(BQ25629_REG::VSYS_ADC, raw_value);
   if (ret == ESP_OK) {
-    data.vsys_mv = ((raw_value >> 1) * 199) / 100;
+    data.vsys_mv = (((raw_value >> 1) & 0x0FFF) * 199) / 100;
   }
 
   // Read TS (0.0961% per LSB)
@@ -405,9 +429,76 @@ esp_err_t BQ25629::enable_adc(bool enable, bool continuous) {
   return write_register(BQ25629_REG::ADC_CONTROL, value);
 }
 
+esp_err_t BQ25629::set_watchdog_timeout(WatchdogTimeout timeout) {
+  uint8_t value =
+      static_cast<uint8_t>(timeout) & BIT_MASK::WATCHDOG_MASK;
+  esp_err_t ret = modify_register(BQ25629_REG::CHARGER_CONTROL_0,
+                                  BIT_MASK::WATCHDOG_MASK, value);
+  if (ret == ESP_OK) {
+    const char *label = "UNKNOWN";
+    switch (timeout) {
+    case WatchdogTimeout::Disable:
+      label = "DISABLED";
+      break;
+    case WatchdogTimeout::Sec50:
+      label = "50s";
+      break;
+    case WatchdogTimeout::Sec100:
+      label = "100s";
+      break;
+    case WatchdogTimeout::Sec200:
+      label = "200s";
+      break;
+    }
+    ESP_LOGI(TAG, "Watchdog timeout set to %s", label);
+  } else {
+    ESP_LOGE(TAG, "Failed to set watchdog timeout: %s",
+             esp_err_to_name(ret));
+  }
+  return ret;
+}
+
 esp_err_t BQ25629::reset_watchdog() {
-  return modify_register(BQ25629_REG::CHARGER_CONTROL_0, BIT_MASK::WD_RST,
+  // Check if OTG mode was active before reset (we need to restore it if watchdog expired)
+  VBusStatus current_vbus_status = VBusStatus::NO_ADAPTER;
+  bool otg_was_active = false;
+  esp_err_t status_ret = get_vbus_status(current_vbus_status);
+  if (status_ret == ESP_OK) {
+    otg_was_active = (current_vbus_status == VBusStatus::OTG_MODE);
+  }
+  
+  // Check if OTG is enabled in register (EN_OTG bit)
+  uint8_t ctrl2 = 0;
+  bool otg_enabled_in_reg = false;
+  esp_err_t ctrl_ret = read_register(BQ25629_REG::CHARGER_CONTROL_2, ctrl2);
+  if (ctrl_ret == ESP_OK) {
+    otg_enabled_in_reg = (ctrl2 & BIT_MASK::EN_OTG) != 0;
+  }
+  
+  // Reset watchdog timer
+  esp_err_t ret = modify_register(BQ25629_REG::CHARGER_CONTROL_0, BIT_MASK::WD_RST,
                          BIT_MASK::WD_RST);
+  if (ret != ESP_OK) {
+    return ret;
+  }
+  
+  // Re-enable ADC in continuous mode (ADC_EN is reset by watchdog)
+  ret = enable_adc(true, true);
+  if (ret != ESP_OK) {
+    ESP_LOGW(TAG, "Failed to re-enable ADC after watchdog reset");
+  }
+  
+  // If OTG was active or enabled before, re-enable it
+  // This handles case where watchdog expired and reset EN_OTG to 0
+  if (otg_was_active || otg_enabled_in_reg) {
+    // Re-enable OTG mode
+    ret = enable_otg(true);
+    if (ret != ESP_OK) {
+      ESP_LOGW(TAG, "Failed to re-enable OTG after watchdog reset");
+    }
+  }
+  
+  return ESP_OK;
 }
 
 esp_err_t BQ25629::is_battery_present(bool &present) {
@@ -668,6 +759,10 @@ esp_err_t BQ25629::set_ts_ignore(bool ignore) {
 esp_err_t BQ25629::enable_pmid_5v_boost() {
   ESP_LOGI(TAG, "Enabling PMID 5V boost output...");
   esp_err_t ret;
+
+  // Note: Watchdog timer remains enabled (default 50s)
+  // Controller must call reset_watchdog() periodically to prevent OTG disable
+  // If watchdog expires, EN_OTG will be reset to 0 automatically
 
   // Step 1: Disable HIZ mode (required for boost operation)
   ret = disable_hiz_mode();

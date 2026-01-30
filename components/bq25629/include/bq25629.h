@@ -103,6 +103,19 @@ enum class VBusStatus : uint8_t {
 };
 
 /**
+ * @brief BQ25629 Watchdog Timer Timeout
+ *
+ * Note: Device supports 50s/100s/200s or disable. 5 minutes is not supported
+ * by hardware.
+ */
+enum class WatchdogTimeout : uint8_t {
+  Disable = 0x00,
+  Sec50 = 0x01,
+  Sec100 = 0x02,
+  Sec200 = 0x03
+};
+
+/**
  * @brief BQ25629 Status Structure
  */
 struct BQ25629_Status {
@@ -281,6 +294,13 @@ public:
    * @return ESP_OK on success
    */
   esp_err_t reset_watchdog();
+
+  /**
+   * @brief Set watchdog timeout (50s/100s/200s/disable)
+   * @param timeout Watchdog timeout selection
+   * @return ESP_OK on success
+   */
+  esp_err_t set_watchdog_timeout(WatchdogTimeout timeout);
 
   /**
    * @brief Enable PMID discharge (force ~30mA discharge current)
