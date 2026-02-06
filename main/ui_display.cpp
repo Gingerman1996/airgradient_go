@@ -1,5 +1,8 @@
 #include "ui_display.h"
 #include "lvgl.h"
+#include "esp_timer.h"
+#include "nvs.h"
+#include <string.h>
 
 extern "C" {
 extern const lv_font_t lv_font_montserrat_32;

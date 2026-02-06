@@ -77,7 +77,7 @@ esp_err_t CAP1203::init() {
   // Sensitivity control (default 0x0F: DELTA_SENSE=0x0 -> 64x, BASE_SHIFT=0xF).
   // DELTA_SENSE[2:0] controls sensitivity (0=128x most sensitive, 7=1x least).
   // BASE_SHIFT[3:0] controls base count scaling; keep default 0xF.
-  ret = setSensitivity(0x00);
+  ret = setSensitivity(0x01);
   if (ret != ESP_OK) {
     ESP_LOGE(TAG, "Failed to set sensitivity");
     return ret;
