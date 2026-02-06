@@ -330,6 +330,11 @@ struct Display::DisplayState {
   lv_obj_t *grid_row3 = nullptr;
   lv_obj_t *grid_bottom = nullptr;
 
+  lv_obj_t *temp_block = nullptr;
+  lv_obj_t *humidity_block = nullptr;
+  lv_obj_t *tvoc_block = nullptr;
+  lv_obj_t *nox_block = nullptr;
+
   lv_obj_t *temp_label = nullptr;
   lv_obj_t *humidity_label = nullptr;
   lv_obj_t *tvoc_label = nullptr;
@@ -853,6 +858,20 @@ bool Display::init(uint16_t w, uint16_t h) {
 
   state->main_divider = create_line_rect(state->root, 0, sy(GoSimBase::kMainDividerY, h), w, sy(GoSimBase::kMainDividerH, h));
 
+  const int grid_x = sx(GoSimBase::kGridVLineX, w);
+  const int row1_y = sy(GoSimBase::kGridVLineY, h);
+  const int row2_y = sy(GoSimBase::kGridLineY_Row2, h);
+  const int row3_y = sy(GoSimBase::kGridLineY_Row3_None, h);
+  const int left_w = grid_x;
+  const int right_w = w - grid_x;
+  const int row1_h = row2_y - row1_y;
+  const int row2_h = row3_y - row2_y;
+
+  state->temp_block = create_rect(state->root, 0, row1_y, left_w, row1_h, false);
+  state->humidity_block = create_rect(state->root, grid_x, row1_y, right_w, row1_h, false);
+  state->tvoc_block = create_rect(state->root, 0, row2_y, left_w, row2_h, false);
+  state->nox_block = create_rect(state->root, grid_x, row2_y, right_w, row2_h, false);
+
   // Grid lines (pure BW, 1px lines are strong but consistent).
   state->grid_vline = create_line_rect(state->root, sx(GoSimBase::kGridVLineX, w), sy(GoSimBase::kGridVLineY, h), sx(1, w),
                                        sy(GoSimBase::kGridVLineH, h));
@@ -1078,10 +1097,18 @@ void Display::setFocusTile(FocusTile tile) {
 
   const bool pm_focused = (tile == FocusTile::PM25);
   const bool co2_focused = (tile == FocusTile::CO2);
+  const bool temp_focused = (tile == FocusTile::TEMP);
+  const bool humi_focused = (tile == FocusTile::HUMI);
+  const bool tvoc_focused = (tile == FocusTile::TVOC);
+  const bool nox_focused = (tile == FocusTile::NOX);
   const bool chart = pm_focused || co2_focused;
 
   set_block_inverted(state->pm_block, state->pm_label, state->pm_value, pm_focused);
   set_block_inverted(state->co2_block, state->co2_label, state->co2_value, co2_focused);
+  set_block_inverted(state->temp_block, state->temp_label, state->temp_value, temp_focused);
+  set_block_inverted(state->humidity_block, state->humidity_label, state->humidity_value, humi_focused);
+  set_block_inverted(state->tvoc_block, state->tvoc_label, state->tvoc_value, tvoc_focused);
+  set_block_inverted(state->nox_block, state->nox_label, state->nox_value, nox_focused);
 
   show_chart(state, chart);
   if (chart) {

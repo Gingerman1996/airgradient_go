@@ -2283,6 +2283,45 @@ static void led_off() {
   g_led_driver->set_global_off(true);
 }
 
+static Display::FocusTile focus_cycle_step(Display::FocusTile current, int dir) {
+  static const Display::FocusTile kCycle[] = {
+      Display::FocusTile::PM25,
+      Display::FocusTile::CO2,
+      Display::FocusTile::TEMP,
+      Display::FocusTile::HUMI,
+      Display::FocusTile::TVOC,
+      Display::FocusTile::NOX,
+  };
+  const size_t count = sizeof(kCycle) / sizeof(kCycle[0]);
+  size_t idx = 0;
+  for (; idx < count; ++idx) {
+    if (kCycle[idx] == current) break;
+  }
+  if (idx >= count) idx = 0;
+  const int step = (dir >= 0) ? 1 : -1;
+  const size_t next = (idx + count + step) % count;
+  return kCycle[next];
+}
+
+static const char *focus_tile_label(Display::FocusTile tile) {
+  switch (tile) {
+  case Display::FocusTile::PM25:
+    return "PM2.5";
+  case Display::FocusTile::CO2:
+    return "CO2";
+  case Display::FocusTile::TEMP:
+    return "Temp";
+  case Display::FocusTile::HUMI:
+    return "Humi";
+  case Display::FocusTile::TVOC:
+    return "TVOC";
+  case Display::FocusTile::NOX:
+    return "NOx";
+  default:
+    return "UNKNOWN";
+  }
+}
+
 // Button callback for CAP1203 (called when button events occur)
 static void button_event_callback(ButtonState state, void *user_data) {
   static const char *TAG_BTN = "CAP1203";
@@ -2322,27 +2361,28 @@ static void button_event_callback(ButtonState state, void *user_data) {
     break;
   }
 
-  bool focus_event = (state.event == ButtonEvent::PRESS ||
-                      state.event == ButtonEvent::SHORT_PRESS ||
-                      state.event == ButtonEvent::LONG_PRESS);
-  if (focus_event) {
+  // Use SHORT_PRESS only to avoid double toggles from PRESS/RELEASE events.
+  if (state.event == ButtonEvent::SHORT_PRESS) {
     bool focus_changed = false;
     const char *focus_label = nullptr;
     
-    // T1 (left) -> CO2 tile, T3 (right) -> PM2.5 tile
+    // T1 (left) -> previous, T3 (right) -> next
     if (state.id == ButtonID::BUTTON_LEFT) {
-      if (g_focus_tile != Display::FocusTile::CO2) {
-        g_focus_tile = Display::FocusTile::CO2;
+      Display::FocusTile next = focus_cycle_step(g_focus_tile, -1);
+      if (g_focus_tile != next) {
+        g_focus_tile = next;
         focus_changed = true;
-        focus_label = "CO2";
-      }
-    } else if (state.id == ButtonID::BUTTON_MIDDLE) {
-      if (g_focus_tile != Display::FocusTile::PM25) {
-        g_focus_tile = Display::FocusTile::PM25;
-        focus_changed = true;
-        focus_label = "PM2.5";
+        focus_label = focus_tile_label(next);
       }
     } else if (state.id == ButtonID::BUTTON_RIGHT) {
+      Display::FocusTile next = focus_cycle_step(g_focus_tile, 1);
+      if (g_focus_tile != next) {
+        g_focus_tile = next;
+        focus_changed = true;
+        focus_label = focus_tile_label(next);
+      }
+    } else if (state.id == ButtonID::BUTTON_MIDDLE) {
+      // Keep T2 as a direct PM2.5 shortcut.
       if (g_focus_tile != Display::FocusTile::PM25) {
         g_focus_tile = Display::FocusTile::PM25;
         focus_changed = true;
