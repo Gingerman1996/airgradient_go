@@ -10,6 +10,7 @@ typedef struct {
     int co2_ppm_avg;      // averaged CO2 ppm
     float temp_c_avg;     // averaged temperature in °C
     float rh_avg;         // averaged relative humidity in %RH
+    bool have_temp_rh;    // true if temperature/RH is available (STCC4 avg or SHT4x)
 
     float pm25_mass;      // PM2.5 µg/m³ (SPS30), 0 if unavailable
     int voc_ticks;        // SGP4x VOC ticks, 0 if unavailable

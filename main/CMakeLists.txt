@@ -10,6 +10,9 @@ idf_component_register(
         "."
     REQUIRES
         "stcc4"
+        "scd4x"
+        "i2cdev"
+        "esp_sht4x"
         "esp_sgp4x"
         "sps30"
         "sensirion_gas_index_algorithm"

@@ -2737,6 +2737,8 @@ static void display_task(void *arg) {
 
         if (snapshot.sensor.have_co2_avg) {
           display->setCO2(snapshot.sensor.co2_ppm_avg);
+        }
+        if (snapshot.sensor.have_temp_rh) {
           display->setTempCf(snapshot.sensor.temp_c_avg);
           display->setRHf(snapshot.sensor.rh_avg);
         }

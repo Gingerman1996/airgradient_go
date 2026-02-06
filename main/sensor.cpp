@@ -8,6 +8,8 @@
 #include "driver/i2c_master.h"
 
 #include "stcc4.h"
+#include "sht4x.h"
+#include "scd4x.h"
 #include "sgp4x.h"
 #include "sps30.h"
 #include "sensirion_gas_index_algorithm.h"
@@ -40,6 +42,13 @@ static const char *TAG_SENS = "sensors";
 // Required for long-term accuracy in high CO2 environments.
 #define STCC4_CONDITIONING_INTERVAL_MS (3 * 60 * 60 * 1000)
 
+// SHT4x backup temperature/RH sensor
+#define SHT4X_READ_INTERVAL_MS 1000
+#define SHT4X_MAX_AGE_MS 5000
+
+// SCD4x CO2 sensor fallback (5s update interval; poll every 1s for ready)
+#define SCD4X_READ_INTERVAL_MS 1000
+
 // DPS368 pressure sensor read interval (milliseconds)
 #define DPS368_READ_INTERVAL_MS 5000
 
@@ -64,6 +73,21 @@ struct Sensors::SensorsState {
     int64_t stcc4_state_time;
     int64_t stcc4_last_conditioning;
     int64_t stcc4_last_read;         // Last successful read time
+    bool stcc4_present;
+
+    // SCD4x CO2 sensor fallback
+    i2c_dev_t scd4x_dev;
+    bool scd4x_present;
+    int64_t scd4x_last_read;
+    int64_t scd4x_last_attempt;
+
+    // SHT4x backup temperature/RH sensor
+    sht4x_handle_t sht4x_handle;
+    bool sht4x_present;
+    float sht4x_temp_c;
+    float sht4x_rh;
+    int64_t sht4x_last_read;
+    int64_t sht4x_last_attempt;
 
     // CO2/Temp/RH ring buffer for last samples (5s average)
     int co2_ring_ppm[CO2_RING_CAP];
@@ -113,6 +137,16 @@ Sensors::Sensors() {
     state->i2c_bus_handle = NULL;
     state->stcc4_state = STCC4State::INIT;
     state->stcc4_last_read = 0;
+    state->stcc4_present = false;
+    state->scd4x_present = false;
+    state->scd4x_last_read = 0;
+    state->scd4x_last_attempt = 0;
+    state->sht4x_handle = NULL;
+    state->sht4x_present = false;
+    state->sht4x_temp_c = 0.0f;
+    state->sht4x_rh = 0.0f;
+    state->sht4x_last_read = 0;
+    state->sht4x_last_attempt = 0;
     state->co2_measurement = {
         .co2_ppm = 0,
         .temperature_raw = 0,
@@ -184,26 +218,41 @@ static inline bool co2_avg_last_5s(Sensors::SensorsState *st, int64_t now_ms, in
     return false;
 }
 
+static esp_err_t sht4x_read_measurement(Sensors::SensorsState *st, float *temp_c, float *rh) {
+    if (!st || !st->sht4x_handle) return ESP_ERR_INVALID_STATE;
+    return sht4x_get_measurement(st->sht4x_handle, temp_c, rh);
+}
+
 // Initialize I2C master bus with GPIO 6 (SCL) and GPIO 7 (SDA) at 100 kHz.
 // Enables internal pull-ups for I2C lines.
 // Returns ESP_OK on success, ESP_FAIL if already initialized or bus creation fails.
 static esp_err_t init_i2c_bus(i2c_master_bus_handle_t &i2c_bus_handle) {
     if (i2c_bus_handle) return ESP_OK;
-    i2c_master_bus_config_t i2c_mst_config = {
-        .i2c_port = I2C_MASTER_NUM,
-        .sda_io_num = (gpio_num_t)I2C_MASTER_SDA_IO,
-        .scl_io_num = (gpio_num_t)I2C_MASTER_SCL_IO,
-        .clk_source = I2C_CLK_SRC_DEFAULT,
-        .glitch_ignore_cnt = 7,
-        .intr_priority = 0,
-        .trans_queue_depth = 0,
-        .flags = {.enable_internal_pullup = true, .allow_pd = false}
-    };
-    esp_err_t ret = i2c_new_master_bus(&i2c_mst_config, &i2c_bus_handle);
+    esp_err_t ret = i2cdev_init();
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG_SENS, "I2C bus init failed: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG_SENS, "I2C subsystem init failed: %s", esp_err_to_name(ret));
         return ret;
     }
+
+    i2c_dev_t bus_probe = {};
+    bus_probe.port = I2C_MASTER_NUM;
+    bus_probe.addr = SCD4X_I2C_ADDR;
+    bus_probe.cfg.sda_io_num = (gpio_num_t)I2C_MASTER_SDA_IO;
+    bus_probe.cfg.scl_io_num = (gpio_num_t)I2C_MASTER_SCL_IO;
+    bus_probe.cfg.sda_pullup_en = true;
+    bus_probe.cfg.scl_pullup_en = true;
+    bus_probe.cfg.master.clk_speed = I2C_MASTER_FREQ_HZ;
+
+    // Force bus creation (probe result may fail if device is absent).
+    (void)i2c_dev_check_present(&bus_probe);
+
+    void *shared_handle = nullptr;
+    ret = i2cdev_get_shared_handle(I2C_MASTER_NUM, &shared_handle);
+    if (ret != ESP_OK || !shared_handle) {
+        ESP_LOGE(TAG_SENS, "I2C bus handle unavailable: %s", esp_err_to_name(ret));
+        return (ret == ESP_OK) ? ESP_FAIL : ret;
+    }
+    i2c_bus_handle = (i2c_master_bus_handle_t)shared_handle;
     ESP_LOGI(TAG_SENS, "I2C bus initialized (SCL=%d, SDA=%d)", I2C_MASTER_SCL_IO, I2C_MASTER_SDA_IO);
     return ESP_OK;
 }
@@ -222,6 +271,7 @@ esp_err_t Sensors::initI2CBus(void) {
 // Returns ESP_OK on success, error code from driver on failure.
 static esp_err_t init_stcc4_sensor(Sensors::SensorsState *state) {
     ESP_LOGI(TAG_SENS, "Initializing STCC4...");
+    state->stcc4_present = false;
     esp_err_t ret = stcc4_init(&state->co2_sensor, state->i2c_bus_handle, STCC4_I2C_ADDR_DEFAULT);
     if (ret != ESP_OK) return ret;
 
@@ -236,14 +286,96 @@ static esp_err_t init_stcc4_sensor(Sensors::SensorsState *state) {
         }
     }
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG_SENS, "Product ID read failed, continuing...");
+        ESP_LOGW(TAG_SENS, "Product ID read failed, STCC4 not found: %s", esp_err_to_name(ret));
+        stcc4_deinit(&state->co2_sensor);
+        return ESP_ERR_NOT_FOUND;
     }
     
     // Set initial state for continuous measurement mode
+    state->stcc4_present = true;
     state->stcc4_state = STCC4State::INIT;
     state->stcc4_state_time = esp_timer_get_time() / 1000;
     state->stcc4_last_conditioning = state->stcc4_state_time;
     state->stcc4_last_read = 0;
+    return ESP_OK;
+}
+
+// Initialize SCD4x CO2 sensor on I2C bus.
+// Returns ESP_OK on success, error code on failure.
+static esp_err_t init_scd4x_sensor(Sensors::SensorsState *state) {
+    ESP_LOGI(TAG_SENS, "Initializing SCD4x...");
+    state->scd4x_present = false;
+    state->scd4x_last_read = 0;
+    state->scd4x_last_attempt = 0;
+
+    esp_err_t ret = scd4x_init_desc(&state->scd4x_dev, I2C_MASTER_NUM,
+                                    (gpio_num_t)I2C_MASTER_SDA_IO,
+                                    (gpio_num_t)I2C_MASTER_SCL_IO);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_SENS, "SCD4x init-desc failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+
+    uint16_t serial0 = 0, serial1 = 0, serial2 = 0;
+    ret = scd4x_get_serial_number(&state->scd4x_dev, &serial0, &serial1, &serial2);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_SENS, "SCD4x serial read failed: %s", esp_err_to_name(ret));
+        scd4x_free_desc(&state->scd4x_dev);
+        return ret;
+    }
+    ESP_LOGI(TAG_SENS, "SCD4x serial: %04X-%04X-%04X", serial0, serial1, serial2);
+
+    ret = scd4x_start_periodic_measurement(&state->scd4x_dev);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_SENS, "SCD4x start measurement failed: %s", esp_err_to_name(ret));
+        scd4x_free_desc(&state->scd4x_dev);
+        return ret;
+    }
+
+    state->scd4x_present = true;
+    ESP_LOGI(TAG_SENS, "SCD4x ready (periodic measurement)");
+    return ESP_OK;
+}
+
+// Initialize SHT4x backup temperature/RH sensor on I2C bus.
+// Returns ESP_OK on success, error code on failure.
+static esp_err_t init_sht4x_sensor(Sensors::SensorsState *state) {
+    ESP_LOGI(TAG_SENS, "Initializing SHT4x...");
+    state->sht4x_present = false;
+    state->sht4x_handle = NULL;
+    state->sht4x_last_read = 0;
+    state->sht4x_last_attempt = 0;
+
+    sht4x_config_t cfg = I2C_SHT4X_CONFIG_DEFAULT;
+    cfg.i2c_address = I2C_SHT4X_DEV_ADDR_LO;
+    cfg.i2c_clock_speed = I2C_MASTER_FREQ_HZ;
+    cfg.repeat_mode = SHT4X_REPEAT_HIGH;
+    cfg.heater_mode = SHT4X_HEATER_OFF;
+
+    esp_err_t ret = sht4x_init(state->i2c_bus_handle, &cfg, &state->sht4x_handle);
+    if (ret != ESP_OK || state->sht4x_handle == NULL) {
+        ESP_LOGW(TAG_SENS, "SHT4x init failed: %s", esp_err_to_name(ret));
+        state->sht4x_handle = NULL;
+        return (ret == ESP_OK) ? ESP_FAIL : ret;
+    }
+
+    float t = 0.0f, rh = 0.0f;
+    ret = sht4x_read_measurement(state, &t, &rh);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_SENS, "SHT4x not responding: %s", esp_err_to_name(ret));
+        sht4x_delete(state->sht4x_handle);
+        state->sht4x_handle = NULL;
+        state->sht4x_last_read = 0;
+        state->sht4x_last_attempt = 0;
+        return ret;
+    }
+
+    state->sht4x_present = true;
+    state->sht4x_temp_c = t;
+    state->sht4x_rh = rh;
+    state->sht4x_last_read = esp_timer_get_time() / 1000;
+    state->sht4x_last_attempt = state->sht4x_last_read;
+    ESP_LOGI(TAG_SENS, "SHT4x ready: T=%.2fC RH=%.1f%%", t, rh);
     return ESP_OK;
 }
 
@@ -374,6 +506,47 @@ static esp_err_t init_sps30_sensor(Sensors::SensorsState *state) {
     }
     
     return ESP_OK;
+}
+
+// Update SHT4x backup temperature/RH sensor (blocking read).
+static void update_sht4x(Sensors::SensorsState *st, int64_t now_ms) {
+    if (!st->sht4x_present || !st->sht4x_handle) return;
+    if (now_ms - st->sht4x_last_attempt < SHT4X_READ_INTERVAL_MS) return;
+    st->sht4x_last_attempt = now_ms;
+    float t = 0.0f, rh = 0.0f;
+    esp_err_t ret = sht4x_read_measurement(st, &t, &rh);
+    if (ret == ESP_OK) {
+        st->sht4x_temp_c = t;
+        st->sht4x_rh = rh;
+        st->sht4x_last_read = now_ms;
+    } else {
+        ESP_LOGW(TAG_SENS, "SHT4x read failed: %s", esp_err_to_name(ret));
+    }
+}
+
+// Update SCD4x CO2 sensor fallback (blocking read).
+static void update_scd4x(Sensors::SensorsState *st, int64_t now_ms) {
+    if (!st->scd4x_present) return;
+    if (now_ms - st->scd4x_last_attempt < SCD4X_READ_INTERVAL_MS) return;
+    st->scd4x_last_attempt = now_ms;
+
+    bool ready = false;
+    esp_err_t ret = scd4x_get_data_ready_status(&st->scd4x_dev, &ready);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_SENS, "SCD4x data-ready failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    if (!ready) return;
+
+    uint16_t co2_ppm = 0;
+    float t = 0.0f, rh = 0.0f;
+    ret = scd4x_read_measurement(&st->scd4x_dev, &co2_ppm, &t, &rh);
+    if (ret == ESP_OK) {
+        st->scd4x_last_read = now_ms;
+        co2_ring_push(st, (int)co2_ppm, t, rh, now_ms);
+    } else {
+        ESP_LOGW(TAG_SENS, "SCD4x read failed: %s", esp_err_to_name(ret));
+    }
 }
 
 // Update STCC4 CO2 sensor using continuous measurement mode (non-blocking).
@@ -599,17 +772,39 @@ esp_err_t Sensors::init(void) {
     esp_log_level_set(TAG_SENS, ESP_LOG_DEBUG);
     ESP_ERROR_CHECK_WITHOUT_ABORT(init_i2c_bus(state->i2c_bus_handle));
     esp_err_t ok1 = init_stcc4_sensor(state);
+    esp_err_t ok_scd4x = ESP_FAIL;
+    esp_err_t ok_sht4x = ESP_FAIL;
     esp_err_t ok2 = init_sgp4x_sensor(state);
     esp_err_t ok3 = init_sps30_sensor(state);
     if (ok1 != ESP_OK) ESP_LOGW(TAG_SENS, "STCC4 init failed: %s", esp_err_to_name(ok1));
     if (ok2 != ESP_OK) ESP_LOGW(TAG_SENS, "SGP4x init failed: %s", esp_err_to_name(ok2));
     if (ok3 != ESP_OK) ESP_LOGW(TAG_SENS, "SPS30 init failed: %s", esp_err_to_name(ok3));
+    if (ok1 != ESP_OK) {
+        ok_scd4x = init_scd4x_sensor(state);
+        if (ok_scd4x != ESP_OK) {
+            ESP_LOGW(TAG_SENS, "SCD4x init failed: %s", esp_err_to_name(ok_scd4x));
+        }
+        ok_sht4x = init_sht4x_sensor(state);
+        if (ok_sht4x != ESP_OK) {
+            ESP_LOGW(TAG_SENS, "SHT4x init failed: %s", esp_err_to_name(ok_sht4x));
+        }
+    }
     state->stcc4_state_time = esp_timer_get_time() / 1000;
-    return (ok1 == ESP_OK || ok2 == ESP_OK || ok3 == ESP_OK) ? ESP_OK : ESP_FAIL;
+    return (ok1 == ESP_OK || ok2 == ESP_OK || ok3 == ESP_OK ||
+            ok_scd4x == ESP_OK || ok_sht4x == ESP_OK) ? ESP_OK : ESP_FAIL;
 }
 
 void Sensors::update(int64_t current_millis) {
-    update_stcc4(state, current_millis);
+    if (state->stcc4_present) {
+        update_stcc4(state, current_millis);
+    } else {
+        if (state->scd4x_present) {
+            update_scd4x(state, current_millis);
+        }
+        if (state->sht4x_present) {
+            update_sht4x(state, current_millis);
+        }
+    }
     update_sgp4x(state, current_millis);
     update_sps30(state, current_millis);
     
@@ -673,10 +868,16 @@ void Sensors::getValues(int64_t now_ms, sensor_values_t *out) {
     int co2_avg = 0; float t_avg = 0.0f; float rh_avg = 0.0f;
     bool have = co2_avg_last_5s(state, now_ms, &co2_avg, &t_avg, &rh_avg);
     out->have_co2_avg = have;
+    out->have_temp_rh = have;
     if (have) {
         out->co2_ppm_avg = co2_avg;
         out->temp_c_avg = t_avg;
         out->rh_avg = rh_avg;
+    } else if (state->sht4x_present && state->sht4x_last_read > 0 &&
+               (now_ms - state->sht4x_last_read <= SHT4X_MAX_AGE_MS)) {
+        out->temp_c_avg = state->sht4x_temp_c;
+        out->rh_avg = state->sht4x_rh;
+        out->have_temp_rh = true;
     }
     out->pm25_mass = state->sps30_data.pm2p5_mass;
     out->voc_ticks = (int)state->sgp_voc_ticks;
