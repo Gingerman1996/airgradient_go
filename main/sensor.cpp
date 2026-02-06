@@ -272,42 +272,58 @@ esp_err_t Sensors::initI2CBus(void) {
 static esp_err_t init_stcc4_sensor(Sensors::SensorsState *state) {
     ESP_LOGI(TAG_SENS, "Initializing STCC4...");
     state->stcc4_present = false;
-    esp_err_t ret = stcc4_init(&state->co2_sensor, state->i2c_bus_handle, STCC4_I2C_ADDR_DEFAULT);
-    if (ret != ESP_OK) return ret;
 
-    uint32_t product_id = 0;
-    int retries = 3;
-    while (retries-- > 0) {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        ret = stcc4_get_product_id(&state->co2_sensor, &product_id, NULL);
-        if (ret == ESP_OK) {
-            ESP_LOGI(TAG_SENS, "STCC4 Product ID: 0x%08X", product_id);
-            break;
+    const uint8_t addr_candidates[] = {
+        SCD4X_I2C_ADDR,         // 0x62 (board wiring)
+        STCC4_I2C_ADDR_DEFAULT, // 0x64 (driver default)
+        STCC4_I2C_ADDR_ALT      // 0x65 (alt)
+    };
+
+    for (size_t i = 0; i < (sizeof(addr_candidates) / sizeof(addr_candidates[0])); ++i) {
+        uint8_t addr = addr_candidates[i];
+        esp_err_t ret = stcc4_init(&state->co2_sensor, state->i2c_bus_handle, addr);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG_SENS, "STCC4 init failed at 0x%02X: %s", addr, esp_err_to_name(ret));
+            continue;
         }
-    }
-    if (ret != ESP_OK) {
-        ESP_LOGW(TAG_SENS, "Product ID read failed, STCC4 not found: %s", esp_err_to_name(ret));
+
+        uint32_t product_id = 0;
+        int retries = 3;
+        while (retries-- > 0) {
+            vTaskDelay(pdMS_TO_TICKS(50));
+            ret = stcc4_get_product_id(&state->co2_sensor, &product_id, NULL);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG_SENS, "STCC4 found at 0x%02X (Product ID: 0x%08X)", addr, product_id);
+                break;
+            }
+        }
+
+        if (ret == ESP_OK) {
+            // Set initial state for continuous measurement mode
+            state->stcc4_present = true;
+            state->stcc4_state = STCC4State::INIT;
+            state->stcc4_state_time = esp_timer_get_time() / 1000;
+            state->stcc4_last_conditioning = state->stcc4_state_time;
+            state->stcc4_last_read = 0;
+            return ESP_OK;
+        }
+
+        ESP_LOGW(TAG_SENS, "STCC4 not responding at 0x%02X: %s", addr, esp_err_to_name(ret));
         stcc4_deinit(&state->co2_sensor);
-        return ESP_ERR_NOT_FOUND;
     }
-    
-    // Set initial state for continuous measurement mode
-    state->stcc4_present = true;
-    state->stcc4_state = STCC4State::INIT;
-    state->stcc4_state_time = esp_timer_get_time() / 1000;
-    state->stcc4_last_conditioning = state->stcc4_state_time;
-    state->stcc4_last_read = 0;
-    return ESP_OK;
+
+    return ESP_ERR_NOT_FOUND;
 }
 
 // Initialize SCD4x CO2 sensor on I2C bus.
 // Returns ESP_OK on success, error code on failure.
 static esp_err_t init_scd4x_sensor(Sensors::SensorsState *state) {
-    ESP_LOGI(TAG_SENS, "Initializing SCD4x...");
+    ESP_LOGI(TAG_SENS, "Initializing SCD41 (SCD4x)...");
     state->scd4x_present = false;
     state->scd4x_last_read = 0;
     state->scd4x_last_attempt = 0;
 
+    memset(&state->scd4x_dev, 0, sizeof(state->scd4x_dev));
     esp_err_t ret = scd4x_init_desc(&state->scd4x_dev, I2C_MASTER_NUM,
                                     (gpio_num_t)I2C_MASTER_SDA_IO,
                                     (gpio_num_t)I2C_MASTER_SCL_IO);
@@ -316,24 +332,47 @@ static esp_err_t init_scd4x_sensor(Sensors::SensorsState *state) {
         return ret;
     }
 
+    // Best-effort wake/reinit in case the sensor was left in sleep or busy state.
+    ret = scd4x_wake_up(&state->scd4x_dev);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG_SENS, "SCD41 wake-up failed (continuing): %s", esp_err_to_name(ret));
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    ret = scd4x_stop_periodic_measurement(&state->scd4x_dev);
+    if (ret != ESP_OK) {
+        ESP_LOGD(TAG_SENS, "SCD41 stop periodic failed (continuing): %s", esp_err_to_name(ret));
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+
+    ret = scd4x_reinit(&state->scd4x_dev);
+    if (ret != ESP_OK) {
+        ESP_LOGD(TAG_SENS, "SCD41 reinit failed (continuing): %s", esp_err_to_name(ret));
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+
     uint16_t serial0 = 0, serial1 = 0, serial2 = 0;
     ret = scd4x_get_serial_number(&state->scd4x_dev, &serial0, &serial1, &serial2);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG_SENS, "SCD4x serial read failed: %s", esp_err_to_name(ret));
-        scd4x_free_desc(&state->scd4x_dev);
-        return ret;
+        ESP_LOGW(TAG_SENS, "SCD41 serial read failed (continuing): %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG_SENS, "SCD41 serial: %04X-%04X-%04X", serial0, serial1, serial2);
     }
-    ESP_LOGI(TAG_SENS, "SCD4x serial: %04X-%04X-%04X", serial0, serial1, serial2);
 
     ret = scd4x_start_periodic_measurement(&state->scd4x_dev);
     if (ret != ESP_OK) {
-        ESP_LOGW(TAG_SENS, "SCD4x start measurement failed: %s", esp_err_to_name(ret));
-        scd4x_free_desc(&state->scd4x_dev);
-        return ret;
+        ESP_LOGW(TAG_SENS, "SCD41 start measurement failed: %s", esp_err_to_name(ret));
+        vTaskDelay(pdMS_TO_TICKS(50));
+        ret = scd4x_start_periodic_measurement(&state->scd4x_dev);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG_SENS, "SCD41 start measurement retry failed: %s", esp_err_to_name(ret));
+            scd4x_free_desc(&state->scd4x_dev);
+            return ret;
+        }
     }
 
     state->scd4x_present = true;
-    ESP_LOGI(TAG_SENS, "SCD4x ready (periodic measurement)");
+    ESP_LOGI(TAG_SENS, "SCD41 ready (periodic measurement)");
     return ESP_OK;
 }
 
@@ -780,10 +819,17 @@ esp_err_t Sensors::init(void) {
     if (ok2 != ESP_OK) ESP_LOGW(TAG_SENS, "SGP4x init failed: %s", esp_err_to_name(ok2));
     if (ok3 != ESP_OK) ESP_LOGW(TAG_SENS, "SPS30 init failed: %s", esp_err_to_name(ok3));
     if (ok1 != ESP_OK) {
-        ok_scd4x = init_scd4x_sensor(state);
-        if (ok_scd4x != ESP_OK) {
-            ESP_LOGW(TAG_SENS, "SCD4x init failed: %s", esp_err_to_name(ok_scd4x));
+        // Only attempt SCD41 if a device responds at 0x62.
+        if (state->i2c_bus_handle &&
+            i2c_master_probe(state->i2c_bus_handle, SCD4X_I2C_ADDR, 1000) == ESP_OK) {
+            ok_scd4x = init_scd4x_sensor(state);
+            if (ok_scd4x != ESP_OK) {
+                ESP_LOGW(TAG_SENS, "SCD41 init failed: %s", esp_err_to_name(ok_scd4x));
+            }
+        } else {
+            ESP_LOGW(TAG_SENS, "SCD41 not detected at 0x%02X, skipping init", SCD4X_I2C_ADDR);
         }
+
         ok_sht4x = init_sht4x_sensor(state);
         if (ok_sht4x != ESP_OK) {
             ESP_LOGW(TAG_SENS, "SHT4x init failed: %s", esp_err_to_name(ok_sht4x));

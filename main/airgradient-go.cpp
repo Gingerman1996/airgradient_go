@@ -1074,6 +1074,8 @@ extern "C" void app_main(void) {
                values.co2_ppm_avg, values.temp_c_avg, values.rh_avg);
       ESP_LOGI(TAG, "  PM2.5: %.1f µg/m³ | VOC: %d | NOx: %d",
                values.pm25_mass, values.voc_index, values.nox_index);
+      ESP_LOGI(TAG, "  SGP4x raw: VOC=%d ticks | NOx=%d ticks",
+               values.voc_ticks, values.nox_ticks);
       ESP_LOGI(TAG, "  Pressure: %.1f hPa", values.pressure_pa / 100.0f);
       ESP_LOGI(TAG, "  GPS: %s | Lat: %.6f | Lon: %.6f | ANT: %s",
                gps_state, gps_static.latitude_deg(), gps_static.longitude_deg(),
@@ -1537,6 +1539,8 @@ extern "C" void app_main(void) {
                vals.co2_ppm_avg, vals.temp_c_avg, vals.rh_avg);
       ESP_LOGI(TAG, "  PM2.5: %.1f µg/m³ | VOC: %d | NOx: %d",
                vals.pm25_mass, vals.voc_index, vals.nox_index);
+      ESP_LOGI(TAG, "  SGP4x raw: VOC=%d ticks | NOx=%d ticks",
+               vals.voc_ticks, vals.nox_ticks);
       ESP_LOGI(TAG, "  Pressure: %.1f hPa", vals.pressure_pa / 100.0f);
       ESP_LOGI(TAG, "  GPS: %s | Lat: %.6f | Lon: %.6f | ANT: %s",
                gps_state, gps_ready ? gps.latitude_deg() : 0.0f,
