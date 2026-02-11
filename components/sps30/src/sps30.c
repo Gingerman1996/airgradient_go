@@ -54,16 +54,17 @@ static float bytes_to_float(const uint8_t *bytes)
 }
 
 /*
- * I2C Write Command (command + CRC)
+ * I2C Write Command (command-only).
+ * SPS30 expects only a 16-bit command for command frames without payload.
+ * CRC bytes are used for data words, not for bare command writes.
  */
 static esp_err_t sps30_i2c_write_command(sps30_handle_t handle, uint16_t cmd)
 {
-    uint8_t buffer[3];
+    uint8_t buffer[2];
     buffer[0] = (cmd >> 8) & 0xFF;
     buffer[1] = cmd & 0xFF;
-    buffer[2] = sps30_calc_crc8(buffer, 2);
 
-    esp_err_t ret = i2c_master_transmit(handle->i2c_handle, buffer, 3, SPS30_I2C_XFR_TIMEOUT_MS);
+    esp_err_t ret = i2c_master_transmit(handle->i2c_handle, buffer, 2, SPS30_I2C_XFR_TIMEOUT_MS);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "I2C write command failed: %s", esp_err_to_name(ret));
     }

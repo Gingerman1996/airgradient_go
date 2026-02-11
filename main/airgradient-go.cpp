@@ -3,6 +3,7 @@
 #include "gps.h"
 #include "log_storage.h"
 #include "lp5036.h"
+#include "WiFiManager.h"
 #include "color_utils.h"
 #include "led_effects.h"
 #include "sensor.h"
@@ -12,6 +13,7 @@
 #include "driver/gpio.h"
 #include "driver/uart.h"
 #include "esp_log.h"
+#include "esp_mac.h"
 #include "esp_random.h"
 #include "esp_sleep.h"
 #include "esp_timer.h"
@@ -27,6 +29,7 @@
 #include "epaper_panel.h"
 #include "lvgl.h"
 
+#include <stdio.h>
 #include <string.h>
 
 // Display resolution selector
@@ -95,6 +98,7 @@ static SemaphoreHandle_t g_display_data_mux = nullptr;
 static const uint64_t kRecordingIntervalMs =
     1000; // 1s - update display every 1 second
 static const uint64_t kUiBlinkIntervalMs = UI_BLINK_INTERVAL_MS;
+static const uint64_t kWiFiReconnectIntervalMs = 30000; // retry WiFi reconnect every 30s
 static const float kBatteryCapacityMah = 2000.0f;
 static const uint16_t kBatteryEmptyMv = 3300;
 static const uint16_t kBatteryFullMv = 4200;
@@ -161,6 +165,94 @@ static void apply_random_display(Display *display) {
   display->setTimeHM(rand_range_int(0, 23), rand_range_int(0, 59), true);
 }
 
+// Forward declarations for UI locking helpers used by WiFi task helpers.
+static bool lvgl_lock(int timeout_ms);
+static void lvgl_unlock(void);
+static void request_lvgl_refresh_urgent(void);
+
+static void set_wifi_status(Display::WiFiStatus status) {
+  static Display::WiFiStatus last_status = Display::WiFiStatus::Off;
+  if (status == last_status || !g_display) {
+    return;
+  }
+  last_status = status;
+
+  if (lvgl_lock(100)) {
+    g_display->setWiFiStatus(status);
+    lvgl_unlock();
+    request_lvgl_refresh_urgent();
+  }
+}
+
+static void build_wifi_manager_ap_name(char *ap_name, size_t len) {
+  if (!ap_name || len == 0) {
+    return;
+  }
+
+  uint8_t mac[6] = {0};
+  esp_err_t mac_ret = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  if (mac_ret == ESP_OK) {
+    snprintf(ap_name, len, "AirGradientGO-%02X%02X%02X", mac[3], mac[4], mac[5]);
+  } else {
+    snprintf(ap_name, len, "AirGradientGO-Setup");
+  }
+}
+
+static void wifi_manager_task(void *arg) {
+  static const char *TAG_WIFI = "WiFiMgrTask";
+  (void)arg;
+
+  static WiFiManager wifi_manager;
+  wifi_manager.setConnectTimeout(20);
+  wifi_manager.setConfigPortalTimeout(0);
+  wifi_manager.setConfigPortalBlocking(true);
+
+  char ap_name[32] = {0};
+  build_wifi_manager_ap_name(ap_name, sizeof(ap_name));
+
+  ESP_LOGI(TAG_WIFI, "Starting WiFi manager (AP: %s)", ap_name);
+  set_wifi_status(Display::WiFiStatus::Connecting);
+
+  bool connected = wifi_manager.autoConnect(ap_name) && wifi_manager.isWiFiConnected();
+  if (connected) {
+    ESP_LOGI(TAG_WIFI, "WiFi connected");
+    wifi_manager.stopServers();
+    set_wifi_status(Display::WiFiStatus::Connected);
+  } else {
+    ESP_LOGW(TAG_WIFI, "WiFi setup did not complete");
+    set_wifi_status(Display::WiFiStatus::Off);
+  }
+
+  bool last_connected = connected;
+  uint64_t last_reconnect_attempt_ms = 0;
+
+  while (true) {
+    bool connected_now = wifi_manager.isWiFiConnected();
+    if (connected_now != last_connected) {
+      last_connected = connected_now;
+      set_wifi_status(connected_now ? Display::WiFiStatus::Connected
+                                    : Display::WiFiStatus::Off);
+      ESP_LOGI(TAG_WIFI, "WiFi %s", connected_now ? "connected" : "disconnected");
+    }
+
+    uint64_t now_ms = static_cast<uint64_t>(esp_timer_get_time() / 1000);
+    if (!connected_now && (now_ms - last_reconnect_attempt_ms >= kWiFiReconnectIntervalMs)) {
+      last_reconnect_attempt_ms = now_ms;
+      ESP_LOGI(TAG_WIFI, "Attempting WiFi reconnect...");
+      set_wifi_status(Display::WiFiStatus::Connecting);
+      connected_now = wifi_manager.reconnectWiFi(15) && wifi_manager.isWiFiConnected();
+      last_connected = connected_now;
+      set_wifi_status(connected_now ? Display::WiFiStatus::Connected
+                                    : Display::WiFiStatus::Off);
+      if (connected_now) {
+        wifi_manager.stopServers();
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1000));
+  }
+}
+
 // Flag set by T1 button to trigger random display refresh
 static volatile bool g_static_test_refresh_requested = false;
 
@@ -193,6 +285,9 @@ static bool lvgl_lock(int timeout_ms);
 static void lvgl_unlock(void);
 static void request_lvgl_refresh(void);
 static void request_lvgl_refresh_urgent(void);
+static void set_wifi_status(Display::WiFiStatus status);
+static void build_wifi_manager_ap_name(char *ap_name, size_t len);
+static void wifi_manager_task(void *arg);
 static void initiate_shutdown(void);
 static void qon_button_task(void *arg);
 static void lv_handler_task(void *arg);
@@ -526,6 +621,15 @@ extern "C" void app_main(void) {
     lvgl_unlock();
   }
   request_lvgl_refresh();
+
+  // Start WiFi manager in background to avoid blocking sensor/display loop.
+  ESP_LOGI(TAG, "Starting WiFi manager task...");
+  BaseType_t wifi_task_ret =
+      xTaskCreatePinnedToCore(wifi_manager_task, "WiFiMgr", 12 * 1024, NULL, 3, NULL,
+                              tskNO_AFFINITY);
+  if (wifi_task_ret != pdPASS) {
+    ESP_LOGW(TAG, "Failed to start WiFi manager task");
+  }
 
   // ==================== DISPLAY UPDATE TASK (STATIC TEST) ====================
   ESP_LOGI(TAG, "Starting display update task for static test...");
@@ -2454,16 +2558,20 @@ static bool lvgl_lock(int timeout_ms) {
 static void lvgl_unlock(void) { xSemaphoreGive(lvgl_mux); }
 
 static void request_lvgl_refresh(void) {
-  g_lvgl_refresh_requested = true;
-  if (g_lvgl_task_handle) {
-    xTaskNotifyGive(g_lvgl_task_handle);
+  if (!g_lvgl_refresh_requested) {
+    g_lvgl_refresh_requested = true;
+    if (g_lvgl_task_handle) {
+      xTaskNotifyGive(g_lvgl_task_handle);
+    }
   }
 }
 
 static void request_lvgl_refresh_urgent(void) {
-  g_lvgl_refresh_urgent = true;
-  if (g_lvgl_task_handle) {
-    xTaskNotifyGive(g_lvgl_task_handle);
+  if (!g_lvgl_refresh_urgent) {
+    g_lvgl_refresh_urgent = true;
+    if (g_lvgl_task_handle) {
+      xTaskNotifyGive(g_lvgl_task_handle);
+    }
   }
 }
 
@@ -2741,6 +2849,8 @@ static void lv_handler_task(void *arg) {
     } else if (task_delay_ms < LVGL_TASK_MIN_DELAY_MS) {
       task_delay_ms = LVGL_TASK_MIN_DELAY_MS;
     }
+    // Always yield so idle tasks can run even under frequent notifications.
+    vTaskDelay(pdMS_TO_TICKS(1));
     ulTaskNotifyTake(pdTRUE, pdMS_TO_TICKS(task_delay_ms));
   }
 }

@@ -27,10 +27,11 @@ idf_component_register(
         "dps368"
         "lis2dh12"
         "lp5036"
+        "WiFiManager"
         "nvs_flash"
 )
 
-# Optimize for size (OTA partition is 1 MB)
+# Optimize for size
 target_compile_options(${COMPONENT_LIB} PRIVATE "-Os")
 # Linker GC unused sections to reduce binary size
 target_link_options(${COMPONENT_LIB} PRIVATE "-Wl,--gc-sections")

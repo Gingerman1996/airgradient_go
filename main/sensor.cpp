@@ -52,6 +52,9 @@ static const char *TAG_SENS = "sensors";
 // DPS368 pressure sensor read interval (milliseconds)
 #define DPS368_READ_INTERVAL_MS 5000
 
+// SPS30 retry interval after I2C/start failures (reduces bus error storms)
+#define SPS30_RETRY_INTERVAL_MS 5000
+
 enum class STCC4State {
     INIT,               // Need to start continuous measurement
     STARTING,           // Starting continuous measurement mode
@@ -435,6 +438,8 @@ static esp_err_t init_sgp4x_sensor(Sensors::SensorsState *state) {
 // Performs initialization test: start measurement, wait 3s, check status, then sleep.
 // Returns ESP_OK on success, error code from driver on failure.
 static esp_err_t init_sps30_sensor(Sensors::SensorsState *state) {
+    esp_err_t sps30_ret = ESP_FAIL;
+
     // Configure EN_PM1 GPIO (IO26) for PM sensor power control
     gpio_config_t io_conf = {};
     io_conf.intr_type = GPIO_INTR_DISABLE;
@@ -453,22 +458,31 @@ static esp_err_t init_sps30_sensor(Sensors::SensorsState *state) {
     
     sps30_config_t cfg = {.i2c_address = 0x69, .i2c_clock_speed = I2C_MASTER_FREQ_HZ};
     esp_err_t ret = sps30_init(state->i2c_bus_handle, &cfg, &state->sps30_handle);
-    if (ret != ESP_OK) return ret;
-
-    ret = sps30_start_measurement(state->sps30_handle);
-    if (ret != ESP_OK) return ret;
-    vTaskDelay(pdMS_TO_TICKS(3000));
-    uint32_t status = 0;
-    if (sps30_read_status_register(state->sps30_handle, &status) == ESP_OK) {
-        ESP_LOGI(TAG_SENS, "SPS30 status after 3s: 0x%08X", status);
+    if (ret == ESP_OK) {
+        ret = sps30_start_measurement(state->sps30_handle);
+        if (ret == ESP_OK) {
+            vTaskDelay(pdMS_TO_TICKS(3000));
+            uint32_t status = 0;
+            if (sps30_read_status_register(state->sps30_handle, &status) == ESP_OK) {
+                ESP_LOGI(TAG_SENS, "SPS30 status after 3s: 0x%08X", status);
+            }
+            bool ready = false;
+            if (sps30_read_data_ready(state->sps30_handle, &ready) == ESP_OK) {
+                ESP_LOGI(TAG_SENS, "SPS30 data-ready: %s", ready ? "YES" : "NO");
+            }
+            (void)sps30_stop_measurement(state->sps30_handle);
+            (void)sps30_sleep(state->sps30_handle);
+            ESP_LOGI(TAG_SENS, "SPS30 ready (sleep mode)");
+            sps30_ret = ESP_OK;
+        } else {
+            ESP_LOGW(TAG_SENS, "SPS30 start measurement failed at init: %s", esp_err_to_name(ret));
+            // Keep handle for update_sps30() retry loop after power-path settles.
+            sps30_ret = ret;
+        }
+    } else {
+        ESP_LOGW(TAG_SENS, "SPS30 init failed: %s", esp_err_to_name(ret));
+        sps30_ret = ret;
     }
-    bool ready = false;
-    if (sps30_read_data_ready(state->sps30_handle, &ready) == ESP_OK) {
-        ESP_LOGI(TAG_SENS, "SPS30 data-ready: %s", ready ? "YES" : "NO");
-    }
-    sps30_stop_measurement(state->sps30_handle);
-    sps30_sleep(state->sps30_handle);
-    ESP_LOGI(TAG_SENS, "SPS30 ready (sleep mode)");
     
     // Initialize DPS368 pressure sensor (address 0x77 per hardware config)
     ret = dps368_init(state->i2c_bus_handle, DPS368_I2C_ADDR_SDO_VDD, &state->dps368_handle);
@@ -544,7 +558,7 @@ static esp_err_t init_sps30_sensor(Sensors::SensorsState *state) {
         ESP_LOGI(TAG_SENS, "LIS2DH12 accelerometer ready");
     }
     
-    return ESP_OK;
+    return sps30_ret;
 }
 
 // Update SHT4x backup temperature/RH sensor (blocking read).
@@ -711,6 +725,10 @@ static void update_sps30(Sensors::SensorsState *st, int64_t now_ms) {
     
     switch (sps30_state) {
         case SPS30_INIT:
+            // Backoff retries when sensor is not yet powered/ready.
+            if (sps30_state_time != 0 && now_ms < sps30_state_time) {
+                break;
+            }
             // Wake up sensor from sleep mode
             ret = sps30_wakeup(st->sps30_handle);
             if (ret == ESP_OK) {
@@ -720,6 +738,8 @@ static void update_sps30(Sensors::SensorsState *st, int64_t now_ms) {
                 st->sps30_not_ready_count = 0;
                 st->sps30_check_fail_count = 0;
                 st->sps30_last_read = 0;
+            } else {
+                sps30_state_time = now_ms + SPS30_RETRY_INTERVAL_MS;
             }
             break;
             
@@ -735,9 +755,10 @@ static void update_sps30(Sensors::SensorsState *st, int64_t now_ms) {
                     st->sps30_check_fail_count = 0;
                 } else {
                     ESP_LOGE(TAG_SENS, "SPS30: Failed to start measurement");
-                    sps30_sleep(st->sps30_handle);
+                    (void)sps30_sleep(st->sps30_handle);
                     sps30_state = SPS30_INIT;
-                    sps30_state_time = now_ms + 5000; // Retry in 5s
+                    sps30_state_time = now_ms + SPS30_RETRY_INTERVAL_MS;
+                    last_read_time = 0;
                 }
             }
             break;
@@ -777,12 +798,12 @@ static void update_sps30(Sensors::SensorsState *st, int64_t now_ms) {
                     st->sps30_not_ready_count++;
                     if (st->sps30_not_ready_count > 2) {
                         ESP_LOGW(TAG_SENS, "SPS30: Data-ready not ready too long, restarting");
-                        sps30_stop_measurement(st->sps30_handle);
-                        sps30_sleep(st->sps30_handle);
+                        (void)sps30_stop_measurement(st->sps30_handle);
+                        (void)sps30_sleep(st->sps30_handle);
                         st->sps30_not_ready_count = 0;
                         st->sps30_last_read = 0;
                         sps30_state = SPS30_INIT;
-                        sps30_state_time = now_ms;
+                        sps30_state_time = now_ms + SPS30_RETRY_INTERVAL_MS;
                         last_read_time = 0;
                     }
                 } else if (ret != ESP_OK) {
@@ -792,13 +813,13 @@ static void update_sps30(Sensors::SensorsState *st, int64_t now_ms) {
                     // Restart SPS30 after 5 consecutive failures
                     if (st->sps30_check_fail_count >= 5) {
                         ESP_LOGW(TAG_SENS, "SPS30: Too many check failures, restarting sensor...");
-                        sps30_stop_measurement(st->sps30_handle);
-                        sps30_sleep(st->sps30_handle);
+                        (void)sps30_stop_measurement(st->sps30_handle);
+                        (void)sps30_sleep(st->sps30_handle);
                         st->sps30_check_fail_count = 0;
                         st->sps30_not_ready_count = 0;
                         st->sps30_last_read = 0;
                         sps30_state = SPS30_INIT;
-                        sps30_state_time = now_ms;
+                        sps30_state_time = now_ms + SPS30_RETRY_INTERVAL_MS;
                         last_read_time = 0;
                     }
                 }
