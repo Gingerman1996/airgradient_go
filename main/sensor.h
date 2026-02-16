@@ -8,6 +8,11 @@
 typedef struct {
     bool have_co2_avg;    // true if 5s average is available
     int co2_ppm_avg;      // averaged CO2 ppm
+    bool have_co2_primary; // true if primary CO2 source has a recent value
+    int co2_ppm_primary;   // primary CO2 source value (typically STCC4 5s avg)
+    bool have_co2_scd4x;   // true if SCD4x CO2 has a recent value
+    int co2_ppm_scd4x;     // latest SCD4x CO2 ppm
+    bool co2_display_is_scd4x; // true when display CO2 is sourced from SCD4x
     float temp_c_avg;     // averaged temperature in °C
     float rh_avg;         // averaged relative humidity in %RH
     bool have_temp_rh;    // true if temperature/RH is available (STCC4 avg or SHT4x)

@@ -48,6 +48,7 @@ static const char *TAG_SENS = "sensors";
 
 // SCD4x CO2 sensor fallback (5s update interval; poll every 1s for ready)
 #define SCD4X_READ_INTERVAL_MS 1000
+#define SCD4X_MAX_AGE_MS 5000
 
 // DPS368 pressure sensor read interval (milliseconds)
 #define DPS368_READ_INTERVAL_MS 5000
@@ -83,6 +84,9 @@ struct Sensors::SensorsState {
     bool scd4x_present;
     int64_t scd4x_last_read;
     int64_t scd4x_last_attempt;
+    int scd4x_co2_ppm;
+    float scd4x_temp_c;
+    float scd4x_rh;
 
     // SHT4x backup temperature/RH sensor
     sht4x_handle_t sht4x_handle;
@@ -144,6 +148,9 @@ Sensors::Sensors() {
     state->scd4x_present = false;
     state->scd4x_last_read = 0;
     state->scd4x_last_attempt = 0;
+    state->scd4x_co2_ppm = 0;
+    state->scd4x_temp_c = 0.0f;
+    state->scd4x_rh = 0.0f;
     state->sht4x_handle = NULL;
     state->sht4x_present = false;
     state->sht4x_temp_c = 0.0f;
@@ -325,6 +332,9 @@ static esp_err_t init_scd4x_sensor(Sensors::SensorsState *state) {
     state->scd4x_present = false;
     state->scd4x_last_read = 0;
     state->scd4x_last_attempt = 0;
+    state->scd4x_co2_ppm = 0;
+    state->scd4x_temp_c = 0.0f;
+    state->scd4x_rh = 0.0f;
 
     memset(&state->scd4x_dev, 0, sizeof(state->scd4x_dev));
     esp_err_t ret = scd4x_init_desc(&state->scd4x_dev, I2C_MASTER_NUM,
@@ -596,7 +606,13 @@ static void update_scd4x(Sensors::SensorsState *st, int64_t now_ms) {
     ret = scd4x_read_measurement(&st->scd4x_dev, &co2_ppm, &t, &rh);
     if (ret == ESP_OK) {
         st->scd4x_last_read = now_ms;
-        co2_ring_push(st, (int)co2_ppm, t, rh, now_ms);
+        st->scd4x_co2_ppm = (int)co2_ppm;
+        st->scd4x_temp_c = t;
+        st->scd4x_rh = rh;
+        // Keep primary CO2/Temp/RH averages from STCC4 when STCC4 is active.
+        if (!st->stcc4_present) {
+            co2_ring_push(st, (int)co2_ppm, t, rh, now_ms);
+        }
     } else {
         ESP_LOGW(TAG_SENS, "SCD4x read failed: %s", esp_err_to_name(ret));
     }
@@ -839,8 +855,9 @@ esp_err_t Sensors::init(void) {
     if (ok1 != ESP_OK) ESP_LOGW(TAG_SENS, "STCC4 init failed: %s", esp_err_to_name(ok1));
     if (ok2 != ESP_OK) ESP_LOGW(TAG_SENS, "SGP4x init failed: %s", esp_err_to_name(ok2));
     if (ok3 != ESP_OK) ESP_LOGW(TAG_SENS, "SPS30 init failed: %s", esp_err_to_name(ok3));
-    if (ok1 != ESP_OK) {
-        // Only attempt SCD41 if a device responds at 0x62.
+    bool can_try_scd4x = !state->stcc4_present || (state->co2_sensor.i2c_addr != SCD4X_I2C_ADDR);
+    if (can_try_scd4x) {
+        // Attempt SCD41 only if a device responds at 0x62.
         if (state->i2c_bus_handle &&
             i2c_master_probe(state->i2c_bus_handle, SCD4X_I2C_ADDR, 1000) == ESP_OK) {
             ok_scd4x = init_scd4x_sensor(state);
@@ -850,7 +867,11 @@ esp_err_t Sensors::init(void) {
         } else {
             ESP_LOGW(TAG_SENS, "SCD41 not detected at 0x%02X, skipping init", SCD4X_I2C_ADDR);
         }
+    } else {
+        ESP_LOGI(TAG_SENS, "Skipping SCD41 init: STCC4 already uses address 0x%02X", SCD4X_I2C_ADDR);
+    }
 
+    if (ok1 != ESP_OK) {
         ok_sht4x = init_sht4x_sensor(state);
         if (ok_sht4x != ESP_OK) {
             ESP_LOGW(TAG_SENS, "SHT4x init failed: %s", esp_err_to_name(ok_sht4x));
@@ -864,13 +885,12 @@ esp_err_t Sensors::init(void) {
 void Sensors::update(int64_t current_millis) {
     if (state->stcc4_present) {
         update_stcc4(state, current_millis);
-    } else {
-        if (state->scd4x_present) {
-            update_scd4x(state, current_millis);
-        }
-        if (state->sht4x_present) {
-            update_sht4x(state, current_millis);
-        }
+    }
+    if (state->scd4x_present) {
+        update_scd4x(state, current_millis);
+    }
+    if (!state->stcc4_present && state->sht4x_present) {
+        update_sht4x(state, current_millis);
     }
     update_sgp4x(state, current_millis);
     update_sps30(state, current_millis);
@@ -933,10 +953,13 @@ void Sensors::getValues(int64_t now_ms, sensor_values_t *out) {
     if (!out) return;
     memset(out, 0, sizeof(*out));
     int co2_avg = 0; float t_avg = 0.0f; float rh_avg = 0.0f;
-    bool have = co2_avg_last_5s(state, now_ms, &co2_avg, &t_avg, &rh_avg);
-    out->have_co2_avg = have;
-    out->have_temp_rh = have;
-    if (have) {
+    bool have_primary = co2_avg_last_5s(state, now_ms, &co2_avg, &t_avg, &rh_avg);
+    out->have_co2_primary = have_primary;
+    out->have_co2_avg = have_primary;
+    out->have_temp_rh = have_primary;
+    out->co2_display_is_scd4x = false;
+    if (have_primary) {
+        out->co2_ppm_primary = co2_avg;
         out->co2_ppm_avg = co2_avg;
         out->temp_c_avg = t_avg;
         out->rh_avg = rh_avg;
@@ -945,6 +968,16 @@ void Sensors::getValues(int64_t now_ms, sensor_values_t *out) {
         out->temp_c_avg = state->sht4x_temp_c;
         out->rh_avg = state->sht4x_rh;
         out->have_temp_rh = true;
+    }
+    if (state->scd4x_last_read > 0 && (now_ms - state->scd4x_last_read <= SCD4X_MAX_AGE_MS)) {
+        out->have_co2_scd4x = true;
+        out->co2_ppm_scd4x = state->scd4x_co2_ppm;
+    }
+    // When SPS30 is present, prefer SCD4x CO2 for display while keeping primary T/RH path.
+    if (state->sps30_handle && out->have_co2_scd4x) {
+        out->have_co2_avg = true;
+        out->co2_ppm_avg = out->co2_ppm_scd4x;
+        out->co2_display_is_scd4x = true;
     }
     out->pm25_mass = state->sps30_data.pm2p5_mass;
     out->voc_ticks = (int)state->sgp_voc_ticks;

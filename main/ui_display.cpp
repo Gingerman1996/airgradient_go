@@ -714,9 +714,6 @@ bool Display::init(uint16_t w, uint16_t h) {
   lv_obj_set_size(state->root, w, h);
   lv_obj_align(state->root, LV_ALIGN_CENTER, 0, 0);
   lv_obj_update_layout(state->root);
-  lv_obj_set_style_transform_pivot_x(state->root, w / 2, 0);
-  lv_obj_set_style_transform_pivot_y(state->root, h / 2, 0);
-  lv_obj_set_style_transform_rotation(state->root, 1800, 0);
 
   const int center_x = w / 2;
 

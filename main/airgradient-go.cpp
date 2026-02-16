@@ -54,9 +54,6 @@
 // Hardware panel width (144 is already byte-aligned, multiple of 8)
 #define DISPLAY_HW_WIDTH DISPLAY_WIDTH
 
-#define DISPLAY_ROT_WIDTH DISPLAY_HEIGHT
-#define DISPLAY_ROT_HEIGHT DISPLAY_WIDTH
-
 // LED configuration
 // LED_ENABLED = 0 -> LED bar disabled (saves power)
 // LED_ENABLED = 1 -> LED bar enabled (shows air quality)
@@ -170,6 +167,34 @@ static bool lvgl_lock(int timeout_ms);
 static void lvgl_unlock(void);
 static void request_lvgl_refresh_urgent(void);
 
+static bool read_chip_mac(uint8_t mac[6]) {
+  if (!mac) {
+    return false;
+  }
+
+  esp_err_t ret = esp_efuse_mac_get_default(mac);
+  if (ret != ESP_OK) {
+    ret = esp_read_mac(mac, ESP_MAC_WIFI_STA);
+  }
+  return ret == ESP_OK;
+}
+
+static bool format_chip_serial(char *serial, size_t len) {
+  if (!serial || len == 0) {
+    return false;
+  }
+
+  uint8_t mac[6] = {0};
+  if (!read_chip_mac(mac)) {
+    serial[0] = '\0';
+    return false;
+  }
+
+  snprintf(serial, len, "%02x%02x%02x%02x%02x%02x", mac[0], mac[1], mac[2],
+           mac[3], mac[4], mac[5]);
+  return true;
+}
+
 static void set_wifi_status(Display::WiFiStatus status) {
   static Display::WiFiStatus last_status = Display::WiFiStatus::Off;
   if (status == last_status || !g_display) {
@@ -190,8 +215,7 @@ static void build_wifi_manager_ap_name(char *ap_name, size_t len) {
   }
 
   uint8_t mac[6] = {0};
-  esp_err_t mac_ret = esp_read_mac(mac, ESP_MAC_WIFI_STA);
-  if (mac_ret == ESP_OK) {
+  if (read_chip_mac(mac)) {
     snprintf(ap_name, len, "AirGradientGO-%02X%02X%02X", mac[3], mac[4], mac[5]);
   } else {
     snprintf(ap_name, len, "AirGradientGO-Setup");
@@ -301,6 +325,12 @@ extern "C" void app_main(void) {
 
   ESP_LOGI(TAG, "=== AirGradient GO - Phase 1.1 ===");
   ESP_LOGI(TAG, "Initializing display and sensors...");
+  char chip_serial[18] = {0};
+  if (format_chip_serial(chip_serial, sizeof(chip_serial))) {
+    ESP_LOGI(TAG, "Chip serial (MAC): %s", chip_serial);
+  } else {
+    ESP_LOGW(TAG, "Chip serial (MAC): unavailable");
+  }
 
   // ==================== NVS INITIALIZATION ====================
   
@@ -385,6 +415,8 @@ extern "C" void app_main(void) {
   // Initialize LVGL display with PARTIAL refresh for faster updates
   epd_lvgl_config_t lvgl_cfg = EPD_LVGL_CONFIG_DEFAULT();
   lvgl_cfg.epd = epd;
+  lvgl_cfg.mirror_x = true;
+  lvgl_cfg.mirror_y = true;    // This panel mapping needs Y-flip to correct text mirroring.
   lvgl_cfg.update_mode =
       EPD_UPDATE_PARTIAL; // Use PARTIAL refresh for fast value updates
   lvgl_cfg.use_partial_refresh = true; // Enable partial refresh
@@ -1172,10 +1204,23 @@ extern "C" void app_main(void) {
       bool gps_has_sentence = gps_static.has_recent_sentence(now_ms_u, 5000);
       const char *gps_state = gps_fix_valid ? "FIX" : (gps_has_sentence ? "SEARCH" : "OFF");
       GPS::AntennaStatus ant_status = gps_static.antenna_status();
+      const char *co2_display_src =
+          values.co2_display_is_scd4x ? "SCD4x" : "PRIMARY";
 
       ESP_LOGI(TAG, "━━━━━━━━━━━━━ SENSOR SUMMARY ━━━━━━━━━━━━━");
-      ESP_LOGI(TAG, "  CO2: %d ppm | T: %.1f°C | RH: %.1f%%",
-               values.co2_ppm_avg, values.temp_c_avg, values.rh_avg);
+      ESP_LOGI(TAG, "  CO2(display:%s): %d ppm | T: %.1f°C | RH: %.1f%%",
+               co2_display_src, values.co2_ppm_avg, values.temp_c_avg,
+               values.rh_avg);
+      if (values.have_co2_primary) {
+        ESP_LOGI(TAG, "  CO2(primary): %d ppm", values.co2_ppm_primary);
+      } else {
+        ESP_LOGI(TAG, "  CO2(primary): N/A");
+      }
+      if (values.have_co2_scd4x) {
+        ESP_LOGI(TAG, "  CO2(SCD4x): %d ppm", values.co2_ppm_scd4x);
+      } else {
+        ESP_LOGI(TAG, "  CO2(SCD4x): N/A");
+      }
       ESP_LOGI(TAG, "  PM2.5: %.1f µg/m³ | VOC: %d | NOx: %d",
                values.pm25_mass, values.voc_index, values.nox_index);
       ESP_LOGI(TAG, "  SGP4x raw: VOC=%d ticks | NOx=%d ticks",
@@ -1637,10 +1682,23 @@ extern "C" void app_main(void) {
       const char *gps_state = gps_fix_valid ? "FIX" : (gps_has_sentence ? "SEARCH" : "OFF");
       GPS::AntennaStatus ant_status = gps_ready ? gps.antenna_status()
                                                 : GPS::AntennaStatus::Unknown;
+      const char *co2_display_src =
+          vals.co2_display_is_scd4x ? "SCD4x" : "PRIMARY";
       
       ESP_LOGI(TAG, "━━━━━━━━━━━━━ SENSOR SUMMARY ━━━━━━━━━━━━━");
-      ESP_LOGI(TAG, "  CO2: %d ppm | T: %.1f°C | RH: %.1f%%",
-               vals.co2_ppm_avg, vals.temp_c_avg, vals.rh_avg);
+      ESP_LOGI(TAG, "  CO2(display:%s): %d ppm | T: %.1f°C | RH: %.1f%%",
+               co2_display_src, vals.co2_ppm_avg, vals.temp_c_avg,
+               vals.rh_avg);
+      if (vals.have_co2_primary) {
+        ESP_LOGI(TAG, "  CO2(primary): %d ppm", vals.co2_ppm_primary);
+      } else {
+        ESP_LOGI(TAG, "  CO2(primary): N/A");
+      }
+      if (vals.have_co2_scd4x) {
+        ESP_LOGI(TAG, "  CO2(SCD4x): %d ppm", vals.co2_ppm_scd4x);
+      } else {
+        ESP_LOGI(TAG, "  CO2(SCD4x): N/A");
+      }
       ESP_LOGI(TAG, "  PM2.5: %.1f µg/m³ | VOC: %d | NOx: %d",
                vals.pm25_mass, vals.voc_index, vals.nox_index);
       ESP_LOGI(TAG, "  SGP4x raw: VOC=%d ticks | NOx=%d ticks",
@@ -2599,14 +2657,11 @@ static void initiate_shutdown(void) {
     lv_obj_set_style_bg_color(screen, lv_color_white(), 0);  // White background
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);  // Opaque
     
-    // Create rotated container (like ui_display.cpp)
+    // Create container matching normal UI orientation
     lv_obj_t *root = lv_obj_create(screen);
     lv_obj_remove_style_all(root);
-    lv_obj_set_size(root, DISPLAY_ROT_WIDTH, DISPLAY_ROT_HEIGHT);
+    lv_obj_set_size(root, DISPLAY_WIDTH, DISPLAY_HEIGHT);
     lv_obj_align(root, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_transform_pivot_x(root, DISPLAY_ROT_WIDTH / 2, 0);
-    lv_obj_set_style_transform_pivot_y(root, DISPLAY_ROT_HEIGHT / 2, 0);
-    lv_obj_set_style_transform_rotation(root, 1800, 0);  // Rotate 180 degrees
     
     lv_obj_t *label = lv_label_create(root);
     lv_label_set_text(label, "Shutting down...\n\nStopping sensors...");
@@ -2642,14 +2697,11 @@ static void initiate_shutdown(void) {
     lv_obj_set_style_bg_color(screen, lv_color_white(), 0);  // White background
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);  // Opaque
     
-    // Create rotated container (like ui_display.cpp)
+    // Create container matching normal UI orientation
     lv_obj_t *root = lv_obj_create(screen);
     lv_obj_remove_style_all(root);
-    lv_obj_set_size(root, DISPLAY_ROT_WIDTH, DISPLAY_ROT_HEIGHT);
+    lv_obj_set_size(root, DISPLAY_WIDTH, DISPLAY_HEIGHT);
     lv_obj_align(root, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_transform_pivot_x(root, DISPLAY_ROT_WIDTH / 2, 0);
-    lv_obj_set_style_transform_pivot_y(root, DISPLAY_ROT_HEIGHT / 2, 0);
-    lv_obj_set_style_transform_rotation(root, 1800, 0);  // Rotate 180 degrees
     
     lv_obj_t *label = lv_label_create(root);
     lv_label_set_text(label, "Shutting down...\n\nStopping recording...");
@@ -2678,14 +2730,11 @@ static void initiate_shutdown(void) {
     lv_obj_set_style_bg_color(screen, lv_color_white(), 0);  // White background
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);  // Opaque
     
-    // Create rotated container (like ui_display.cpp)
+    // Create container matching normal UI orientation
     lv_obj_t *root = lv_obj_create(screen);
     lv_obj_remove_style_all(root);
-    lv_obj_set_size(root, DISPLAY_ROT_WIDTH, DISPLAY_ROT_HEIGHT);
+    lv_obj_set_size(root, DISPLAY_WIDTH, DISPLAY_HEIGHT);
     lv_obj_align(root, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_transform_pivot_x(root, DISPLAY_ROT_WIDTH / 2, 0);
-    lv_obj_set_style_transform_pivot_y(root, DISPLAY_ROT_HEIGHT / 2, 0);
-    lv_obj_set_style_transform_rotation(root, 1800, 0);  // Rotate 180 degrees
     
     lv_obj_t *label = lv_label_create(root);
     lv_label_set_text(label, "Shutting down...\n\nSaving data...");
@@ -2724,14 +2773,11 @@ static void initiate_shutdown(void) {
     lv_obj_set_style_bg_color(screen, lv_color_white(), 0);  // White background
     lv_obj_set_style_bg_opa(screen, LV_OPA_COVER, 0);  // Opaque
     
-    // Create rotated container (like ui_display.cpp)
+    // Create container matching normal UI orientation
     lv_obj_t *root = lv_obj_create(screen);
     lv_obj_remove_style_all(root);
-    lv_obj_set_size(root, DISPLAY_ROT_WIDTH, DISPLAY_ROT_HEIGHT);
+    lv_obj_set_size(root, DISPLAY_WIDTH, DISPLAY_HEIGHT);
     lv_obj_align(root, LV_ALIGN_CENTER, 0, 0);
-    lv_obj_set_style_transform_pivot_x(root, DISPLAY_ROT_WIDTH / 2, 0);
-    lv_obj_set_style_transform_pivot_y(root, DISPLAY_ROT_HEIGHT / 2, 0);
-    lv_obj_set_style_transform_rotation(root, 1800, 0);  // Rotate 180 degrees
     
     lv_obj_t *label = lv_label_create(root);
     lv_label_set_text(label, "Powering off...\n\nGoodbye!");
